@@ -214,7 +214,7 @@ Step-Check -Name "Static check: no forbidden direct deps in crate Cargo.toml" -S
             $ok = $false
             continue
         }
-        $content = Get-Content $f -Raw
+        $content = Get-Content -Encoding utf8 $f -Raw
         if ($content -match 'tauri') {
             Write-Host "  $f contains forbidden token: tauri"
             $ok = $false
@@ -251,7 +251,7 @@ Step-Check -Name "Static check: no TODO/FIXME/todo!()/unimplemented!() in .rs" -
     $files = Get-ChildItem -Path crates -Recurse -Filter *.rs
     $ok = $true
     foreach ($f in $files) {
-        $lines = Get-Content $f.FullName
+        $lines = Get-Content -Encoding utf8 $f.FullName
         for ($i = 0; $i -lt $lines.Count; $i++) {
             if ($lines[$i] -match 'TODO|FIXME|todo!\(|unimplemented!\(') {
                 Write-Host "  $($f.FullName):$($i + 1): $($lines[$i].Trim())"
@@ -263,7 +263,89 @@ Step-Check -Name "Static check: no TODO/FIXME/todo!()/unimplemented!() in .rs" -
 }
 
 # ---------------------------------------------------------------------------
-# STEP 12: duplicate dependencies (informational only, never fails)
+# STEP 12: unsafe keyword may only appear in crates/idm-core/src/disk/win32.rs,
+#          and there each `unsafe` block must be preceded by a SAFETY: comment.
+# ---------------------------------------------------------------------------
+Step-Check -Name "Static check: unsafe only in win32.rs with SAFETY notes" -ScriptBlock {
+    $allowed = "crates/idm-core/src/disk/win32.rs".ToLower()
+    $files = Get-ChildItem -Path crates -Recurse -Filter *.rs
+    $ok = $true
+    foreach ($f in $files) {
+        # Normalize the absolute path to forward slashes + lowercase so the
+        # forward-slash allow pattern matches on Windows (where FullName uses `\`).
+        $norm = $f.FullName.Replace('\', '/').ToLower()
+        $lines = Get-Content -Encoding utf8 $f.FullName
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $trimmed = $lines[$i].Trim()
+            # Skip comment lines: a real `unsafe` usage (block, fn, impl, extern,
+            # trait) is never prefixed with `//`. Doc comments may *mention*
+            # `unsafe` (e.g. "this module allows `unsafe`"), which must not count.
+            if ($trimmed -like '//*') { continue }
+            # Case-sensitive: match every `unsafe` usage, not just `unsafe {`.
+            if ($trimmed -cmatch '\bunsafe\b') {
+                if ($norm -notmatch [regex]::Escape($allowed)) {
+                    Write-Host "  $($f.FullName):$($i + 1): unsafe outside win32.rs: $trimmed"
+                    $ok = $false
+                }
+                else {
+                    # Walk backwards over blank lines and comment lines (a SAFETY note
+                    # may span several `//` lines; only the first carries `SAFETY:`).
+                    # Stop at the first non-comment, non-blank line.
+                    $j = $i - 1
+                    $found = $false
+                    while ($j -ge 0) {
+                        $t = $lines[$j].Trim()
+                        if ($t -eq '') { $j--; continue }
+                        if ($t -like '//*') {
+                            if ($t -match 'SAFETY:') { $found = $true }
+                            $j--
+                            continue
+                        }
+                        break
+                    }
+                    if (-not $found) {
+                        Write-Host "  $($f.FullName):$($i + 1): unsafe block missing preceding SAFETY: comment"
+                        $ok = $false
+                    }
+                }
+            }
+        }
+    }
+    return $ok
+}
+
+# ---------------------------------------------------------------------------
+# STEP 13: #[allow( / #![allow( only allowed as the top-level
+#          `#![allow(unsafe_code)]` in win32.rs.
+# ---------------------------------------------------------------------------
+Step-Check -Name "Static check: allow only in win32.rs as #![allow(unsafe_code)]" -ScriptBlock {
+    $allowed = "crates/idm-core/src/disk/win32.rs".ToLower()
+    $files = Get-ChildItem -Path crates -Recurse -Filter *.rs
+    $ok = $true
+    foreach ($f in $files) {
+        # Normalize the absolute path to forward slashes + lowercase so the
+        # forward-slash allow pattern matches on Windows (where FullName uses `\`).
+        $norm = $f.FullName.Replace('\', '/').ToLower()
+        $lines = Get-Content -Encoding utf8 $f.FullName
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $trimmed = $lines[$i].Trim()
+            # Skip comment lines: a real `#[allow]`/`#![allow]` attribute is never
+            # prefixed with `//`, while doc comments may *mention* the attribute.
+            if ($trimmed -like '//*') { continue }
+            if ($trimmed -match '#!?\[allow\(') {
+                $isAllowed = ($norm -match [regex]::Escape($allowed)) -and ($trimmed -eq '#![allow(unsafe_code)]')
+                if (-not $isAllowed) {
+                    Write-Host "  $($f.FullName):$($i + 1): forbidden allow: $trimmed"
+                    $ok = $false
+                }
+            }
+        }
+    }
+    return $ok
+}
+
+# ---------------------------------------------------------------------------
+# STEP 14: duplicate dependencies (informational only, never fails)
 # ---------------------------------------------------------------------------
 $stepNumber++
 Write-Host "[STEP $stepNumber] Show duplicate dependencies (informational)"

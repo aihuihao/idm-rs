@@ -8,6 +8,13 @@
 //! Phase 1-3 将在此承载网络、分块调度、断点续传、磁盘 I/O 与 SQLite
 //! 状态持久化等全部核心逻辑；它不依赖任何 GUI、浏览器或 IPC crate。
 
+pub mod error;
+
+/// Windows 磁盘 I/O 模块（共享句柄 + seek_write + 落盘线程池 + 空间分配）。
+/// 仅 `cfg(windows)` 编译；非 Windows 平台不提供。
+#[cfg(windows)]
+pub mod disk;
+
 /// Returns the semantic version of this crate (`CARGO_PKG_VERSION`).
 ///
 /// This is a `const fn` so it can be evaluated at compile time and embedded
@@ -36,15 +43,14 @@ mod tests {
     // They are NOT business functionality and must not be exposed as API.
 
     #[test]
-    fn rusqlite_bundled_sqlite_initializes() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory database");
-        let version: String = conn
-            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-            .expect("query sqlite_version()");
+    fn rusqlite_bundled_sqlite_initializes() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        let version: String = conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
         assert!(
             !version.is_empty(),
             "sqlite_version() returned an empty string"
         );
+        Ok(())
     }
 
     // NOTE: this test only verifies that the reqwest client can be built and the

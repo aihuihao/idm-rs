@@ -16,6 +16,9 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+bytes = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -28,6 +31,7 @@ unimplemented = "deny"
 dbg_macro = "deny"
 unwrap_used = "warn"
 expect_used = "warn"
+undocumented_unsafe_blocks = "deny"
 
 [profile.release]
 lto = "thin"
