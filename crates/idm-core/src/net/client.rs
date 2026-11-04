@@ -61,13 +61,22 @@ impl DownloadConfig {
         }
     }
 
-    /// 单请求总超时（连接 + 读取），用于 `request.timeout()`。
+    /// **仅供 Probe 使用** 的单请求总超时：连接 + 读取。Probe 不读取响应体，因此
+    /// 整个请求的总时长可以设上限。分块/顺序下载请求**不得**使用此总时长超时
+    /// （大分块在慢速网络下会因读取全部响应体超时而失败），它们依赖 Client 级别的
+    /// `connect_timeout`（连接超时）与 `read_timeout`（两次收到数据之间的空闲超时）。
     pub fn request_timeout(&self) -> Duration {
         self.connect_timeout + self.read_timeout
     }
 
     /// 构建 reqwest 客户端：强制 `Accept-Encoding: identity`、限制重定向次数。
     /// 代理设置留到 Phase 3，本阶段不做。
+    ///
+    /// 三层超时（见 `ARCHITECTURE.md`）：
+    /// - `connect_timeout`：建立 TCP/TLS 连接的最长耗时；
+    /// - `read_timeout`：两次收到响应体字节之间的最长空闲间隔（空闲超时），
+    ///   由 Client 级别统一施加，**不**针对单个请求设总时长上限；
+    /// - Probe 单独用 [`Self::request_timeout`] 设一个总时长上限（它不读取正文）。
     ///
     /// 不调用任何 `danger_*` 方法，证书校验保持默认开启；Cargo 依赖也只启用默认
     /// TLS 后端 + `stream`，未开启 gzip/brotli/zstd/deflate 等压缩特性。
@@ -79,6 +88,7 @@ impl DownloadConfig {
             .user_agent(&self.user_agent)
             .default_headers(headers)
             .connect_timeout(self.connect_timeout)
+            .read_timeout(self.read_timeout)
             .redirect(reqwest::redirect::Policy::limited(self.max_redirects))
             .build()
             .map_err(|e| Error::Http {

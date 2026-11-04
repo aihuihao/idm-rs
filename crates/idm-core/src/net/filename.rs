@@ -54,18 +54,24 @@ pub fn sanitize_windows_filename(raw: &str) -> String {
 }
 
 /// 在 `dir` 下解析不冲突的目标文件名：`name` 不存在直接返回，否则依次 `name (1).ext`。
+///
+/// 判断占用时，`name` 本身或其对应的临时文件 `name.idm-part` 任一存在都视为已占用——
+/// 否则两个任务会同时下载到同一个 `.idm-part`，最终重命名时互相覆盖。
 pub fn resolve_conflict(dir: &Path, name: &str) -> PathBuf {
-    let mut candidate = dir.join(name);
-    if !candidate.exists() {
-        return candidate;
+    let part_name = |base: &str| -> PathBuf { dir.join(format!("{base}.idm-part")) };
+    let occupied = |base: &str| -> bool {
+        let p = dir.join(base);
+        p.exists() || part_name(base).exists()
+    };
+    if !occupied(name) {
+        return dir.join(name);
     }
     let (stem, ext) = split_ext(name);
     let mut n = 1u32;
     loop {
         let new_name = format!("{stem} ({n}){ext}");
-        candidate = dir.join(&new_name);
-        if !candidate.exists() {
-            return candidate;
+        if !occupied(&new_name) {
+            return dir.join(&new_name);
         }
         n += 1;
     }

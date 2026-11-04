@@ -294,6 +294,7 @@ mod dl {
         let mut dir: Option<String> = None;
         let mut connections: usize = 8;
         let mut out_name: Option<String> = None;
+        let mut cancel_after: Option<u64> = None;
         // B5：`--strategy` 默认 Auto（卷支持稀疏文件则 Sparse，否则 SetLen）。
         let mut strategy = AllocationStrategy::Auto;
 
@@ -347,6 +348,20 @@ mod dl {
                         }
                     };
                 }
+                "--cancel-after" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --cancel-after");
+                        return 2;
+                    }
+                    match args[i].parse::<u64>() {
+                        Ok(v) => cancel_after = Some(v),
+                        _ => {
+                            eprintln!("--cancel-after must be a non-negative number of seconds");
+                            return 2;
+                        }
+                    };
+                }
                 other if url.is_none() && !other.starts_with("--") => url = Some(other.to_string()),
                 other => {
                     eprintln!("unknown argument: {other}");
@@ -360,7 +375,7 @@ mod dl {
             Some(u) => u,
             None => {
                 eprintln!(
-                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto]"
+                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto] [--cancel-after SECONDS]"
                 );
                 return 2;
             }
@@ -462,6 +477,16 @@ mod dl {
             let _ = tokio::signal::ctrl_c().await;
             signal_task.cancel();
         });
+
+        // `--cancel-after <秒>`（用于测试）：到达指定秒数后，触发与 Ctrl+C 完全相同的
+        // 取消路径（同一个 CancelSignal、同样的退出码、同样的输出）。不得另写一套取消逻辑。
+        if let Some(secs) = cancel_after {
+            let signal_timer = signal.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                signal_timer.cancel();
+            });
+        }
 
         let started = Instant::now();
         let result = download(&url, pool.clone(), &opts, Some(signal.as_ref())).await;

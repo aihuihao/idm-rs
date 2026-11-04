@@ -77,6 +77,12 @@ enum Request {
         new_end: u64,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// 兜底清理：移除本线程内所有属于 `path` 的残留写入器，返回移除数量。
+    /// 正常协作式释放后写入器已被 `Release` 移除；本请求仅用于分块 panic/泄露的兜底。
+    Purge {
+        path: PathBuf,
+        reply: oneshot::Sender<usize>,
+    },
 }
 
 /// 落盘线程池。
@@ -159,6 +165,13 @@ fn worker(mut rx: mpsc::Receiver<Request>) {
                     }),
                 };
                 let _ = reply.send(res);
+            }
+            Request::Purge { path, reply } => {
+                // 移除所有属于该路径的残留写入器（含其持有的文件句柄）。
+                let before = writers.len();
+                writers.retain(|_, w| w.path() != path.as_path());
+                let removed = before - writers.len();
+                let _ = reply.send(removed);
             }
         }
     }
@@ -309,6 +322,28 @@ impl DiskWriterPool {
             offset: 0,
             source: io::Error::other(format!("join failed: {e}")),
         })?
+    }
+
+    /// 兜底清理：移除所有落盘线程中属于 `target` 路径的残留写入器，返回移除总数。
+    ///
+    /// 正常协作式释放流程中，每个分块在退出时都会走 `release` 把自己从线程本地
+    /// 登记表移除（写器随之 drop、文件句柄关闭）。本方法仅作为**兜底**——当某个
+    /// 分块任务 panic / 泄露、未能走到 `release` 时使用，避免残留的文件句柄导致
+    /// 最终重命名失败。每次下载以非 `Completed` 结果结束时调用一次即可。
+    pub async fn purge(&self, target: &TargetFile) -> Result<usize> {
+        let path = target.path().to_path_buf();
+        let mut total = 0usize;
+        for s in &self.senders {
+            let (tx, rx) = oneshot::channel();
+            s.send(Request::Purge {
+                path: path.clone(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| Error::PoolClosed)?;
+            total += rx.await.map_err(|_| Error::PoolClosed)?;
+        }
+        Ok(total)
     }
 
     /// 关闭通道并等待所有线程退出。已提交但尚未处理的请求会被处理完（不丢失）；

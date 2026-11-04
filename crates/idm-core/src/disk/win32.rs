@@ -17,8 +17,8 @@ use windows_sys::Win32::Foundation::{FALSE, HANDLE, SetLastError};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_SPARSE_FILE, FILE_STANDARD_INFO, FileAllocationInfo,
     FileStandardInfo, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetFileAttributesW,
-    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
-    SetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, MOVEFILE_COPY_ALLOWED,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
@@ -191,6 +191,29 @@ pub(crate) fn is_sparse(path: &Path) -> Result<bool> {
 
 /// `FILE_SUPPORTS_SPARSE_FILES` 文件系统能力标志位。
 const FILE_SUPPORTS_SPARSE_FILES: u32 = 0x40;
+
+/// 安全地把文件从 `from` 移动到 `to`，**不覆盖**已存在的目标。
+///
+/// 使用 `MoveFileExW`，带 `MOVEFILE_COPY_ALLOWED`（允许跨卷复制）与 `MOVEFILE_WRITE_THROUGH`
+/// （完成前不返回），但**不带** `MOVEFILE_REPLACE_EXISTING`：若 `to` 已存在，Win32 返回
+/// `ERROR_ALREADY_EXISTS`，调用方据此转为错误，从而不会覆盖用户已有的同名文件。
+pub(crate) fn move_file(from: &Path, to: &Path) -> Result<()> {
+    let from_w = to_wide(from);
+    let to_w = to_wide(to);
+    // SAFETY: `from_w` 与 `to_w` 都是 null 结尾的有效 UTF-16 字符串，且在本调用期间存活；
+    // 两个 `PCWSTR` 仅被同步读取；`dwFlags` 为编译期常量，无输出参数。
+    let ret = unsafe {
+        MoveFileExW(
+            from_w.as_ptr() as PCWSTR,
+            to_w.as_ptr() as PCWSTR,
+            MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ret == FALSE {
+        return Err(io_err("MoveFileExW", to, 0));
+    }
+    Ok(())
+}
 
 /// 解析 `path` 所在的卷根，并查询其文件系统名与能力标志位。
 ///

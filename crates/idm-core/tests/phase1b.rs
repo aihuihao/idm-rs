@@ -12,14 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use idm_core::disk::{AllocationStrategy, DiskWriterPool};
+use idm_core::disk::{AllocationStrategy, DiskWriterPool, TargetFile};
 use idm_core::error::{Error, Result as IdmResult};
 use idm_core::net::Url;
 use idm_core::net::client::DownloadConfig;
 use idm_core::net::filename::{resolve_conflict, sanitize_windows_filename};
 use idm_core::net::headers::{parse_content_disposition, parse_content_range};
 use idm_core::net::probe::Probe;
-use idm_core::task::{CancelSignal, DownloadOptions, DownloadOutcome, ProgressSnapshot, download};
+use idm_core::task::{
+    CancelSignal, DownloadOptions, DownloadOutcome, PauseReason, ProgressSnapshot, download,
+};
 use support::{RangeMode, ServerConfig, byte_at, start, verify_file};
 use tempfile::tempdir;
 use tokio::sync::watch;
@@ -46,6 +48,35 @@ fn options(dir: &Path, connections: usize, min_chunk: u64, out: &str) -> Downloa
 
 fn part_path(dir: &Path, out: &str) -> PathBuf {
     dir.join(format!("{out}.idm-part"))
+}
+
+/// 用给定的 `DownloadConfig`（可定制超时）构造下载选项。
+fn options_with(dir: &Path, cfg: DownloadConfig, out: &str) -> DownloadOptions {
+    DownloadOptions {
+        config: cfg,
+        strategy: AllocationStrategy::Sparse,
+        dir: dir.to_path_buf(),
+        out_name: Some(out.to_string()),
+        progress_tx: None,
+    }
+}
+
+/// 验证下载结束后没有残留的文件句柄：把 `.idm-part` 改名必须成功（说明句柄已释放），
+/// 改回原名后能用 `TargetFile::open_existing` 重新打开并申请原来的分块区间（区间已注销）。
+fn assert_no_residual_handle(part: &Path, size: u64) -> TestResult<()> {
+    let alt = part.with_file_name("alt_no_leak.bin");
+    std::fs::rename(part, &alt).map_err(|e| -> Box<dyn std::error::Error> {
+        format!("rename .idm-part failed (residual handle?): {e}").into()
+    })?;
+    std::fs::rename(&alt, part)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("rename back failed: {e}").into() })?;
+    let tf = TargetFile::open_existing(part, size).map_err(|e| -> Box<dyn std::error::Error> {
+        format!("open_existing failed: {e}").into()
+    })?;
+    let _w = tf
+        .allocate_chunk(0, 0, size)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("re-register failed: {e}").into() })?;
+    Ok(())
 }
 
 async fn shutdown_pool(pool: Arc<DiskWriterPool>) -> TestResult {
@@ -414,7 +445,8 @@ async fn expect_download_error(
     server_cfg: ServerConfig,
     out: &str,
     connections: usize,
-) -> TestResult<Error> {
+    expect_part: bool,
+) -> TestResult<(Error, PathBuf, tempfile::TempDir)> {
     let srv = start(server_cfg).await?;
     let tmp = tempdir()?;
     let pool = Arc::new(DiskWriterPool::new(4, 8)?);
@@ -430,16 +462,23 @@ async fn expect_download_error(
         Err(e) => e,
     };
     let part = part_path(tmp.path(), out);
-    assert!(part.exists(), "{out}.idm-part must be retained on failure");
+    // 目标文件已创建（失败发生在分块阶段）→ 保留 .idm-part；
+    // 失败发生在 Probe / 建文件之前 → 不留下任何文件。两者都在此断言。
+    assert_eq!(
+        part.exists(),
+        expect_part,
+        "{out}: .idm-part existence expected={expect_part}"
+    );
     // 程序不能 panic：能走到这里、并且线程池能正常 shutdown 即为证据。
     shutdown_pool(pool).await?;
     srv.shutdown();
-    Ok(e)
+    // 返回 TempDir 以保持临时目录存活（调用方可能还要读取/重命名文件）。
+    Ok((e, part, tmp))
 }
 
 #[tokio::test]
 async fn error_range_returned_200() -> TestResult {
-    let e = expect_download_error(
+    let (e, part, _tmp) = expect_download_error(
         ServerConfig {
             size: 256 * KIB,
             range: RangeMode::RangeReturn200,
@@ -447,15 +486,18 @@ async fn error_range_returned_200() -> TestResult {
         },
         "e200.bin",
         4,
+        true,
     )
     .await?;
     assert!(matches!(e, Error::RangeNotHonored), "got {e:?}");
+    // 分块阶段失败，文件已创建 → 无残留句柄。
+    assert_no_residual_handle(&part, 256 * KIB)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn error_bad_content_range() -> TestResult {
-    let e = expect_download_error(
+    let (e, _part, _tmp) = expect_download_error(
         ServerConfig {
             size: 256 * KIB,
             range: RangeMode::BadContentRange,
@@ -463,6 +505,7 @@ async fn error_bad_content_range() -> TestResult {
         },
         "ecr.bin",
         4,
+        true,
     )
     .await?;
     assert!(matches!(e, Error::InvalidContentRange { .. }), "got {e:?}");
@@ -471,7 +514,7 @@ async fn error_bad_content_range() -> TestResult {
 
 #[tokio::test]
 async fn error_connection_broken() -> TestResult {
-    let e = expect_download_error(
+    let (e, part, _tmp) = expect_download_error(
         ServerConfig {
             size: 256 * KIB,
             break_at: Some(70 * KIB),
@@ -479,15 +522,18 @@ async fn error_connection_broken() -> TestResult {
         },
         "eeof.bin",
         4,
+        true,
     )
     .await?;
     assert!(matches!(e, Error::UnexpectedEof { .. }), "got {e:?}");
+    // 中途断开：文件已创建，且无残留句柄（分块已 release）。
+    assert_no_residual_handle(&part, 256 * KIB)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn error_etag_changed() -> TestResult {
-    let e = expect_download_error(
+    let (e, _part, _tmp) = expect_download_error(
         ServerConfig {
             size: 256 * KIB,
             etag: Some("\"v1\"".to_string()),
@@ -496,6 +542,7 @@ async fn error_etag_changed() -> TestResult {
         },
         "etag.bin",
         4,
+        true,
     )
     .await?;
     assert!(matches!(e, Error::RemoteChanged), "got {e:?}");
@@ -505,7 +552,7 @@ async fn error_etag_changed() -> TestResult {
 #[tokio::test]
 async fn error_weak_etag_changed_on_206() -> TestResult {
     // 弱 ETag：不发 If-Range，改为校验每个 206 响应的 ETag 与 Probe 时一致。
-    let e = expect_download_error(
+    let (e, _part, _tmp) = expect_download_error(
         ServerConfig {
             size: 256 * KIB,
             etag: Some("\"v1\"".to_string()),
@@ -515,6 +562,7 @@ async fn error_weak_etag_changed_on_206() -> TestResult {
         },
         "wetag.bin",
         4,
+        true,
     )
     .await?;
     assert!(matches!(e, Error::RemoteChanged), "got {e:?}");
@@ -523,7 +571,8 @@ async fn error_weak_etag_changed_on_206() -> TestResult {
 
 #[tokio::test]
 async fn error_gzip() -> TestResult {
-    let e = expect_download_error(
+    // gzip 在 Probe 阶段被拒，目标文件尚未创建 → 不留下任何文件。
+    let (e, _part, _tmp) = expect_download_error(
         ServerConfig {
             size: 128 * KIB,
             content_encoding: Some("gzip".to_string()),
@@ -531,12 +580,34 @@ async fn error_gzip() -> TestResult {
         },
         "gzip.bin",
         4,
+        false,
     )
     .await?;
     assert!(
         matches!(e, Error::UnsupportedContentEncoding { .. }),
         "got {e:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn error_weak_etag_with_last_modified_still_detected() -> TestResult {
+    // 弱 ETag 但有 Last-Modified：用 Last-Modified 作为 If-Range；变更后仍被检测为 RemoteChanged。
+    let (e, _part, _tmp) = expect_download_error(
+        ServerConfig {
+            size: 256 * KIB,
+            etag: Some("\"v1\"".to_string()),
+            weak_etag: true,
+            last_modified: Some("Wed, 01 Jan 2025 00:00:00 GMT".to_string()),
+            change_etag_after: Some(0),
+            ..ServerConfig::default()
+        },
+        "wlm.bin",
+        4,
+        true,
+    )
+    .await?;
+    assert!(matches!(e, Error::RemoteChanged), "got {e:?}");
     Ok(())
 }
 
@@ -550,7 +621,9 @@ async fn run_cancel_case(
     connections: usize,
     pre_cancel: bool,
     cancel_after: Option<Duration>,
+    expect_part: bool,
 ) -> TestResult {
+    let size = server_cfg.size;
     let srv = start(server_cfg).await?;
     let tmp = tempdir()?;
     let pool = Arc::new(DiskWriterPool::new(4, 16)?);
@@ -579,10 +652,16 @@ async fn run_cancel_case(
         DownloadOutcome::Cancelled,
         "{out} must be Cancelled"
     );
-    assert!(
-        part_path(tmp.path(), out).exists(),
-        "{out}.idm-part must remain"
+    let part = part_path(tmp.path(), out);
+    assert_eq!(
+        part.exists(),
+        expect_part,
+        "{out}: .idm-part existence expected={expect_part}"
     );
+    // 文件已创建（取消发生在建立之后）→ 验证没有残留句柄。
+    if expect_part {
+        assert_no_residual_handle(&part, size)?;
+    }
     if let Some(t) = cancel_task {
         t.await?;
     }
@@ -591,7 +670,7 @@ async fn run_cancel_case(
     Ok(())
 }
 
-/// 取消时机 1：Probe 完成之前（且发生在 download 开始等待之前）。
+/// 取消时机 1：Probe 完成之前（且发生在 download 开始等待之前）→ 不创建任何文件。
 #[tokio::test]
 async fn cancel_before_probe() -> TestResult {
     run_cancel_case(
@@ -604,11 +683,12 @@ async fn cancel_before_probe() -> TestResult {
         8,
         true,
         None,
+        false,
     )
     .await
 }
 
-/// 取消时机 2：Probe 进行中（watch 状态语义保证不会漏掉）。
+/// 取消时机 2：Probe 进行中（watch 状态语义保证不会漏掉）→ 文件尚未创建，不留下任何文件。
 #[tokio::test]
 async fn cancel_during_probe() -> TestResult {
     run_cancel_case(
@@ -621,29 +701,30 @@ async fn cancel_during_probe() -> TestResult {
         8,
         false,
         Some(Duration::from_millis(100)),
+        false,
     )
     .await
 }
 
-/// 取消时机 3：Probe 已完成、分块任务尚未全部启动。
+/// 取消时机 3：Probe 进行中（延迟较长，取消在其完成前触发）→ 目标文件尚未创建，不留下任何文件。
 #[tokio::test]
-async fn cancel_before_all_chunks_spawned() -> TestResult {
+async fn cancel_after_probe_before_create() -> TestResult {
     run_cancel_case(
         ServerConfig {
             size: 4 * MIB,
-            probe_delay: Some(Duration::from_millis(150)),
-            chunk_delay: Some(Duration::from_millis(5)),
+            probe_delay: Some(Duration::from_millis(300)),
             ..ServerConfig::default()
         },
         "cancel_spawn.bin",
         32,
         false,
-        Some(Duration::from_millis(160)),
+        Some(Duration::from_millis(100)),
+        false,
     )
     .await
 }
 
-/// 取消时机 4：下载进行中（数据正在到达）。
+/// 取消时机 4：下载进行中（数据正在到达）→ 文件已创建、保留 .idm-part、无残留句柄。
 #[tokio::test]
 async fn cancel_during_download() -> TestResult {
     run_cancel_case(
@@ -656,8 +737,197 @@ async fn cancel_during_download() -> TestResult {
         8,
         false,
         Some(Duration::from_millis(200)),
+        true,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// 超时（三层）：慢速但持续发送必须成功；发送一部分后停住超过 read_timeout 必须超时
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn timeout_slow_but_steady_succeeds() -> TestResult {
+    // 短空闲超时（1s），但每 200ms 收到数据 → 总耗时 > 3x read_timeout 仍应成功。
+    let cfg = DownloadConfig {
+        connect_timeout: Duration::from_secs(1),
+        read_timeout: Duration::from_secs(1),
+        ..DownloadConfig::default()
+    };
+    let size = 20 * 64 * KIB; // 20 块 × 64KiB，每块间隔 200ms ≈ 4s
+    let srv = start(ServerConfig {
+        size,
+        chunk_delay: Some(Duration::from_millis(200)),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(2, 8)?);
+    let opts = options_with(tmp.path(), cfg, "slow.bin");
+    let (outcome, _rx) = download(&srv.url("/file.bin"), pool.clone(), &opts, None).await?;
+    assert_eq!(outcome, DownloadOutcome::Completed);
+    verify_file(&tmp.path().join("slow.bin"), size)?;
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
+}
+
+#[tokio::test]
+async fn timeout_freeze_returns_error_and_retains_part() -> TestResult {
+    // 收到 128KiB 后静默停顿 2s（> read_timeout 1s）→ 读取空闲超时，保留 .idm-part。
+    let cfg = DownloadConfig {
+        connect_timeout: Duration::from_secs(1),
+        read_timeout: Duration::from_secs(1),
+        ..DownloadConfig::default()
+    };
+    let size = 4 * 64 * KIB;
+    let srv = start(ServerConfig {
+        size,
+        freeze_after: Some(2 * 64 * KIB),
+        freeze_duration: Some(Duration::from_secs(2)),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(2, 8)?);
+    let opts = options_with(tmp.path(), cfg, "freeze.bin");
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        download(&srv.url("/file.bin"), pool.clone(), &opts, None),
+    )
+    .await?;
+    let e = match r {
+        Ok(_) => panic!("expected timeout error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(e, Error::Http { .. }),
+        "expected Http timeout error, got {e:?}"
+    );
+    assert!(
+        part_path(tmp.path(), "freeze.bin").exists(),
+        ".idm-part retained on timeout"
+    );
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 安全重命名：不覆盖同名文件
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rename_does_not_overwrite_existing() -> TestResult {
+    let size = 512 * KIB;
+    let srv = start(ServerConfig {
+        size,
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(4, 8)?);
+    // 用户预先创建一个同名文件，内容不同。
+    let final_path = tmp.path().join("keep.bin");
+    std::fs::write(&final_path, b"USERDATA-KEEP")?;
+    let opts = options(tmp.path(), 4, 128 * KIB, "keep.bin");
+    let (outcome, _rx) = download(&srv.url("/file.bin"), pool.clone(), &opts, None).await?;
+    assert_eq!(outcome, DownloadOutcome::Completed);
+    // 用户的文件内容不变。
+    assert_eq!(std::fs::read(&final_path)?, b"USERDATA-KEEP");
+    // 下载结果另存为 `keep (1).bin`。
+    let renamed = tmp.path().join("keep (1).bin");
+    assert!(
+        renamed.exists(),
+        "download must be saved under a conflict-free name"
+    );
+    verify_file(&renamed, size)?;
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 创建文件时磁盘满 → 不留下任何文件，结果为 Paused
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn download_disk_full_at_creation_leaves_no_file() -> TestResult {
+    let srv = start(ServerConfig {
+        size: u64::MAX / 2, // 远超可用空间 → 创建阶段即报 DiskFull
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(2, 8)?);
+    let opts = options(tmp.path(), 4, 64 * KIB, "big.bin");
+    let (outcome, _rx) = download(&srv.url("/file.bin"), pool.clone(), &opts, None).await?;
+    assert_eq!(outcome, DownloadOutcome::Paused(PauseReason::DiskFull));
+    assert!(
+        !part_path(tmp.path(), "big.bin").exists(),
+        "no .idm-part on disk-full at creation"
+    );
+    assert!(
+        !tmp.path().join("big.bin").exists(),
+        "no final file on disk-full at creation"
+    );
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 两个任务同时下载同一 URL → 因冲突各得不同名字，均成功
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_same_url_different_names() -> TestResult {
+    let size = 8 * 64 * KIB;
+    let srv = start(ServerConfig {
+        size,
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(8, 32)?);
+    let dir = tmp.path().to_path_buf();
+    let url = srv.url("/file.bin");
+    let mut tasks: JoinSet<IdmResult<DownloadOutcome>> = JoinSet::new();
+    // 第一个任务先启动，创建 `same.bin`。
+    {
+        let p = pool.clone();
+        let d = dir.clone();
+        let u = url.clone();
+        tasks.spawn(async move {
+            let opts = options(&d, 4, 64 * KIB, "same.bin");
+            download(&u, p, &opts, None).await.map(|(o, _)| o)
+        });
+    }
+    // 短暂错开，使第二个任务在解析文件名时已能看到第一个任务的 `.idm-part` 被占用。
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        let p = pool.clone();
+        let d = dir.clone();
+        let u = url.clone();
+        tasks.spawn(async move {
+            let opts = options(&d, 4, 64 * KIB, "same.bin");
+            download(&u, p, &opts, None).await.map(|(o, _)| o)
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        let outcome = joined??;
+        assert_eq!(outcome, DownloadOutcome::Completed);
+    }
+    // 两个不同名字的文件都应存在且内容正确。
+    let a = dir.join("same.bin");
+    let b = dir.join("same (1).bin");
+    assert!(a.exists(), "same.bin must exist");
+    assert!(b.exists(), "same (1).bin must exist");
+    verify_file(&a, size)?;
+    verify_file(&b, size)?;
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

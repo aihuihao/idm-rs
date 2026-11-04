@@ -53,8 +53,14 @@ pub struct ServerConfig {
     pub redirect: bool,
     /// 写到该绝对字节位置后断开连接。
     pub break_at: Option<u64>,
-    /// 每发送一块数据后的延迟（慢速发送）。
+    /// 每发送一块数据后的延迟（慢速但持续发送，用于验证空闲超时不会误杀）。
     pub chunk_delay: Option<Duration>,
+    /// 写到该绝对字节位置后，静默停顿 `freeze_duration` 再关闭连接（用于触发读取空闲超时）。
+    pub freeze_after: Option<u64>,
+    /// 触发 `freeze_after` 后的静默停顿时长（应大于客户端的 `read_timeout`）。
+    pub freeze_duration: Option<Duration>,
+    /// 可选的 Last-Modified 响应头（用于弱 ETag + Last-Modified 作为 If-Range 的测试）。
+    pub last_modified: Option<String>,
     /// Probe 请求（Range: bytes=0-0）响应前的延迟。
     pub probe_delay: Option<Duration>,
 }
@@ -72,6 +78,9 @@ impl Default for ServerConfig {
             redirect: false,
             break_at: None,
             chunk_delay: None,
+            freeze_after: None,
+            freeze_duration: None,
+            last_modified: None,
             probe_delay: None,
         }
     }
@@ -230,10 +239,17 @@ async fn handle_conn(
     } else {
         format!("{prefix}{base_etag}")
     };
-    let if_range_mismatch = changed
-        && if_range
-            .as_deref()
-            .is_some_and(|ir| ir.trim() != current_etag.trim());
+    let base_lm = cfg
+        .last_modified
+        .clone()
+        .unwrap_or_else(|| "Wed, 01 Jan 2025 00:00:00 GMT".to_string());
+    // 变更后同时更换 ETag 与 Last-Modified，使任意 If-Range（ETag 或 Last-Modified）都失配。
+    let current_lm = if changed {
+        "Thu, 02 Jan 2026 00:00:00 GMT".to_string()
+    } else {
+        base_lm
+    };
+    let if_range_mismatch = changed && if_range.is_some();
 
     if let Some(d) = cfg.probe_delay
         && is_probe
@@ -303,6 +319,9 @@ async fn handle_conn(
     if cfg.etag.is_some() || changed {
         head.push_str(&format!("ETag: {current_etag}\r\n"));
     }
+    if cfg.last_modified.is_some() {
+        head.push_str(&format!("Last-Modified: {current_lm}\r\n"));
+    }
     head.push_str("Content-Type: application/octet-stream\r\n");
     head.push_str("Connection: close\r\n\r\n");
     sock.write_all(head.as_bytes()).await?;
@@ -314,6 +333,17 @@ async fn handle_conn(
         let n = ((length - written) as usize).min(BLOCK);
         let mut buf = vec![0u8; n];
         fill_block(&mut buf, start + written);
+        // 冻结模式：已写到 freeze_after 之后，静默停顿 freeze_duration 再关闭连接。
+        // 停顿期间客户端收不到任何字节，其 read_timeout 会先于本函数返回而触发超时错误。
+        if let Some(fa) = cfg.freeze_after {
+            let abs = start + written;
+            if abs >= fa {
+                if let Some(d) = cfg.freeze_duration {
+                    tokio::time::sleep(d).await;
+                }
+                return Ok(());
+            }
+        }
         // 提前断开：只写到 break_at 为止就关闭连接，保证 Content-Length 声明的
         // 长度无法被满足，客户端必须观察到响应体被截断。
         if let Some(b) = cfg.break_at {
