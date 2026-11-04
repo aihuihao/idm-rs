@@ -14,7 +14,10 @@ mod bench {
     use std::os::windows::fs::FileExt;
     use std::path::Path;
 
-    use idm_core::disk::{AllocationStrategy, TargetFile, disk_free_space, volume_filesystem};
+    use idm_core::disk::{
+        AllocationStrategy, SpaceCheck, TargetFile, disk_free_space, volume_filesystem,
+    };
+    use idm_core::error::Error;
 
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;
@@ -132,13 +135,14 @@ mod bench {
             for run in 0..runs {
                 let file_path = path.join(format!("bench_{strategy:?}_{run}.bin"));
                 let start = std::time::Instant::now();
-                let target = match TargetFile::create(&file_path, size, strategy) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        println!("  run {run} CREATE_ERROR {e}");
-                        continue;
-                    }
-                };
+                let target =
+                    match TargetFile::create(&file_path, size, strategy, SpaceCheck::Enforce) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            println!("  run {run} CREATE_ERROR {e}");
+                            continue;
+                        }
+                    };
                 let create_ms = start.elapsed().as_secs_f64() * 1000.0;
                 let info_before = match target.allocation_info() {
                     Ok(i) => i,
@@ -207,7 +211,9 @@ mod bench {
                 return;
             }
         };
-        // size = 可用空间 + 1GB，只做创建、不写入，观察空间不足时的行为。
+        // size = 可用空间 + 1GB，只做创建、不写入，观察空间不足时的系统级报错。
+        // 跳过 create 内部的目标卷空间预检查（skip_space_check=true），让系统调用
+        // 直接暴露原始错误码（如 112 = ERROR_DISK_FULL）。
         let size = available + GB;
         println!("SKIP_PRECHECK available_bytes={available} attempt_size_bytes={size} runs={runs}");
         for strategy in [
@@ -216,10 +222,36 @@ mod bench {
             AllocationStrategy::Sparse,
         ] {
             let file_path = path.join(format!("bench_skip_{strategy:?}.bin"));
-            let r = TargetFile::create(&file_path, size, strategy);
+            let r = TargetFile::create(&file_path, size, strategy, SpaceCheck::Skip);
             match r {
-                Ok(_) => println!("  {strategy:?} CREATE_SUCCEEDED unexpected"),
-                Err(e) => println!("  {strategy:?} CREATE_FAILED {e}"),
+                Ok(_) => {
+                    if strategy == AllocationStrategy::Sparse {
+                        println!(
+                            "  {strategy:?} CREATE_SUCCEEDED (expected: sparse does not pre-allocate)"
+                        );
+                    } else {
+                        println!("  {strategy:?} CREATE_SUCCEEDED UNEXPECTED (expected DiskFull)");
+                    }
+                }
+                Err(e) => {
+                    let os_code = match &e {
+                        Error::Io { source, .. } => source.raw_os_error(),
+                        _ => None,
+                    };
+                    if strategy == AllocationStrategy::Sparse {
+                        println!(
+                            "  {strategy:?} CREATE_FAILED UNEXPECTED os_error={os_code:?} {e}"
+                        );
+                    } else if os_code == Some(112) {
+                        println!(
+                            "  {strategy:?} CREATE_FAILED os_error=112 (expected: ERROR_DISK_FULL)"
+                        );
+                    } else {
+                        println!(
+                            "  {strategy:?} CREATE_FAILED os_error={os_code:?} (expected 112) {e}"
+                        );
+                    }
+                }
             }
             let _ = std::fs::remove_file(&file_path);
         }

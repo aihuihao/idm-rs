@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use idm_core::disk::{AllocationStrategy, ChunkWriter, DiskWriterPool, TargetFile};
+use idm_core::disk::{AllocationStrategy, ChunkWriter, DiskWriterPool, SpaceCheck, TargetFile};
 use tempfile::tempdir;
 
 const FILE_SIZE: u64 = 64 * 1024 * 1024; // 64MB
@@ -100,7 +100,7 @@ fn run_std_concurrency(
     for seed in 0..seeds {
         let dir = tempdir()?;
         let path = dir.path().join("conc.bin");
-        let target = TargetFile::create(&path, size, strategy)?;
+        let target = TargetFile::create(&path, size, strategy, SpaceCheck::Enforce)?;
         let mut st = seed.wrapping_add(0x9E37);
         let boundaries = make_chunks(&mut st, N_CHUNKS, size);
 
@@ -154,7 +154,7 @@ async fn run_pool_concurrency(
     for seed in 0..seeds {
         let dir = tempdir()?;
         let path = dir.path().join("pool.bin");
-        let target = TargetFile::create(&path, size, strategy)?;
+        let target = TargetFile::create(&path, size, strategy, SpaceCheck::Enforce)?;
         let pool = Arc::new(DiskWriterPool::new(8, 4, target.file(), path.clone())?);
 
         let mut st = seed.wrapping_add(0x85EB);
@@ -235,7 +235,7 @@ fn stress_three_strategies() -> Result<(), Box<dyn std::error::Error>> {
             let dir = tempdir()?;
             let path = dir.path().join("stress.bin");
             let start = std::time::Instant::now();
-            let target = TargetFile::create(&path, BIG, strategy)?;
+            let target = TargetFile::create(&path, BIG, strategy, SpaceCheck::Enforce)?;
             let mut st = seed.wrapping_add(0x1234);
             let boundaries = make_chunks(&mut st, N, BIG);
 

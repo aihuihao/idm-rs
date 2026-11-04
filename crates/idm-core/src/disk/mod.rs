@@ -23,6 +23,6 @@ pub mod write;
 pub use pool::DiskWriterPool;
 pub use range::ChunkRange;
 pub use target::{
-    AllocationInfo, AllocationStrategy, TargetFile, disk_free_space, volume_filesystem,
+    AllocationInfo, AllocationStrategy, SpaceCheck, TargetFile, disk_free_space, volume_filesystem,
 };
 pub use write::{ChunkWriter, PositionalWrite};

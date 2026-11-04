@@ -28,6 +28,14 @@
 - Phase 1 必须在 NTFS 上实测并比较以下方案：set_len、SetFileInformationByHandle(FileAllocationInfo)、稀疏文件。比较项包括：创建耗时、实际磁盘占用、尾部首次写入耗时、磁盘空间不足时的报错时机、异常退出后的文件状态。根据结果再定方案。
 - 禁止使用需要特殊权限的 SetFileValidData。
 
+### 决定（依据 Phase 1a 实测，详见 docs/phase1a-allocation-report.md）
+- 目标卷支持稀疏文件时（GetVolumeInformationW 返回的标志含 FILE_SUPPORTS_SPARSE_FILES），默认使用 Sparse 策略。
+- 不支持时退回 SetLen，并输出 warn 日志，说明首次在远端偏移写入时会触发补零。
+- 依据：D 盘（机械硬盘，NTFS）16GB 文件，SetLen / Reserve 在尾部首次写入 1MB 的耗时中位数约 123s / 134s，Sparse 约 0.35ms。
+- 创建前的空间预检查保留，对所有策略生效。
+- 已知代价 1：稀疏文件按需分配空间，下载中途仍可能磁盘满。写入遇到 ERROR_DISK_FULL(112) 时，任务必须进入可恢复的暂停状态，不得判定失败、不得丢弃已下载数据（Phase 1b/1c 实现）。
+- 已知代价 2：多个 Chunk 并发写入会使文件碎片化，机械硬盘上更明显，后续阶段评估影响。
+
 ## 4. 断点续传一致性（最重要）
 - 写入顺序：数据写入 → 按策略刷盘（flush/sync_data）→ 再更新 SQLite 中的 Chunk 进度。
 - 数据库中记录的已完成偏移量，任何时刻都不得超过已确认落盘的数据。宁可少记、重下一段，也不能多记。

@@ -28,6 +28,15 @@ pub enum AllocationStrategy {
     Sparse,
 }
 
+/// 创建前的目标卷空间检查策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceCheck {
+    /// 创建前检查目标卷可用空间，不足则返回 `Error::DiskFull`（默认用法）。
+    Enforce,
+    /// 跳过检查，仅用于 bench-alloc 观察系统原始行为。
+    Skip,
+}
+
 /// 文件空间信息。
 #[derive(Debug, Clone, Copy)]
 pub struct AllocationInfo {
@@ -59,17 +68,21 @@ impl TargetFile {
         path: P,
         len: u64,
         strategy: AllocationStrategy,
+        space_check: SpaceCheck,
     ) -> Result<TargetFile> {
         let path = path.as_ref().to_path_buf();
 
-        // 创建前检查目标卷可用空间。
-        let available = win32::get_disk_free_space(&path)?;
-        if available < len {
-            return Err(Error::DiskFull {
-                path: path.clone(),
-                needed: len,
-                available,
-            });
+        // 创建前检查目标卷可用空间（bench-alloc 的 `--skip-precheck` 模式传入
+        // `SpaceCheck::Skip`，跳过此处以观察系统层面的空间不足报错时机）。
+        if space_check == SpaceCheck::Enforce {
+            let available = win32::get_disk_free_space(&path)?;
+            if available < len {
+                return Err(Error::DiskFull {
+                    path: path.clone(),
+                    needed: len,
+                    available,
+                });
+            }
         }
 
         let file = OpenOptions::new()
@@ -267,9 +280,12 @@ mod tests {
     fn create_rejects_existing() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("exists.bin");
-        let _t = TargetFile::create(&path, 4096, AllocationStrategy::SetLen)?;
+        let _t = TargetFile::create(&path, 4096, AllocationStrategy::SetLen, SpaceCheck::Enforce)?;
         // 已存在则绝不覆盖，必须失败。
-        assert!(TargetFile::create(&path, 4096, AllocationStrategy::SetLen).is_err());
+        assert!(
+            TargetFile::create(&path, 4096, AllocationStrategy::SetLen, SpaceCheck::Enforce)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -279,7 +295,7 @@ mod tests {
         let dir = tempdir()?;
         let path = dir.path().join("huge.bin");
         let huge = u64::MAX / 2;
-        let r = TargetFile::create(&path, huge, AllocationStrategy::SetLen);
+        let r = TargetFile::create(&path, huge, AllocationStrategy::SetLen, SpaceCheck::Enforce);
         assert!(matches!(r, Err(Error::DiskFull { .. })));
         assert!(!path.exists(), "no file should be left behind on disk-full");
         Ok(())
@@ -290,7 +306,8 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("oor.bin");
-        let target = TargetFile::create(&path, 1024, AllocationStrategy::SetLen)?;
+        let target =
+            TargetFile::create(&path, 1024, AllocationStrategy::SetLen, SpaceCheck::Enforce)?;
         let mut w = target.allocate_chunk(1, 0, 512)?;
         let buf = vec![7u8; 100];
         w.write(&buf)?;
@@ -318,7 +335,8 @@ mod tests {
     fn shrink_end_normal_and_invalid() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("shrink.bin");
-        let target = TargetFile::create(&path, 100, AllocationStrategy::SetLen)?;
+        let target =
+            TargetFile::create(&path, 100, AllocationStrategy::SetLen, SpaceCheck::Enforce)?;
         let mut w = target.allocate_chunk(1, 0, 50)?;
         let buf = vec![1u8; 20];
         w.write(&buf)?; // pos = 20
@@ -341,7 +359,7 @@ mod tests {
         ] {
             let dir = tempdir()?;
             let path = dir.path().join("alloc.bin");
-            let target = TargetFile::create(&path, SIZE, strategy)?;
+            let target = TargetFile::create(&path, SIZE, strategy, SpaceCheck::Enforce)?;
             let info = target.allocation_info()?;
             assert_eq!(info.logical_len, SIZE, "logical length must match");
             if strategy == AllocationStrategy::Sparse {
