@@ -255,6 +255,153 @@ mod bench {
     }
 }
 
+#[cfg(windows)]
+mod dl {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use idm_core::disk::{AllocationStrategy, DiskWriterPool};
+    use idm_core::net::client::DownloadConfig;
+    use idm_core::task::{DownloadOptions, DownloadOutcome, download};
+    use tokio::sync::Notify;
+
+    pub async fn run(args: &[String]) -> i32 {
+        let mut url: Option<String> = None;
+        let mut dir: Option<String> = None;
+        let mut connections: usize = 8;
+        let mut out_name: Option<String> = None;
+        let mut strategy = AllocationStrategy::Sparse;
+
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--dir" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --dir");
+                        return 2;
+                    }
+                    dir = Some(args[i].clone());
+                }
+                "--connections" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --connections");
+                        return 2;
+                    }
+                    match args[i].parse::<usize>() {
+                        Ok(v) if (1..=32).contains(&v) => connections = v,
+                        _ => {
+                            eprintln!("--connections must be in 1..=32");
+                            return 2;
+                        }
+                    }
+                }
+                "--out" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --out");
+                        return 2;
+                    }
+                    out_name = Some(args[i].clone());
+                }
+                "--strategy" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --strategy");
+                        return 2;
+                    }
+                    strategy = match args[i].as_str() {
+                        "sparse" => AllocationStrategy::Sparse,
+                        "reserve" => AllocationStrategy::Reserve,
+                        "setlen" => AllocationStrategy::SetLen,
+                        "auto" => AllocationStrategy::Auto,
+                        other => {
+                            eprintln!("unknown --strategy: {other}");
+                            return 2;
+                        }
+                    };
+                }
+                other if url.is_none() && !other.starts_with("--") => url = Some(other.to_string()),
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    return 2;
+                }
+            }
+            i += 1;
+        }
+
+        let url = match url {
+            Some(u) => u,
+            None => {
+                eprintln!(
+                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto]"
+                );
+                return 2;
+            }
+        };
+
+        let dir = match dir {
+            Some(d) => PathBuf::from(d),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+
+        let config = DownloadConfig {
+            connections,
+            ..DownloadConfig::default()
+        };
+        let opts = DownloadOptions {
+            config,
+            strategy,
+            dir: dir.clone(),
+            out_name,
+        };
+
+        let pool = match DiskWriterPool::new(4, 16) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("disk writer pool init failed: {e}");
+                return 1;
+            }
+        };
+
+        // Ctrl+C → 取消信号。
+        let notify = Arc::new(Notify::new());
+        let notify_signal = notify.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            notify_signal.notify_one();
+        });
+
+        let result = download(&url, pool.clone(), &opts, Some(notify.as_ref())).await;
+        let (outcome, rx) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("download failed: {e}");
+                return 1;
+            }
+        };
+        match outcome {
+            DownloadOutcome::Completed => {
+                let snap = rx.borrow();
+                println!(
+                    "download completed: {} bytes (speed {:.0} B/s)",
+                    snap.downloaded, snap.speed
+                );
+                0
+            }
+            DownloadOutcome::Cancelled => {
+                println!("download cancelled; partial file retained");
+                0
+            }
+            DownloadOutcome::Paused(reason) => {
+                println!("download paused: {reason:?}; partial file retained");
+                0
+            }
+        }
+    }
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -280,6 +427,16 @@ async fn main() {
         #[cfg(not(windows))]
         {
             eprintln!("bench-alloc is only supported on Windows");
+            std::process::exit(2);
+        }
+    } else if args.len() > 1 && args[1] == "download" {
+        #[cfg(windows)]
+        {
+            std::process::exit(dl::run(&args[2..]).await);
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("download is only supported on Windows");
             std::process::exit(2);
         }
     }

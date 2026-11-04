@@ -10,6 +10,9 @@ use crate::error::{Error, Result};
 ///
 /// 构造时校验 `start < end` 且 `end <= 文件长度`，因此一旦构造成功即为合法的
 /// 文件内区间。Phase 2 工作窃取会用到 `shrink_end` 来拆分尾部区间。
+///
+/// 特殊值 `end == u64::MAX` 表示**无界区间**（流式下载，长度未知），此时跳过
+/// `end <= 文件长度` 的上界校验；`ChunkWriter` 据此不做尾部越界检查，数据可任意增长。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkRange {
     start: u64,
@@ -26,7 +29,8 @@ impl ChunkRange {
                 file_len,
             });
         }
-        if end > file_len {
+        // 无界区间（流式，end == u64::MAX）跳过上界校验；其余要求 end <= 文件长度。
+        if end != u64::MAX && end > file_len {
             return Err(Error::InvalidRange {
                 start,
                 end,
@@ -136,6 +140,18 @@ mod tests {
         assert!(r.overlaps(&overlap_yes));
         let overlap_no = ChunkRange::new(8, 9, 10)?;
         assert!(!r.overlaps(&overlap_no));
+        Ok(())
+    }
+
+    #[test]
+    fn unbounded_range_skips_upper_bound() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // 流式下载：end == u64::MAX 表示无界区间，即便文件长度为 0 也构造成功。
+        let r = ChunkRange::new(0, u64::MAX, 0)?;
+        assert_eq!(r.start(), 0);
+        assert_eq!(r.end(), u64::MAX);
+        // 任意有限偏移都不越界。
+        assert!(r.contains(0, 1024));
+        assert!(r.contains(1 << 40, 4096));
         Ok(())
     }
 

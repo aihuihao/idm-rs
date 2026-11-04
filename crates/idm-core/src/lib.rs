@@ -15,6 +15,14 @@ pub mod error;
 #[cfg(windows)]
 pub mod disk;
 
+/// 网络层：HTTP 客户端、Probe、响应头与文件名解析（依赖 reqwest）。
+#[cfg(windows)]
+pub mod net;
+
+/// 下载编排、状态机与进度（依赖 `disk` 与 `net`）。
+#[cfg(windows)]
+pub mod task;
+
 /// Returns the semantic version of this crate (`CARGO_PKG_VERSION`).
 ///
 /// This is a `const fn` so it can be evaluated at compile time and embedded

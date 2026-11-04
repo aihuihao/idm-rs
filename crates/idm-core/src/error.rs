@@ -75,6 +75,39 @@ pub enum Error {
     /// 落盘线程池构造参数非法（线程数或队列容量为 0）。
     #[error("invalid disk writer pool config: {message}")]
     InvalidPoolConfig { message: String },
+
+    /// HTTP 请求失败（网络层错误，或状态码 4xx/5xx 被 reqwest 暴露）。
+    #[error("http request to {url} failed: {source}")]
+    Http {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    /// 参数非法（如连接数超出 1..=32、URL scheme 不支持）。
+    #[error("invalid argument: {message}")]
+    InvalidArgument { message: String },
+    /// 响应携带非 `identity` 的 Content-Encoding，绝不能把压缩字节当作文件内容写盘。
+    #[error("unsupported Content-Encoding: {encoding}")]
+    UnsupportedContentEncoding { encoding: String },
+    /// 带 If-Range 却返回 200（远端在下载过程中发生变化）。
+    #[error("remote changed: If-Range sent but server returned 200")]
+    RemoteChanged,
+    /// 未带 If-Range 却返回 200（服务器不遵守 Range 请求）。
+    #[error("server ignored Range request and returned 200")]
+    RangeNotHonored,
+    /// 返回 206 但 Content-Range 与请求区间不一致。
+    #[error("Content-Range {actual:?} does not match requested {requested:?}")]
+    InvalidContentRange {
+        requested: (u64, u64),
+        actual: String,
+    },
+    /// 收到的字节数少于分块长度（提前结束 / 连接被截断）。
+    #[error("unexpected EOF on chunk {chunk_id}: expected {expected}, received {received}")]
+    UnexpectedEof {
+        chunk_id: u64,
+        expected: u64,
+        received: u64,
+    },
 }
 
 /// 便捷 Result 别名。
