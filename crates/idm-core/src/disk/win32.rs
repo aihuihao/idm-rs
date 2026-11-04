@@ -166,7 +166,6 @@ pub(crate) fn get_allocation_size(file: &File, path: &Path) -> Result<u64> {
 pub(crate) fn get_compressed_file_size(path: &Path) -> Result<u64> {
     let wide = to_wide(path);
     let mut high: u32 = 0;
-    // SAFETY: `wide` 是 null 结尾的有效 UTF-16 字符串，调用期间存活；`high` 是
     // SAFETY: `SetLastError(0)` 仅设置线程局部的 Win32 错误码，不涉及任何指针操作。
     unsafe { SetLastError(0) };
     // SAFETY: `wide` 是 null 结尾的有效 UTF-16 字符串，调用期间存活；`high` 是有效的
@@ -190,12 +189,14 @@ pub(crate) fn is_sparse(path: &Path) -> Result<bool> {
     Ok(attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0)
 }
 
-/// 查询卷的文件系统类型名（用于判断是否为 NTFS）。
+/// `FILE_SUPPORTS_SPARSE_FILES` 文件系统能力标志位。
+const FILE_SUPPORTS_SPARSE_FILES: u32 = 0x40;
+
+/// 解析 `path` 所在的卷根，并查询其文件系统名与能力标志位。
 ///
 /// `GetVolumeInformationW` 需要**卷根**路径（如 `C:\`），而传入的 `path` 通常是
-/// 文件或子目录。这里先用 `GetVolumePathNameW` 把任意路径解析为对应的卷根，
-/// 再查询文件系统名。
-pub(crate) fn get_volume_filesystem(path: &Path) -> Result<String> {
+/// 文件或子目录。这里先用 `GetVolumePathNameW` 把任意路径解析为对应的卷根。
+fn volume_info(path: &Path) -> Result<(String, u32)> {
     let wide = to_wide(path);
     // 缓冲区长度取「输入路径 UTF-16 长度 + 1」与 261 的较大值（`wide` 已含 null 结尾）。
     let buf_len = wide.len().max(261);
@@ -208,9 +209,10 @@ pub(crate) fn get_volume_filesystem(path: &Path) -> Result<String> {
         return Err(io_err("GetVolumePathNameW", path, 0));
     }
     // `GetVolumePathNameW` 写入的卷根自带 null 结尾（`vol` 已零初始化），可直接传入。
-    let mut buf: [u16; 256] = [0; 256];
-    // SAFETY: `vol` 是 null 结尾的有效 UTF-16 卷根；`buf` 容量为 256 个 u16，长度参数
-    // 按 256 给出；其余指针为 null。
+    let mut name_buf: [u16; 256] = [0; 256];
+    let mut flags: u32 = 0;
+    // SAFETY: `vol` 是 null 结尾的有效 UTF-16 卷根；`name_buf` 容量 256 个 u16、长度 256；
+    // `flags` 是有效的 u32 输出参数；其余指针为 null。
     let ret = unsafe {
         GetVolumeInformationW(
             vol.as_ptr() as PCWSTR,
@@ -218,16 +220,29 @@ pub(crate) fn get_volume_filesystem(path: &Path) -> Result<String> {
             0,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            buf.as_mut_ptr(),
+            &mut flags as *mut u32,
+            name_buf.as_mut_ptr(),
             256,
         )
     };
     if ret == FALSE {
         return Err(io_err("GetVolumeInformationW", path, 0));
     }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Ok(String::from_utf16_lossy(&buf[..len]))
+    let len = name_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(name_buf.len());
+    Ok((String::from_utf16_lossy(&name_buf[..len]), flags))
+}
+
+/// 查询卷的文件系统类型名（用于判断是否为 NTFS）。
+pub(crate) fn get_volume_filesystem(path: &Path) -> Result<String> {
+    Ok(volume_info(path)?.0)
+}
+
+/// 查询卷是否支持稀疏文件（`FILE_SUPPORTS_SPARSE_FILES` 能力位）。
+pub(crate) fn volume_supports_sparse(path: &Path) -> Result<bool> {
+    Ok(volume_info(path)?.1 & FILE_SUPPORTS_SPARSE_FILES != 0)
 }
 
 #[cfg(test)]

@@ -263,10 +263,11 @@ Step-Check -Name "Static check: no TODO/FIXME/todo!()/unimplemented!() in .rs" -
 }
 
 # ---------------------------------------------------------------------------
-# STEP 12: unsafe keyword may only appear in crates/idm-core/src/disk/win32.rs,
-#          and there each `unsafe` block must be preceded by a SAFETY: comment.
+# STEP 12: unsafe keyword may only appear in crates/idm-core/src/disk/win32.rs.
+#          (The "every `unsafe` block needs a SAFETY note" rule is now enforced
+#           by clippy's `undocumented_unsafe_blocks`, see STEP 6.)
 # ---------------------------------------------------------------------------
-Step-Check -Name "Static check: unsafe only in win32.rs with SAFETY notes" -ScriptBlock {
+Step-Check -Name "Static check: unsafe only in win32.rs" -ScriptBlock {
     $allowed = "crates/idm-core/src/disk/win32.rs".ToLower()
     $files = Get-ChildItem -Path crates -Recurse -Filter *.rs
     $ok = $true
@@ -286,27 +287,6 @@ Step-Check -Name "Static check: unsafe only in win32.rs with SAFETY notes" -Scri
                 if ($norm -notmatch [regex]::Escape($allowed)) {
                     Write-Host "  $($f.FullName):$($i + 1): unsafe outside win32.rs: $trimmed"
                     $ok = $false
-                }
-                else {
-                    # Walk backwards over blank lines and comment lines (a SAFETY note
-                    # may span several `//` lines; only the first carries `SAFETY:`).
-                    # Stop at the first non-comment, non-blank line.
-                    $j = $i - 1
-                    $found = $false
-                    while ($j -ge 0) {
-                        $t = $lines[$j].Trim()
-                        if ($t -eq '') { $j--; continue }
-                        if ($t -like '//*') {
-                            if ($t -match 'SAFETY:') { $found = $true }
-                            $j--
-                            continue
-                        }
-                        break
-                    }
-                    if (-not $found) {
-                        Write-Host "  $($f.FullName):$($i + 1): unsafe block missing preceding SAFETY: comment"
-                        $ok = $false
-                    }
                 }
             }
         }

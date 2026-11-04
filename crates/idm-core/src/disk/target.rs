@@ -5,9 +5,10 @@
 //! 创建前先查可用空间，空间不足直接报错且不创建文件；创建中途失败会删除半成品。
 
 use std::fs::{File, OpenOptions};
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use tracing::warn;
 
 use crate::disk::range::{ChunkRange, RangeRegistry};
 use crate::disk::win32;
@@ -24,6 +25,9 @@ pub enum AllocationStrategy {
     Reserve,
     /// 先 `FSCTL_SET_SPARSE` 标记为稀疏文件，再 `set_len`。
     Sparse,
+    /// 自动：卷支持稀疏文件时用 [`AllocationStrategy::Sparse`]，否则回退到
+    /// [`AllocationStrategy::SetLen`]（与 `ARCHITECTURE.md` 第 3 节决定一致）。
+    Auto,
 }
 
 /// 创建前的目标卷空间检查策略。
@@ -118,6 +122,24 @@ impl TargetFile {
                 AllocationStrategy::Sparse => {
                     // 先标记为稀疏文件（未写入区域不占物理空间），再 set_len 扩展逻辑长度。
                     win32::set_sparse(&file, &path)?;
+                    file.set_len(len).map_err(|e| Error::Io {
+                        operation: "set_len",
+                        path: path.clone(),
+                        offset: len,
+                        source: e,
+                    })?;
+                }
+                AllocationStrategy::Auto => {
+                    // 自动：卷支持稀疏文件 → Sparse；否则回退 SetLen 并打 warn 日志。
+                    let supports_sparse = win32::volume_supports_sparse(&path).unwrap_or(false);
+                    if supports_sparse {
+                        win32::set_sparse(&file, &path)?;
+                    } else {
+                        warn!(
+                            path = ?path,
+                            "volume does not support sparse files; falling back to SetLen allocation strategy"
+                        );
+                    }
                     file.set_len(len).map_err(|e| Error::Io {
                         operation: "set_len",
                         path: path.clone(),
@@ -226,32 +248,16 @@ impl TargetFile {
 
     /// 刷盘（FlushFileBuffers）。写入顺序：数据写入 → 刷盘 → 再记录进度。
     pub fn sync_data(&self) -> Result<()> {
-        self.file.sync_data().map_err(|source| Error::Io {
-            operation: "sync_data",
-            path: self.path.clone(),
-            offset: 0,
-            source,
-        })
+        self.file
+            .sync_data()
+            .map_err(|e| crate::error::io_error("sync_data", self.path.clone(), 0, e))
     }
 
     /// 在给定偏移量写入（诊断/基准用，绕过区间登记与位置追踪）。生产写入路径请使用
     /// `allocate_chunk` + `ChunkWriter` 或落盘线程池。
     pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        crate::disk::write::write_all_at(&*self.file, buf, offset).map_err(|e| {
-            if e.kind() == io::ErrorKind::WriteZero {
-                Error::WriteZero {
-                    path: self.path.clone(),
-                    offset,
-                }
-            } else {
-                Error::Io {
-                    operation: "write_at",
-                    path: self.path.clone(),
-                    offset,
-                    source: e,
-                }
-            }
-        })
+        crate::disk::write::write_all_at(&*self.file, buf, offset)
+            .map_err(|e| crate::error::io_error("write_at", self.path.clone(), offset, e))
     }
 
     /// 文件逻辑长度。

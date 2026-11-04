@@ -173,19 +173,7 @@ impl ChunkWriter {
     }
 
     fn map_io(&self, e: io::Error, operation: &'static str) -> Error {
-        if e.kind() == io::ErrorKind::WriteZero {
-            Error::WriteZero {
-                path: self.path.clone(),
-                offset: self.pos,
-            }
-        } else {
-            Error::Io {
-                operation,
-                path: self.path.clone(),
-                offset: self.pos,
-                source: e,
-            }
-        }
+        crate::error::io_error(operation, self.path.clone(), self.pos, e)
     }
 }
 

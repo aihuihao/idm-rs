@@ -165,7 +165,7 @@ async fn run_pool_concurrency(
         let r: Result<()> = t.await?;
         r?;
     }
-    pool.sync(&target)?;
+    pool.sync(&target).await?;
 
     let pool = Arc::try_unwrap(pool)
         .map_err(|_| -> Box<dyn std::error::Error> { "pool still referenced".into() })?;
@@ -262,8 +262,8 @@ mod tests {
             pool.write(&pc2, Bytes::from(vec![(10 + i) as u8; 64]))
                 .await?;
         }
-        pool.sync(&t1)?;
-        pool.sync(&t2)?;
+        pool.sync(&t1).await?;
+        pool.sync(&t2).await?;
         let pool = Arc::try_unwrap(pool)
             .map_err(|_| -> Box<dyn std::error::Error> { "pool still referenced".into() })?;
         pool.shutdown().await?;
@@ -319,6 +319,86 @@ mod tests {
         assert!(bad.is_err(), "shrink below written position must fail");
         pool.release(pc).await?;
         pool.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pool_assigns_unique_ids_two_files_many_chunks()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let p1 = tmp.path().join("a.bin");
+        let p2 = tmp.path().join("b.bin");
+        let t1 = make_target(&p1, 4096)?;
+        let t2 = make_target(&p2, 4096)?;
+        let pool = Arc::new(DiskWriterPool::new(4, 8)?);
+
+        // 两个文件**故意**都使用 chunk_id 0..7 这种相同编号，用于验证线程池用内部
+        // 分配的 `pool_id` 路由，不会因 chunk_id 撞键把文件 A 的数据写进文件 B。
+        let mut pcs1 = Vec::new();
+        let mut pcs2 = Vec::new();
+        for c in 0..8u64 {
+            pcs1.push(
+                pool.register(t1.allocate_chunk(c, c * 512, (c + 1) * 512)?)
+                    .await?,
+            );
+            pcs2.push(
+                pool.register(t2.allocate_chunk(c, c * 512, (c + 1) * 512)?)
+                    .await?,
+            );
+        }
+
+        // 并发写入：每个 chunk 由多个 64 字节小块组成。file1 内容 = offset & 0xff，
+        // file2 内容 = (offset + 0x80) & 0xff（两者不同，便于发现串写）。
+        let mut tasks = Vec::new();
+        for c in 0..8u64 {
+            let pool = pool.clone();
+            let pc1 = pcs1[c as usize].clone();
+            let pc2 = pcs2[c as usize].clone();
+            tasks.push(tokio::spawn(async move {
+                let mut off = c * 512;
+                while off < (c + 1) * 512 {
+                    let left = ((c + 1) * 512 - off).min(64);
+                    // 逐字节写入：字节值由它的绝对偏移决定，便于逐字节校验。
+                    let mut buf1 = Vec::with_capacity(left as usize);
+                    let mut buf2 = Vec::with_capacity(left as usize);
+                    for k in 0..left {
+                        let o = off + k;
+                        buf1.push((o & 0xff) as u8);
+                        buf2.push(((o + 0x80) & 0xff) as u8);
+                    }
+                    pool.write(&pc1, Bytes::from(buf1)).await?;
+                    pool.write(&pc2, Bytes::from(buf2)).await?;
+                    off += left;
+                }
+                Ok::<(), Error>(())
+            }));
+        }
+        for t in tasks {
+            let r: Result<()> = t.await?;
+            r?;
+        }
+        pool.sync(&t1).await?;
+        pool.sync(&t2).await?;
+        let pool = Arc::try_unwrap(pool)
+            .map_err(|_| -> Box<dyn std::error::Error> { "pool still referenced".into() })?;
+        pool.shutdown().await?;
+
+        let d1 = std::fs::read(&p1)?;
+        let d2 = std::fs::read(&p2)?;
+        assert_eq!(d1.len(), 4096);
+        assert_eq!(d2.len(), 4096);
+        for off in 0..4096u64 {
+            assert_eq!(
+                d1[off as usize],
+                (off & 0xff) as u8,
+                "file1 mismatch at {off}"
+            );
+            assert_eq!(
+                d2[off as usize],
+                ((off + 0x80) & 0xff) as u8,
+                "file2 mismatch at {off}"
+            );
+        }
         Ok(())
     }
 }

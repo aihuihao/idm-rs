@@ -55,7 +55,65 @@ pub enum Error {
     /// 落盘线程池已关闭，无法再提交写请求。
     #[error("disk writer pool is closed")]
     PoolClosed,
+
+    /// 写入过程中磁盘空间不足（系统错误码 112 ERROR_DISK_FULL / 39
+    /// ERROR_HANDLE_DISK_FULL）。与创建前的 [`Error::DiskFull`] 区分，但
+    /// [`Error::is_disk_full`] 对两者都返回 `true`。
+    #[error("disk full during write on {path:?} at offset {offset}")]
+    DiskFullDuringWrite { path: PathBuf, offset: u64 },
+
+    /// 向落盘线程池写入/注销一个未注册（或已 release）的 chunk。
+    #[error(
+        "chunk not registered in disk writer pool: pool_id={pool_id}, chunk_id={chunk_id}, path={path:?}"
+    )]
+    ChunkNotRegistered {
+        pool_id: u64,
+        chunk_id: u64,
+        path: PathBuf,
+    },
+
+    /// 落盘线程池构造参数非法（线程数或队列容量为 0）。
+    #[error("invalid disk writer pool config: {message}")]
+    InvalidPoolConfig { message: String },
 }
 
 /// 便捷 Result 别名。
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// 是否为磁盘空间不足（创建前预检查或写盘过程中）。`DiskFull` 与
+    /// `DiskFullDuringWrite` 都返回 `true`，便于上层统一处理暂停/重试。
+    pub fn is_disk_full(&self) -> bool {
+        matches!(
+            self,
+            Error::DiskFull { .. } | Error::DiskFullDuringWrite { .. }
+        )
+    }
+}
+
+/// 把底层 IO 错误包装为强类型错误，并把系统错误码 112 / 39 统一映射为
+/// [`Error::DiskFullDuringWrite`]，0 字节短写映射为 [`Error::WriteZero`]。
+pub(crate) fn io_error(
+    operation: &'static str,
+    path: PathBuf,
+    offset: u64,
+    e: std::io::Error,
+) -> Error {
+    if is_disk_full_io(&e) {
+        Error::DiskFullDuringWrite { path, offset }
+    } else if e.kind() == std::io::ErrorKind::WriteZero {
+        Error::WriteZero { path, offset }
+    } else {
+        Error::Io {
+            operation,
+            path,
+            offset,
+            source: e,
+        }
+    }
+}
+
+/// 系统错误码 112（ERROR_DISK_FULL）或 39（ERROR_HANDLE_DISK_FULL）视为磁盘满。
+fn is_disk_full_io(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(112) | Some(39))
+}
