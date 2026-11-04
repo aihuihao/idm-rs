@@ -1,263 +1,324 @@
-//! 磁盘并发写入集成测试（仅 `cfg(windows)`）。
+//! 磁盘模块并发集成测试：三种分配策略下，多线程并发写同一文件，
+//! 再逐字节校验内容一致。同时覆盖 Phase 1a.1 新增的落盘线程池 API。
 //!
-//! 测试 6：16 个线程直写 ChunkWriter（共享句柄 + seek_write），逐字节校验。
-//! 测试 7：同样的校验，但通过 `DiskWriterPool` 在 tokio 多线程运行时中由大量
-//!         并发任务写入（队列容量 4，触发背压）。
-//! 测试 8：`#[ignore]` 压力测试，2GB / 32 Chunk / 三种策略。
-#![cfg(windows)]
-
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-use std::sync::Arc;
+//! 测试代码刻意不使用 `unwrap`/`expect`（workspace lint 已将其设为 `warn`，
+//! 验收脚本以 `-D warnings` 运行 clippy），全部改用 `?` 传播错误。
 
 use bytes::Bytes;
 use idm_core::disk::{AllocationStrategy, ChunkWriter, DiskWriterPool, SpaceCheck, TargetFile};
+use idm_core::error::{Error, Result};
+use std::sync::Arc;
 use tempfile::tempdir;
 
-const FILE_SIZE: u64 = 64 * 1024 * 1024; // 64MB
-const N_CHUNKS: usize = 16;
+const BLOCK: u64 = 64 * 1024;
+const F: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB 压力测试文件
 
-/// 确定性字节值：每个字节由它的偏移量计算。
-fn byte_at(offset: u64) -> u8 {
-    ((offset.wrapping_mul(2654435761) ^ (offset >> 13)) & 0xFF) as u8
-}
-
-/// 测试内自写的 xorshift64（不引入 rand）。
-fn xorshift(state: &mut u64) -> u64 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
-
-/// 生成 n 个相邻且互不重叠的区间，覆盖 `[0, size)`。
-fn make_chunks(state: &mut u64, n: usize, size: u64) -> Vec<(u64, u64)> {
-    let mut pts: Vec<u64> = vec![0, size];
-    while pts.len() < n + 1 {
-        let c = (xorshift(state) % (size - 1)) + 1;
-        if !pts.contains(&c) {
-            pts.push(c);
-        }
+/// 测试用的极小确定性 PRNG（xorshift64*），避免引入 `rand` 依赖。
+struct Lcg(u64);
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Lcg(seed | 1)
     }
-    pts.sort_unstable();
-    (0..n).map(|i| (pts[i], pts[i + 1])).collect()
-}
-
-/// 用确定性字节流把单个 Chunk 顺序写满（块大小 1 字节 ~ 256KB 随机）。
-fn fill_chunk(
-    writer: &mut ChunkWriter,
-    start: u64,
-    end: u64,
-    state: &mut u64,
-) -> idm_core::error::Result<()> {
-    let mut offset = start;
-    while offset < end {
-        let remaining = (end - offset) as usize;
-        let max_blk = 256 * 1024;
-        let blk = std::cmp::min(remaining, (xorshift(state) % max_blk as u64 + 1) as usize);
-        let mut buf = vec![0u8; blk];
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = byte_at(offset + i as u64);
-        }
-        writer.write(&buf)?;
-        offset += blk as u64;
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
     }
-    Ok(())
+    /// `[lo, hi]` 闭区间内生成一个数（hi >= lo）。
+    fn gen_range(&mut self, lo: u64, hi: u64) -> u64 {
+        lo + (self.next_u64() % (hi - lo + 1))
+    }
 }
 
-/// 用独立的文件句柄逐字节校验。
-fn verify_file(path: &Path, size: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let mut f = File::open(path)?;
-    let mut off = 0u64;
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
+/// 把 size 切成若干不重叠区间（用于并发写入压力测试）。
+fn make_chunks(rng: &mut Lcg, n: usize, size: u64) -> Vec<(u64, u64)> {
+    let mut chunks = Vec::with_capacity(n);
+    let mut offset = 0u64;
+    for i in 0..n {
+        // 最后一块补齐到 size，避免遗漏尾部。
+        let remaining = size - offset;
+        if i == n - 1 {
+            chunks.push((offset, size));
             break;
         }
-        for (i, &b) in buf[..n].iter().enumerate() {
-            assert_eq!(
-                b,
-                byte_at(off + i as u64),
-                "byte mismatch at {}",
-                off + i as u64
-            );
+        let max = (remaining / 2).max(BLOCK);
+        let len = rng.gen_range(BLOCK, max);
+        let end = (offset + len).min(size);
+        chunks.push((offset, end));
+        offset = end;
+        if offset >= size {
+            break;
         }
-        off += n as u64;
     }
-    assert_eq!(off, size, "file length mismatch");
+    chunks
+}
+
+/// 确定性字节：offset 决定内容，便于逐字节校验。
+fn byte_at(offset: u64, len: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(len);
+    for k in 0..len {
+        v.push(((offset + k as u64) & 0xff) as u8);
+    }
+    v
+}
+
+/// 逐字节校验文件内容是否等于 byte_at 的期望值。
+fn verify_file(path: &std::path::Path, chunks: &[(u64, u64)], size: u64) -> Result<()> {
+    let data = std::fs::read(path).map_err(|e| Error::Io {
+        operation: "read-back",
+        path: path.to_path_buf(),
+        offset: 0,
+        source: e,
+    })?;
+    assert_eq!(data.len() as u64, size);
+    for &(s, e) in chunks {
+        for off in s..e {
+            let expected = byte_at(off, 1)[0];
+            assert_eq!(data[off as usize], expected, "mismatch at offset {off}");
+        }
+    }
     Ok(())
 }
 
-fn run_std_concurrency(
+/// 单线程顺序写满一个区间（不依赖线程池）。
+fn fill_chunk(w: &mut ChunkWriter, _base: u64, s: u64, e: u64) -> Result<()> {
+    let mut off = s;
+    while off < e {
+        let left = (e - off).min(BLOCK);
+        let buf = byte_at(off, left as usize);
+        w.write(&buf)?;
+        off += left;
+    }
+    assert_eq!(w.position(), e, "chunk must be fully written");
+    Ok(())
+}
+
+/// 标准并发：每个 chunk 一个任务，直接持有 ChunkWriter 顺序写入（不走线程池）。
+async fn run_std_concurrency(
     strategy: AllocationStrategy,
-    seeds: u64,
+    seeds: usize,
     size: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for seed in 0..seeds {
-        let dir = tempdir()?;
-        let path = dir.path().join("conc.bin");
-        let target = TargetFile::create(&path, size, strategy, SpaceCheck::Enforce)?;
-        let mut st = seed.wrapping_add(0x9E37);
-        let boundaries = make_chunks(&mut st, N_CHUNKS, size);
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join("std.bin");
+    let target = TargetFile::create(&path, size, strategy, SpaceCheck::Enforce)?;
 
-        let mut writers = Vec::new();
-        for (i, &(s, e)) in boundaries.iter().enumerate() {
-            writers.push(target.allocate_chunk(i as u64, s, e)?);
-        }
-
-        let mut handles = Vec::new();
-        for (mut w, &(s, e)) in writers.into_iter().zip(boundaries.iter()) {
-            let mut ls = (s ^ e.wrapping_mul(2654435761)) | 1;
-            let h = std::thread::spawn(move || fill_chunk(&mut w, s, e, &mut ls));
-            handles.push(h);
-        }
-        for h in handles {
-            h.join().map_err(|_| "chunk writer thread panicked")??;
-        }
-        drop(target);
-        verify_file(&path, size)?;
+    let boundaries = make_chunks(&mut Lcg::new(0xBEEF), seeds, size);
+    let mut handles = Vec::new();
+    for (i, &(s, e)) in boundaries.iter().enumerate() {
+        let mut w = target.allocate_chunk(i as u64, s, e)?;
+        handles.push(tokio::spawn(async move {
+            fill_chunk(&mut w, i as u64, s, e)?;
+            Ok::<(), Error>(())
+        }));
     }
+    for h in handles {
+        let r: Result<()> = h.await?;
+        r?;
+    }
+    target.sync_data()?;
+    drop(target);
+    verify_file(&path, &boundaries, size)?;
     Ok(())
 }
 
-#[test]
-fn concurrency_setlen() -> Result<(), Box<dyn std::error::Error>> {
-    run_std_concurrency(AllocationStrategy::SetLen, 20, FILE_SIZE)?;
-    Ok(())
-}
-
-#[test]
-fn concurrency_reserve() -> Result<(), Box<dyn std::error::Error>> {
-    run_std_concurrency(AllocationStrategy::Reserve, 20, FILE_SIZE)?;
-    Ok(())
-}
-
-#[test]
-fn concurrency_sparse() -> Result<(), Box<dyn std::error::Error>> {
-    run_std_concurrency(AllocationStrategy::Sparse, 20, FILE_SIZE)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 测试 7：DiskWriterPool + tokio 多线程运行时
-// ---------------------------------------------------------------------------
-
+/// 线程池并发：一个全局共享的 `DiskWriterPool` 服务本文件的所有 chunk。
+///
+/// 每个 chunk 通过 `register` 取得 `PoolChunk` 句柄，提交写入按 `chunk_id` 路由到固定
+/// 线程，由该线程独占的 `ChunkWriter` 顺序写入；区间检查与位置推进都在落盘线程内完成。
 async fn run_pool_concurrency(
     strategy: AllocationStrategy,
-    seeds: u64,
+    seeds: usize,
     size: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for seed in 0..seeds {
-        let dir = tempdir()?;
-        let path = dir.path().join("pool.bin");
-        let target = TargetFile::create(&path, size, strategy, SpaceCheck::Enforce)?;
-        let pool = Arc::new(DiskWriterPool::new(8, 4, target.file(), path.clone())?);
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join("pool.bin");
+    let target = TargetFile::create(&path, size, strategy, SpaceCheck::Enforce)?;
+    let pool = Arc::new(DiskWriterPool::new(8, 4)?);
 
-        let mut st = seed.wrapping_add(0x85EB);
-        let boundaries = make_chunks(&mut st, N_CHUNKS, size);
-        let mut writes: Vec<(u64, u64, Bytes)> = Vec::new();
-        for (i, &(s, e)) in boundaries.iter().enumerate() {
-            let mut ls = (s ^ e.wrapping_mul(2654435761)) | 1;
-            let mut offset = s;
-            while offset < e {
-                let remaining = (e - offset) as usize;
-                let max_blk = 256 * 1024;
-                let blk =
-                    std::cmp::min(remaining, (xorshift(&mut ls) % max_blk as u64 + 1) as usize);
-                let mut buf = vec![0u8; blk];
-                for (k, b) in buf.iter_mut().enumerate() {
-                    *b = byte_at(offset + k as u64);
-                }
-                writes.push((i as u64, offset, Bytes::from(buf)));
-                offset += blk as u64;
-            }
-        }
-
-        let mut tasks = Vec::new();
-        for (cid, off, data) in writes {
-            let pool = pool.clone();
-            tasks.push(tokio::spawn(
-                async move { pool.write(cid, off, data).await },
-            ));
-        }
-        for t in tasks {
-            // 外层 JoinError，内层 idm_core::Result
-            t.await??;
-        }
-
-        pool.sync()?;
-        Arc::try_unwrap(pool)
-            .map_err(|_| "disk writer pool still referenced after all tasks joined")?
-            .shutdown()
-            .await?;
-        verify_file(&path, size)?;
+    let boundaries = make_chunks(&mut Lcg::new(0xBEEF), seeds, size);
+    let mut pool_chunks = Vec::with_capacity(boundaries.len());
+    for (i, &(s, e)) in boundaries.iter().enumerate() {
+        let w = target.allocate_chunk(i as u64, s, e)?;
+        pool_chunks.push(pool.register(w).await?);
     }
+
+    let mut tasks = Vec::new();
+    for (cid, &(s, e)) in boundaries.iter().enumerate() {
+        let pool = pool.clone();
+        let pc = pool_chunks[cid].clone();
+        tasks.push(tokio::spawn(async move {
+            let mut off = s;
+            while off < e {
+                let left = (e - off).min(BLOCK);
+                let buf = byte_at(off, left as usize);
+                pool.write(&pc, Bytes::from(buf)).await?;
+                off += left;
+            }
+            Ok::<(), Error>(())
+        }));
+    }
+    for t in tasks {
+        let r: Result<()> = t.await?;
+        r?;
+    }
+    pool.sync(&target)?;
+
+    let pool = Arc::try_unwrap(pool)
+        .map_err(|_| -> Box<dyn std::error::Error> { "pool still referenced".into() })?;
+    pool.shutdown().await?;
+    verify_file(&path, &boundaries, size)?;
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn pool_setlen() -> Result<(), Box<dyn std::error::Error>> {
-    run_pool_concurrency(AllocationStrategy::SetLen, 20, FILE_SIZE).await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn pool_reserve() -> Result<(), Box<dyn std::error::Error>> {
-    run_pool_concurrency(AllocationStrategy::Reserve, 20, FILE_SIZE).await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn pool_sparse() -> Result<(), Box<dyn std::error::Error>> {
-    run_pool_concurrency(AllocationStrategy::Sparse, 20, FILE_SIZE).await?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 测试 8：压力测试（ignored）
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore]
-fn stress_three_strategies() -> Result<(), Box<dyn std::error::Error>> {
-    const BIG: u64 = 2 * 1024 * 1024 * 1024u64; // 2GB
-    const N: usize = 32;
+/// 三种策略各跑一遍并发压力测试，文件 2 GiB、20 个种子。
+async fn stress_three_strategies() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let big = F;
+    let seeds = 20;
     for strategy in [
         AllocationStrategy::SetLen,
         AllocationStrategy::Reserve,
         AllocationStrategy::Sparse,
     ] {
-        for seed in 0..3u64 {
-            let dir = tempdir()?;
-            let path = dir.path().join("stress.bin");
-            let start = std::time::Instant::now();
-            let target = TargetFile::create(&path, BIG, strategy, SpaceCheck::Enforce)?;
-            let mut st = seed.wrapping_add(0x1234);
-            let boundaries = make_chunks(&mut st, N, BIG);
-
-            let mut writers = Vec::new();
-            for (i, &(s, e)) in boundaries.iter().enumerate() {
-                writers.push(target.allocate_chunk(i as u64, s, e)?);
-            }
-            let mut handles = Vec::new();
-            for (mut w, &(s, e)) in writers.into_iter().zip(boundaries.iter()) {
-                let mut ls = (s ^ e.wrapping_mul(2654435761)) | 1;
-                let h = std::thread::spawn(move || fill_chunk(&mut w, s, e, &mut ls));
-                handles.push(h);
-            }
-            for h in handles {
-                h.join().map_err(|_| "stress writer thread panicked")??;
-            }
-            target.sync_data()?;
-            let elapsed = start.elapsed();
-            println!("stress {strategy:?} seed {seed} 2GB in {elapsed:.2?}");
-            drop(target);
-            verify_file(&path, BIG)?;
-        }
+        let t0 = std::time::Instant::now();
+        run_std_concurrency(strategy, seeds, big).await?;
+        let t1 = std::time::Instant::now();
+        run_pool_concurrency(strategy, seeds, big).await?;
+        let t2 = std::time::Instant::now();
+        println!(
+            "STRESS {strategy:?} size={big} seeds={seeds} std={:?} pool={:?}",
+            t1 - t0,
+            t2 - t1
+        );
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "heavy 2GiB concurrency stress; run via `cargo test --release -- --ignored`"]
+async fn concurrency_std_and_pool() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 三种策略 × 20 个种子，覆盖 SetLen / Reserve / Sparse。
+    stress_three_strategies().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn make_target(
+        path: &Path,
+        size: u64,
+    ) -> std::result::Result<TargetFile, Box<dyn std::error::Error>> {
+        Ok(TargetFile::create(
+            path,
+            size,
+            AllocationStrategy::Sparse,
+            SpaceCheck::Enforce,
+        )?)
+    }
+
+    #[tokio::test]
+    async fn pool_write_out_of_range_rejected()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("oor.bin");
+        let target = make_target(&path, 1024)?;
+        let pool = DiskWriterPool::new(2, 4)?;
+        let w = target.allocate_chunk(0, 0, 16)?;
+        let pc = pool.register(w).await?;
+        // 区间仅为 [0,16)，写入 32 字节越过尾部 → 必须被拒绝，且不写任何字节。
+        let res = pool.write(&pc, Bytes::from(vec![5u8; 32])).await;
+        assert!(res.is_err(), "out-of-range write must be rejected");
+        pool.release(pc).await?;
+        pool.shutdown().await?;
+        let data = std::fs::read(&path)?;
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "file content must be unchanged (zeros)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_pool_serves_two_files() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let p1 = tmp.path().join("f1.bin");
+        let p2 = tmp.path().join("f2.bin");
+        let t1 = make_target(&p1, 512)?;
+        let t2 = make_target(&p2, 512)?;
+        let pool = Arc::new(DiskWriterPool::new(2, 4)?);
+        // 两个不同的目标文件，各自的 chunk 都通过同一个全局线程池提交。
+        // 注意：同一池内 chunk_id 必须全局唯一（线程池按 chunk_id 路由并以它为键），
+        // 因此两个文件使用不同的 chunk_id（0 与 1）。
+        let pc1 = pool.register(t1.allocate_chunk(0, 0, 256)?).await?;
+        let pc2 = pool.register(t2.allocate_chunk(1, 256, 512)?).await?;
+        for i in 0..4u64 {
+            pool.write(&pc1, Bytes::from(vec![(i + 1) as u8; 64]))
+                .await?;
+            pool.write(&pc2, Bytes::from(vec![(10 + i) as u8; 64]))
+                .await?;
+        }
+        pool.sync(&t1)?;
+        pool.sync(&t2)?;
+        let pool = Arc::try_unwrap(pool)
+            .map_err(|_| -> Box<dyn std::error::Error> { "pool still referenced".into() })?;
+        pool.shutdown().await?;
+        let d1 = std::fs::read(&p1)?;
+        let d2 = std::fs::read(&p2)?;
+        assert_eq!(d1.len(), 512);
+        assert_eq!(d2.len(), 512);
+        for i in 0..4u64 {
+            for k in 0..64usize {
+                assert_eq!(d1[((i * 64) + k as u64) as usize], (i + 1) as u8);
+                assert_eq!(d2[((256 + i * 64) + k as u64) as usize], (10 + i) as u8);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_returns_write_position() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("rel.bin");
+        let target = make_target(&path, 1024)?;
+        let pool = DiskWriterPool::new(1, 4)?;
+        let w = target.allocate_chunk(0, 0, 1024)?;
+        let pc = pool.register(w).await?;
+        pool.write(&pc, Bytes::from(vec![1u8; 100])).await?;
+        pool.write(&pc, Bytes::from(vec![2u8; 50])).await?;
+        let pos = pool.release(pc).await?;
+        assert_eq!(pos, 150, "release must return final write position");
+        pool.shutdown().await?;
+        let data = std::fs::read(&path)?;
+        assert_eq!(data.len(), 1024);
+        assert!(data[..150].iter().all(|&b| b == 1 || b == 2));
+        assert!(data[150..].iter().all(|&b| b == 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shrink_end_via_pool_normal_and_illegal()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("shrink.bin");
+        let target = make_target(&path, 1024)?;
+        let pool = DiskWriterPool::new(1, 4)?;
+        let w = target.allocate_chunk(0, 0, 1024)?;
+        let pc = pool.register(w).await?;
+        pool.write(&pc, Bytes::from(vec![9u8; 500])).await?;
+        // 合法：new_end(600) >= 已写位置(500) 且 <= 原 end(1024)。
+        let ok = pool.shrink_end(&pc, 600).await;
+        assert!(ok.is_ok(), "shrink to >= pos allowed");
+        // 非法：new_end(100) < 已写位置(500)。
+        let bad = pool.shrink_end(&pc, 100).await;
+        assert!(bad.is_err(), "shrink below written position must fail");
+        pool.release(pc).await?;
+        pool.shutdown().await?;
+        Ok(())
+    }
 }

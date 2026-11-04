@@ -5,11 +5,9 @@
 //! 创建前先查可用空间，空间不足直接报错且不创建文件；创建中途失败会删除半成品。
 
 use std::fs::{File, OpenOptions};
-use std::os::windows::io::AsRawHandle;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-use windows_sys::Win32::Foundation::HANDLE;
 
 use crate::disk::range::{ChunkRange, RangeRegistry};
 use crate::disk::win32;
@@ -96,7 +94,6 @@ impl TargetFile {
                 source: e,
             })?;
 
-        let handle = file.as_raw_handle() as HANDLE;
         let alloc = || -> Result<()> {
             match strategy {
                 AllocationStrategy::SetLen => {
@@ -110,7 +107,7 @@ impl TargetFile {
                 AllocationStrategy::Reserve => {
                     // 先预留物理分配大小（AllocationSize = len），再扩展逻辑长度到 len。
                     // 这样逻辑长度落在已分配区间内，避免 NTFS 在扩展 EOF 时再自动分配并补零。
-                    win32::set_file_allocation(handle, len)?;
+                    win32::set_file_allocation(&file, &path, len)?;
                     file.set_len(len).map_err(|e| Error::Io {
                         operation: "set_len",
                         path: path.clone(),
@@ -120,7 +117,7 @@ impl TargetFile {
                 }
                 AllocationStrategy::Sparse => {
                     // 先标记为稀疏文件（未写入区域不占物理空间），再 set_len 扩展逻辑长度。
-                    win32::set_sparse(handle)?;
+                    win32::set_sparse(&file, &path)?;
                     file.set_len(len).map_err(|e| Error::Io {
                         operation: "set_len",
                         path: path.clone(),
@@ -206,7 +203,6 @@ impl TargetFile {
 
     /// 读取文件空间信息（逻辑长度、分配大小、实际占用、是否稀疏）。
     pub fn allocation_info(&self) -> Result<AllocationInfo> {
-        let handle = self.file.as_raw_handle() as HANDLE;
         let logical_len = self
             .file
             .metadata()
@@ -217,7 +213,7 @@ impl TargetFile {
                 source: e,
             })?
             .len();
-        let allocation_size = win32::get_allocation_size(handle)?;
+        let allocation_size = win32::get_allocation_size(&self.file, &self.path)?;
         let compressed_size = win32::get_compressed_file_size(&self.path)?;
         let is_sparse = win32::is_sparse(&self.path)?;
         Ok(AllocationInfo {
@@ -230,8 +226,32 @@ impl TargetFile {
 
     /// 刷盘（FlushFileBuffers）。写入顺序：数据写入 → 刷盘 → 再记录进度。
     pub fn sync_data(&self) -> Result<()> {
-        let handle = self.file.as_raw_handle() as HANDLE;
-        win32::flush_buffers(handle)
+        self.file.sync_data().map_err(|source| Error::Io {
+            operation: "sync_data",
+            path: self.path.clone(),
+            offset: 0,
+            source,
+        })
+    }
+
+    /// 在给定偏移量写入（诊断/基准用，绕过区间登记与位置追踪）。生产写入路径请使用
+    /// `allocate_chunk` + `ChunkWriter` 或落盘线程池。
+    pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        crate::disk::write::write_all_at(&*self.file, buf, offset).map_err(|e| {
+            if e.kind() == io::ErrorKind::WriteZero {
+                Error::WriteZero {
+                    path: self.path.clone(),
+                    offset,
+                }
+            } else {
+                Error::Io {
+                    operation: "write_at",
+                    path: self.path.clone(),
+                    offset,
+                    source: e,
+                }
+            }
+        })
     }
 
     /// 文件逻辑长度。
@@ -245,7 +265,7 @@ impl TargetFile {
     }
 
     /// 共享文件句柄（供落盘线程池使用）。
-    pub fn file(&self) -> Arc<File> {
+    pub(crate) fn file(&self) -> Arc<File> {
         self.file.clone()
     }
 

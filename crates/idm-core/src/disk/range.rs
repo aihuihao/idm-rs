@@ -65,7 +65,7 @@ impl ChunkRange {
     }
 }
 
-/// 目标文件内部的区间登记表：把 `chunk_id` 映射到已登记的 [`ChunkRange`]。
+/// 目标文件内部的区间登记表：把 `chunk_id` 映射到已登记的 `ChunkRange`。
 ///
 /// 持锁期间只做区间查找与更新，不做任何 IO。
 pub(crate) struct RangeRegistry {

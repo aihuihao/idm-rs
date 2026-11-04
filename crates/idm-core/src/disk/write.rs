@@ -104,6 +104,16 @@ impl ChunkWriter {
         self.pos
     }
 
+    /// 该写器对应的 chunk 编号（供落盘线程池路由）。
+    pub fn chunk_id(&self) -> u64 {
+        self.chunk_id
+    }
+
+    /// 该写器对应的目标文件路径（供落盘线程池在错误中携带）。
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// 写入一块数据；先校验不越出区间尾部，越界则报错且一个字节都不写。
     pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let end_offset =

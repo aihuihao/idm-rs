@@ -353,6 +353,20 @@ $dups = Invoke-Step -Name "cargo tree -d" -ScriptBlock { cargo tree --workspace 
 Write-Host $dups.Output.Trim()
 
 # ---------------------------------------------------------------------------
+# STEP 15: 文档注释 / 链接检查（rustdoc -D warnings）
+# ---------------------------------------------------------------------------
+$stepNumber++
+Write-Host "[STEP $stepNumber] cargo doc --workspace --no-deps --locked (RUSTDOCFLAGS=-D warnings)"
+$env:RUSTDOCFLAGS = "-D warnings"
+$doc = Invoke-Step -Name "cargo doc" -ScriptBlock { cargo doc --workspace --no-deps --locked }
+if ($doc.ExitCode -ne 0) {
+    Write-Host "FAIL (exit=$($doc.ExitCode))"
+    Write-Host $doc.Output
+    exit 1
+}
+Write-Host "PASS"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Host "=============================================="

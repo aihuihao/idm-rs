@@ -1,20 +1,23 @@
 //! 唯一允许 `unsafe` 的子模块：对 Win32 API 的薄封装。
 //!
-//! 本文件顶部 [`#![allow(unsafe_code)]`](unsafe_code) 是本阶段唯一被允许的
-//! `#[allow]`。所有 FFI 调用都被封装成安全函数，其它子模块不得直接调用
-//! windows-sys。每个 `unsafe` 块上方都有对应的 `// SAFETY:` 注释。
+//! 本文件顶部 `#![allow(unsafe_code)]` 是本阶段唯一被允许的 `#[allow]`。所有 FFI
+//! 调用都被封装成安全函数，其它子模块不得直接调用 windows-sys。每个 `unsafe` 块上方
+//! 都有对应的 `// SAFETY:` 注释。
 
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
+use std::fs::File;
+use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{FALSE, HANDLE};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE, SetLastError};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_SPARSE_FILE, FILE_STANDARD_INFO, FileAllocationInfo,
-    FileStandardInfo, FlushFileBuffers, GetCompressedFileSizeW, GetDiskFreeSpaceExW,
-    GetFileAttributesW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
+    FileStandardInfo, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetFileAttributesW,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
     SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
@@ -46,9 +49,15 @@ fn io_err(operation: &'static str, path: &Path, offset: u64) -> Error {
 ///
 /// `GetDiskFreeSpaceExW` 要求路径必须存在，因此传入尚未创建的文件路径会失败。
 /// 这里统一查询 **父目录**（创建场景里父目录必然存在），既能覆盖"文件尚未存在"
-/// 的 `create` 前置检查，也兼容传入已有目录/文件的场景。
+/// 的 `create` 前置检查，也兼容传入已有目录/文件的场景。相对路径（如 `x.bin`）的
+/// 父目录为空，退化为当前目录 `.`。
 pub(crate) fn get_disk_free_space(path: &Path) -> Result<u64> {
-    let query = path.parent().unwrap_or(path);
+    let parent = path.parent().unwrap_or(path);
+    let query = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     let wide = to_wide(query);
     let mut free: u64 = 0;
     // SAFETY: `wide` 是 null 结尾的有效 UTF-16 字符串，调用期间存活；`free` 是
@@ -68,10 +77,17 @@ pub(crate) fn get_disk_free_space(path: &Path) -> Result<u64> {
 }
 
 /// 通过 `SetFileInformationByHandle(FileAllocationInfo)` 预留物理分配大小。
-pub(crate) fn set_file_allocation(handle: HANDLE, size: u64) -> Result<()> {
+pub(crate) fn set_file_allocation(file: &File, path: &Path, size: u64) -> Result<()> {
+    let alloc = i64::try_from(size).map_err(|_| Error::Io {
+        operation: "set_file_allocation size overflow",
+        path: path.to_path_buf(),
+        offset: size,
+        source: io::Error::other("size exceeds i64::MAX"),
+    })?;
     let info = FILE_ALLOCATION_INFO {
-        AllocationSize: size as i64,
+        AllocationSize: alloc,
     };
+    let handle = file.as_raw_handle() as HANDLE;
     // SAFETY: `info` 是栈上的固定大小结构，调用期间有效；长度按结构大小给出。
     let ret = unsafe {
         SetFileInformationByHandle(
@@ -84,7 +100,7 @@ pub(crate) fn set_file_allocation(handle: HANDLE, size: u64) -> Result<()> {
     if ret == FALSE {
         return Err(Error::Io {
             operation: "SetFileInformationByHandle(FileAllocationInfo)",
-            path: std::path::PathBuf::new(),
+            path: path.to_path_buf(),
             offset: size,
             source: std::io::Error::last_os_error(),
         });
@@ -93,7 +109,8 @@ pub(crate) fn set_file_allocation(handle: HANDLE, size: u64) -> Result<()> {
 }
 
 /// 通过 `DeviceIoControl(FSCTL_SET_SPARSE)` 把文件标记为稀疏文件。
-pub(crate) fn set_sparse(handle: HANDLE) -> Result<()> {
+pub(crate) fn set_sparse(file: &File, path: &Path) -> Result<()> {
+    let handle = file.as_raw_handle() as HANDLE;
     let mut bytes_returned: u32 = 0;
     // SAFETY: FSCTL_SET_SPARSE 不需要输入/输出缓冲区；`lpOverlapped` 传 null 表示
     // 同步完成。所有指针均为 null 或有效的栈变量。
@@ -112,7 +129,7 @@ pub(crate) fn set_sparse(handle: HANDLE) -> Result<()> {
     if ret == FALSE {
         return Err(Error::Io {
             operation: "DeviceIoControl(FSCTL_SET_SPARSE)",
-            path: std::path::PathBuf::new(),
+            path: path.to_path_buf(),
             offset: 0,
             source: std::io::Error::last_os_error(),
         });
@@ -121,7 +138,8 @@ pub(crate) fn set_sparse(handle: HANDLE) -> Result<()> {
 }
 
 /// 通过 `GetFileInformationByHandleEx(FileStandardInfo)` 读取物理分配大小。
-pub(crate) fn get_allocation_size(handle: HANDLE) -> Result<u64> {
+pub(crate) fn get_allocation_size(file: &File, path: &Path) -> Result<u64> {
+    let handle = file.as_raw_handle() as HANDLE;
     // SAFETY: FILE_STANDARD_INFO 是固定大小结构，零初始化后由下面的调用填充。
     let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
     // SAFETY: `info` 是栈上的固定大小结构，调用期间有效；长度按结构大小给出。
@@ -136,7 +154,7 @@ pub(crate) fn get_allocation_size(handle: HANDLE) -> Result<u64> {
     if ret == FALSE {
         return Err(Error::Io {
             operation: "GetFileInformationByHandleEx(FileStandardInfo)",
-            path: std::path::PathBuf::new(),
+            path: path.to_path_buf(),
             offset: 0,
             source: std::io::Error::last_os_error(),
         });
@@ -149,7 +167,11 @@ pub(crate) fn get_compressed_file_size(path: &Path) -> Result<u64> {
     let wide = to_wide(path);
     let mut high: u32 = 0;
     // SAFETY: `wide` 是 null 结尾的有效 UTF-16 字符串，调用期间存活；`high` 是
-    // 有效的 u32 输出参数（容纳大小的高 32 位）。
+    // SAFETY: `SetLastError(0)` 仅设置线程局部的 Win32 错误码，不涉及任何指针操作。
+    unsafe { SetLastError(0) };
+    // SAFETY: `wide` 是 null 结尾的有效 UTF-16 字符串，调用期间存活；`high` 是有效的
+    // u32 输出参数（容纳大小的高 32 位）。按 MSDN：若返回 `INVALID_FILE_SIZE`
+    // （0xffffffff）且 `GetLastError()` 不为 0 才表示失败，否则 0xffffffff 也可能是合法大小。
     let low = unsafe { GetCompressedFileSizeW(wide.as_ptr() as PCWSTR, &mut high as *mut u32) };
     if low == 0xffff_ffff && std::io::Error::last_os_error().raw_os_error() != Some(0) {
         return Err(io_err("GetCompressedFileSizeW", path, 0));
@@ -168,21 +190,6 @@ pub(crate) fn is_sparse(path: &Path) -> Result<bool> {
     Ok(attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0)
 }
 
-/// 通过 `FlushFileBuffers` 把文件数据刷到磁盘。
-pub(crate) fn flush_buffers(handle: HANDLE) -> Result<()> {
-    // SAFETY: `handle` 是调用方在调用期间持有的有效文件句柄。
-    let ret = unsafe { FlushFileBuffers(handle) };
-    if ret == FALSE {
-        return Err(Error::Io {
-            operation: "FlushFileBuffers",
-            path: std::path::PathBuf::new(),
-            offset: 0,
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    Ok(())
-}
-
 /// 查询卷的文件系统类型名（用于判断是否为 NTFS）。
 ///
 /// `GetVolumeInformationW` 需要**卷根**路径（如 `C:\`），而传入的 `path` 通常是
@@ -190,17 +197,20 @@ pub(crate) fn flush_buffers(handle: HANDLE) -> Result<()> {
 /// 再查询文件系统名。
 pub(crate) fn get_volume_filesystem(path: &Path) -> Result<String> {
     let wide = to_wide(path);
-    let mut vol: [u16; 256] = [0; 256];
-    // SAFETY: `wide` 是 null 结尾的有效 UTF-16 字符串；`vol` 容量为 256 个 u16，
-    // 长度参数按 256 给出；该 API 只写入 `vol`，不会读取越界。
-    let ret = unsafe { GetVolumePathNameW(wide.as_ptr() as PCWSTR, vol.as_mut_ptr(), 256) };
+    // 缓冲区长度取「输入路径 UTF-16 长度 + 1」与 261 的较大值（`wide` 已含 null 结尾）。
+    let buf_len = wide.len().max(261);
+    let mut vol: Vec<u16> = vec![0; buf_len];
+    let vol_ptr = vol.as_mut_ptr();
+    // SAFETY: `wide` 是 null 结尾的有效 UTF-16；`vol` 容量为 buf_len 个 u16，长度参数按
+    // buf_len 给出；该 API 只写入 `vol`，不会读取越界。
+    let ret = unsafe { GetVolumePathNameW(wide.as_ptr() as PCWSTR, vol_ptr, buf_len as u32) };
     if ret == FALSE {
         return Err(io_err("GetVolumePathNameW", path, 0));
     }
     // `GetVolumePathNameW` 写入的卷根自带 null 结尾（`vol` 已零初始化），可直接传入。
     let mut buf: [u16; 256] = [0; 256];
-    // SAFETY: `vol[..vol_len]` 是 null 结尾的有效 UTF-16 卷根；`buf` 容量为 256
-    // 个 u16，对应的大小参数也按 256 给出；其余指针为 null。
+    // SAFETY: `vol` 是 null 结尾的有效 UTF-16 卷根；`buf` 容量为 256 个 u16，长度参数
+    // 按 256 给出；其余指针为 null。
     let ret = unsafe {
         GetVolumeInformationW(
             vol.as_ptr() as PCWSTR,
@@ -218,4 +228,16 @@ pub(crate) fn get_volume_filesystem(path: &Path) -> Result<String> {
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     Ok(String::from_utf16_lossy(&buf[..len]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_free_space_handles_relative_path() {
+        // 相对路径 `x.bin` 的 parent 为空，应退化为当前目录 `.` 并查询成功。
+        let r = get_disk_free_space(Path::new("x.bin"));
+        assert!(r.is_ok(), "relative path must resolve to cwd: {r:?}");
+    }
 }

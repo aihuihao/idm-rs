@@ -11,7 +11,6 @@ use tracing::info;
 
 #[cfg(windows)]
 mod bench {
-    use std::os::windows::fs::FileExt;
     use std::path::Path;
 
     use idm_core::disk::{
@@ -151,13 +150,11 @@ mod bench {
                         continue;
                     }
                 };
-                let file = target.file();
-
                 // 尾部（len - 1MB）首次写入 1MB，只计 write 调用本身。
                 let tail_off = size - MB;
                 let buf = vec![0u8; MB as usize];
                 let tw = std::time::Instant::now();
-                if let Err(e) = file.seek_write(&buf, tail_off) {
+                if let Err(e) = target.write_at(tail_off, &buf) {
                     println!("  run {run} TAIL_WRITE_ERROR {e}");
                 }
                 let tail_write_ms = tw.elapsed().as_secs_f64() * 1000.0;
@@ -171,7 +168,7 @@ mod bench {
                 // 中部首次写入 1MB。
                 let mid_off = size / 2;
                 let mw = std::time::Instant::now();
-                if let Err(e) = file.seek_write(&buf, mid_off) {
+                if let Err(e) = target.write_at(mid_off, &buf) {
                     println!("  run {run} MID_WRITE_ERROR {e}");
                 }
                 let mid_write_ms = mw.elapsed().as_secs_f64() * 1000.0;
