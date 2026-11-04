@@ -259,18 +259,43 @@ mod bench {
 mod dl {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use idm_core::disk::{AllocationStrategy, DiskWriterPool};
+    use idm_core::disk::{AllocationStrategy, DiskWriterPool, volume_supports_sparse};
+    use idm_core::net::Url;
     use idm_core::net::client::DownloadConfig;
-    use idm_core::task::{DownloadOptions, DownloadOutcome, download};
-    use tokio::sync::Notify;
+    use idm_core::net::filename::{resolve_conflict, sanitize_windows_filename};
+    use idm_core::net::probe::Probe;
+    use idm_core::task::{
+        CancelSignal, ChunkState, DownloadOptions, DownloadOutcome, ProgressSnapshot, download,
+    };
+    use tokio::sync::watch;
+
+    fn print_progress(snap: &ProgressSnapshot) {
+        let total = snap.total_size.unwrap_or(0);
+        let pct = if total > 0 {
+            snap.downloaded as f64 * 100.0 / total as f64
+        } else {
+            0.0
+        };
+        let active = snap
+            .chunks
+            .iter()
+            .filter(|c| c.state == ChunkState::Downloading)
+            .count();
+        println!(
+            "PROGRESS {}/{} bytes ({pct:.1}%) {:.0} B/s active_chunks={active}",
+            snap.downloaded, total, snap.speed
+        );
+    }
 
     pub async fn run(args: &[String]) -> i32 {
         let mut url: Option<String> = None;
         let mut dir: Option<String> = None;
         let mut connections: usize = 8;
         let mut out_name: Option<String> = None;
-        let mut strategy = AllocationStrategy::Sparse;
+        // B5：`--strategy` 默认 Auto（卷支持稀疏文件则 Sparse，否则 SetLen）。
+        let mut strategy = AllocationStrategy::Auto;
 
         let mut i = 0;
         while i < args.len() {
@@ -345,16 +370,81 @@ mod dl {
             Some(d) => PathBuf::from(d),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("cannot create dir {}: {e}", dir.display());
+            return 1;
+        }
+
+        let parsed_url = match Url::parse(&url) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("invalid URL: {e}");
+                return 2;
+            }
+        };
+        if let Err(e) = DownloadConfig::check_scheme(&parsed_url) {
+            eprintln!("{e}");
+            return 2;
+        }
 
         let config = DownloadConfig {
             connections,
             ..DownloadConfig::default()
         };
+        let client = match config.build_client() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("cannot build HTTP client: {e}");
+                return 1;
+            }
+        };
+
+        // B5：先执行 Probe 并打印结果，再开始下载。
+        let probe_result = match Probe::new(&client, &config).probe(&parsed_url).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("probe failed: {e}");
+                return 1;
+            }
+        };
+        println!(
+            "PROBE final_url={} total_size={:?} supports_range={} etag={:?} last_modified={:?} filename={} content_type={:?}",
+            probe_result.final_url,
+            probe_result.total_size,
+            probe_result.supports_range,
+            probe_result.etag,
+            probe_result.last_modified,
+            probe_result.filename,
+            probe_result.content_type
+        );
+
+        // 外部进度通道：下载开始前就订阅，实现每秒刷新。
+        let (progress_tx, final_rx) = watch::channel(ProgressSnapshot::default());
+        let mut live_rx = progress_tx.subscribe();
+        let progress_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = ticker.tick() => print_progress(&live_rx.borrow()),
+                    r = live_rx.changed() => {
+                        if r.is_err() { break; }
+                    }
+                }
+            }
+        });
+
+        let raw_name = match &out_name {
+            Some(n) => sanitize_windows_filename(n),
+            None => probe_result.filename.clone(),
+        };
+        let final_path = resolve_conflict(&dir, &raw_name);
         let opts = DownloadOptions {
             config,
             strategy,
             dir: dir.clone(),
             out_name,
+            progress_tx: Some(progress_tx),
         };
 
         let pool = match DiskWriterPool::new(4, 16) {
@@ -365,38 +455,57 @@ mod dl {
             }
         };
 
-        // Ctrl+C → 取消信号。
-        let notify = Arc::new(Notify::new());
-        let notify_signal = notify.clone();
+        // Ctrl+C → `CancelSignal`（watch 状态，取消不会漏掉）。
+        let signal = Arc::new(CancelSignal::new());
+        let signal_task = signal.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            notify_signal.notify_one();
+            signal_task.cancel();
         });
 
-        let result = download(&url, pool.clone(), &opts, Some(notify.as_ref())).await;
-        let (outcome, rx) = match result {
+        let started = Instant::now();
+        let result = download(&url, pool.clone(), &opts, Some(signal.as_ref())).await;
+        let elapsed = started.elapsed();
+        progress_task.abort();
+        let snap = final_rx.borrow().clone();
+        let (outcome, _rx) = match result {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("download failed: {e}");
                 return 1;
             }
         };
+
+        let actual_strategy = match strategy {
+            AllocationStrategy::Auto => match volume_supports_sparse(&dir) {
+                Ok(true) => "Sparse".to_string(),
+                Ok(false) => "SetLen".to_string(),
+                Err(e) => format!("Auto(undetermined: {e})"),
+            },
+            other => format!("{other:?}"),
+        };
+        let size = snap.downloaded;
+        let avg_speed = if elapsed.as_secs_f64() > 0.0 {
+            size as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        println!(
+            "RESULT status={outcome:?} path={} size={size} elapsed={:.2}s avg_speed={avg_speed:.0} B/s chunks={} strategy={actual_strategy}",
+            final_path.display(),
+            elapsed.as_secs_f64(),
+            snap.chunks.len()
+        );
+
         match outcome {
-            DownloadOutcome::Completed => {
-                let snap = rx.borrow();
-                println!(
-                    "download completed: {} bytes (speed {:.0} B/s)",
-                    snap.downloaded, snap.speed
-                );
-                0
-            }
+            DownloadOutcome::Completed => 0,
             DownloadOutcome::Cancelled => {
-                println!("download cancelled; partial file retained");
-                0
+                eprintln!("download cancelled; partial file retained");
+                1
             }
             DownloadOutcome::Paused(reason) => {
-                println!("download paused: {reason:?}; partial file retained");
-                0
+                eprintln!("download paused: {reason:?}; partial file retained");
+                1
             }
         }
     }

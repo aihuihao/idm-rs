@@ -8,6 +8,11 @@ use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue};
 use crate::error::{Error, Result};
 
 /// 下载配置。连接数默认 8（范围 1..=32），最小分块大小默认 1 MiB。
+///
+/// **TLS 策略**：本结构体不含任何 TLS 配置项，也刻意不提供
+/// `danger_accept_invalid_certs` / `danger_accept_invalid_hostnames`、
+/// 自定义根证书或关闭证书校验的开关。`build_client()` 直接使用 reqwest 的默认
+/// TLS 后端，证书链与主机名校验始终开启，调用方无法削弱。
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
     pub connections: usize,
@@ -63,6 +68,9 @@ impl DownloadConfig {
 
     /// 构建 reqwest 客户端：强制 `Accept-Encoding: identity`、限制重定向次数。
     /// 代理设置留到 Phase 3，本阶段不做。
+    ///
+    /// 不调用任何 `danger_*` 方法，证书校验保持默认开启；Cargo 依赖也只启用默认
+    /// TLS 后端 + `stream`，未开启 gzip/brotli/zstd/deflate 等压缩特性。
     pub fn build_client(&self) -> Result<reqwest::Client> {
         self.validate()?;
         let mut headers = HeaderMap::new();

@@ -33,7 +33,7 @@ impl PositionalWrite for File {
 /// - 任何一次 `write_at` 返回 0 字节 → 立即报错（短写退化为 0）。
 /// - 遇到 [`io::ErrorKind::Interrupted`] → 重试（不前进偏移）。
 /// - 偏移量计算使用 `checked_add`，避免溢出。
-pub fn write_all_at<P: PositionalWrite>(
+pub fn write_all_at<P: PositionalWrite + ?Sized>(
     file: &P,
     mut buf: &[u8],
     mut offset: u64,
@@ -64,7 +64,8 @@ pub fn write_all_at<P: PositionalWrite>(
 /// 持有所属区间与自己的写入位置（与文件游标无关）。越界写入会被拒绝且一个字节
 /// 都不写。被 drop 时自动注销对应区间。
 pub struct ChunkWriter {
-    file: Arc<File>,
+    /// 通过 trait object 持有，便于单元测试注入失败的写入器（A3）。生产路径为 `Arc<File>`。
+    file: Arc<dyn PositionalWrite + Send + Sync>,
     path: std::path::PathBuf,
     registry: Arc<Mutex<RangeRegistry>>,
     chunk_id: u64,
@@ -75,7 +76,7 @@ pub struct ChunkWriter {
 
 impl ChunkWriter {
     pub(crate) fn new(
-        file: Arc<File>,
+        file: Arc<dyn PositionalWrite + Send + Sync>,
         path: std::path::PathBuf,
         registry: Arc<Mutex<RangeRegistry>>,
         chunk_id: u64,
@@ -264,6 +265,75 @@ mod tests {
         let buf = [5u8, 6, 7, 8];
         write_all_at(&w, &buf, 0)?;
         assert_eq!(&w.store.borrow()[..4], &buf);
+        Ok(())
+    }
+
+    /// 可切换失败/成功的注入式写入器（A3：验证写失败时位置不推进）。
+    struct SwitchableWriter {
+        fail: std::sync::atomic::AtomicBool,
+        store: Mutex<Vec<u8>>,
+    }
+
+    impl SwitchableWriter {
+        fn new(fail: bool) -> Self {
+            SwitchableWriter {
+                fail: std::sync::atomic::AtomicBool::new(fail),
+                store: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PositionalWrite for SwitchableWriter {
+        fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(io::Error::other("injected write failure"));
+            }
+            let mut s = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            let end = offset as usize + buf.len();
+            if s.len() < end {
+                s.resize(end, 0);
+            }
+            s[offset as usize..end].copy_from_slice(buf);
+            Ok(buf.len())
+        }
+    }
+
+    fn chunk_writer_with(
+        file: Arc<dyn PositionalWrite + Send + Sync>,
+    ) -> std::result::Result<ChunkWriter, Box<dyn std::error::Error>> {
+        let registry = Arc::new(Mutex::new(RangeRegistry::new(100)));
+        let range = ChunkRange::new(0, 100, 100)?;
+        registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(0, range)?;
+        Ok(ChunkWriter::new(
+            file,
+            std::path::PathBuf::from("mock.bin"),
+            registry,
+            0,
+            range,
+            100,
+        ))
+    }
+
+    /// A3：写入失败时 `position()` 保持不变，之后重新写入同一偏移是安全的。
+    #[test]
+    fn write_failure_does_not_advance_position()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let file = Arc::new(SwitchableWriter::new(true));
+        let mut w = chunk_writer_with(file.clone())?;
+        assert_eq!(w.position(), 0);
+        let failed = w.write(&[1, 2, 3, 4]);
+        assert!(failed.is_err(), "injected write failure must surface");
+        assert_eq!(w.position(), 0, "position must not advance on failure");
+
+        // 关闭失败注入，重新写同一偏移，数据必须落在 0 而不是 4。
+        file.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(w.write(&[9, 8, 7])?, 3);
+        assert_eq!(w.position(), 3);
+        let store = file.store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(&store[..3], &[9, 8, 7]);
         Ok(())
     }
 }

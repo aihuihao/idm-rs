@@ -26,6 +26,9 @@ pub struct ProgressSnapshot {
     pub chunks: Vec<ChunkProgress>,
     /// 最近一段时间的平均速度（字节/秒）。
     pub speed: f64,
+    /// 是否可断点续传：仅静态分块（总长已知且支持 Range）为 `true`；
+    /// 总长未知/不支持 Range 的单连接顺序下载为 `false`（供 Phase 1c 使用）。
+    pub resumable: bool,
 }
 
 /// 进度发布器：内部持有共享快照与 `watch::Sender`，按 200ms 节流发布。
@@ -39,9 +42,14 @@ pub struct ProgressPublisher {
 
 impl ProgressPublisher {
     /// 创建发布器与接收端。`ranges` 为各分块的 (start, end)。
+    ///
+    /// 传入 `tx` 时复用外部通道（调用方可在下载开始前就订阅进度，用于实时刷新）；
+    /// 传 `None` 则内部创建通道。无论哪种，发布都按 200ms 节流，且没有读者也不阻塞。
     pub fn new(
         total_size: Option<u64>,
         ranges: &[(u64, u64)],
+        tx: Option<watch::Sender<ProgressSnapshot>>,
+        resumable: bool,
     ) -> (Self, watch::Receiver<ProgressSnapshot>) {
         let chunks = ranges
             .iter()
@@ -57,9 +65,17 @@ impl ProgressPublisher {
             downloaded: 0,
             chunks,
             speed: 0.0,
+            resumable,
         };
         let current = Arc::new(Mutex::new(snap.clone()));
-        let (tx, rx) = watch::channel(snap);
+        let (tx, rx) = match tx {
+            Some(t) => {
+                let r = t.subscribe();
+                let _ = t.send(snap);
+                (t, r)
+            }
+            None => watch::channel(snap),
+        };
         let now = Instant::now();
         (
             ProgressPublisher {

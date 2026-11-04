@@ -205,10 +205,22 @@ impl TargetFile {
         })
     }
 
-    /// 申请一个写入区间，返回 [`ChunkWriter`]。与已登记区间重叠则返回
+    /// 申请一个**有界**写入区间，返回 [`ChunkWriter`]。与已登记区间重叠则返回
     /// [`Error::RangeOverlap`]。`ChunkWriter` 被 drop 时自动注销该区间。
     pub fn allocate_chunk(&self, chunk_id: u64, start: u64, end: u64) -> Result<ChunkWriter> {
         let range = ChunkRange::new(start, end, self.len)?;
+        self.register_chunk(chunk_id, range)
+    }
+
+    /// 申请一个**无界**写入区间 `[start, ∞)`，仅供总长未知的单连接顺序下载使用。
+    ///
+    /// 登记表保证它在同一文件上独占：已有任何区间（或已有另一个无界区间）时返回
+    /// [`Error::UnboundedRangeConflict`]。
+    pub fn allocate_unbounded_chunk(&self, chunk_id: u64, start: u64) -> Result<ChunkWriter> {
+        self.register_chunk(chunk_id, ChunkRange::unbounded(start))
+    }
+
+    fn register_chunk(&self, chunk_id: u64, range: ChunkRange) -> Result<ChunkWriter> {
         {
             let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
             reg.register(chunk_id, range)?;

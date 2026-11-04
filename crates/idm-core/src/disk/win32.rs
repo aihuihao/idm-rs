@@ -241,7 +241,8 @@ pub(crate) fn get_volume_filesystem(path: &Path) -> Result<String> {
 }
 
 /// 查询卷是否支持稀疏文件（`FILE_SUPPORTS_SPARSE_FILES` 能力位）。
-pub(crate) fn volume_supports_sparse(path: &Path) -> Result<bool> {
+/// `AllocationStrategy::Auto` 据此决定实际策略；公开以便上层报告实际使用的策略。
+pub fn volume_supports_sparse(path: &Path) -> Result<bool> {
     Ok(volume_info(path)?.1 & FILE_SUPPORTS_SPARSE_FILES != 0)
 }
 

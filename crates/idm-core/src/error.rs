@@ -108,6 +108,9 @@ pub enum Error {
         expected: u64,
         received: u64,
     },
+    /// 无界区间与另一个区间冲突：同一文件上无界区间必须唯一。
+    #[error("unbounded range conflict: chunk {chunk_id} cannot coexist with other ranges")]
+    UnboundedRangeConflict { chunk_id: u64 },
 }
 
 /// 便捷 Result 别名。
@@ -149,4 +152,68 @@ pub(crate) fn io_error(
 /// 系统错误码 112（ERROR_DISK_FULL）或 39（ERROR_HANDLE_DISK_FULL）视为磁盘满。
 fn is_disk_full_io(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(112) | Some(39))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A3：写盘时的 112 / 39 必须映射为 `DiskFullDuringWrite`，且 `is_disk_full()`
+    /// 对创建前预检查的 `DiskFull` 同样返回 true。
+    #[test]
+    fn disk_full_os_error_mapping() {
+        for code in [112i32, 39] {
+            let e = io_error(
+                "write",
+                PathBuf::from("d:/out.bin"),
+                4096,
+                std::io::Error::from_raw_os_error(code),
+            );
+            match &e {
+                Error::DiskFullDuringWrite { path, offset } => {
+                    assert_eq!(path, &PathBuf::from("d:/out.bin"));
+                    assert_eq!(*offset, 4096);
+                }
+                other => panic!("expected DiskFullDuringWrite for code {code}, got {other:?}"),
+            }
+            assert!(
+                e.is_disk_full(),
+                "code {code} must be reported as disk full"
+            );
+        }
+    }
+
+    #[test]
+    fn other_io_errors_are_not_disk_full() {
+        let e = io_error(
+            "write",
+            PathBuf::from("d:/out.bin"),
+            0,
+            std::io::Error::from_raw_os_error(5),
+        );
+        assert!(matches!(e, Error::Io { .. }));
+        assert!(!e.is_disk_full());
+    }
+
+    #[test]
+    fn predownload_disk_full_is_disk_full() {
+        let e = Error::DiskFull {
+            path: PathBuf::from("d:/out.bin"),
+            needed: 100,
+            available: 1,
+        };
+        assert!(e.is_disk_full());
+        assert!(!Error::PoolClosed.is_disk_full());
+    }
+
+    #[test]
+    fn write_zero_maps_to_write_zero_variant() {
+        let e = io_error(
+            "write",
+            PathBuf::from("d:/out.bin"),
+            7,
+            std::io::Error::new(std::io::ErrorKind::WriteZero, "zero"),
+        );
+        assert!(matches!(e, Error::WriteZero { offset: 7, .. }));
+    }
 }

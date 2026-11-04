@@ -25,4 +25,5 @@ pub use range::ChunkRange;
 pub use target::{
     AllocationInfo, AllocationStrategy, SpaceCheck, TargetFile, disk_free_space, volume_filesystem,
 };
+pub use win32::volume_supports_sparse;
 pub use write::{ChunkWriter, PositionalWrite};
