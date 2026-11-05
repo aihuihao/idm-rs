@@ -23,6 +23,9 @@ pub mod net;
 #[cfg(windows)]
 pub mod task;
 
+/// SQLite 状态持久化：独立线程持有连接、迁移、检查点与启动恢复。
+pub mod store;
+
 /// Returns the semantic version of this crate (`CARGO_PKG_VERSION`).
 ///
 /// This is a `const fn` so it can be evaluated at compile time and embedded

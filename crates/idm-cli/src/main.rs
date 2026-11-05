@@ -6,7 +6,12 @@
 //!
 //! 核心库不初始化全局 tracing subscriber；由本可执行程序负责。
 
+#[cfg(windows)]
+use std::sync::Arc;
+
 use idm_core::core_version;
+#[cfg(windows)]
+use idm_core::store::{Store, default_db_path};
 use tracing::info;
 
 #[cfg(windows)]
@@ -266,8 +271,10 @@ mod dl {
     use idm_core::net::client::DownloadConfig;
     use idm_core::net::filename::{resolve_conflict, sanitize_windows_filename};
     use idm_core::net::probe::Probe;
+    use idm_core::store::{NewTask, Store};
     use idm_core::task::{
-        CancelSignal, ChunkState, DownloadOptions, DownloadOutcome, ProgressSnapshot, download,
+        CancelSignal, ChunkState, DownloadContext, DownloadOptions, DownloadOutcome,
+        ProgressSnapshot, download_with_store, resume,
     };
     use tokio::sync::watch;
 
@@ -335,13 +342,14 @@ mod dl {
         println!("{}", format_chunk_summary(snap));
     }
 
-    pub async fn run(args: &[String]) -> i32 {
+    pub async fn run(args: &[String], store: Arc<Store>) -> i32 {
         let mut url: Option<String> = None;
         let mut dir: Option<String> = None;
         let mut connections: usize = 8;
         let mut out_name: Option<String> = None;
         let mut cancel_after: Option<u64> = None;
         let mut max_speed: Option<u64> = None;
+        let mut checkpoint_ms: Option<u64> = None;
         // B5：`--strategy` 默认 Auto（卷支持稀疏文件则 Sparse，否则 SetLen）。
         let mut strategy = AllocationStrategy::Auto;
 
@@ -426,13 +434,27 @@ mod dl {
                         }
                     }
                 }
-                "--log-file" => {
+                "--checkpoint-ms" => {
                     i += 1;
                     if i >= args.len() {
-                        eprintln!("missing value for --log-file");
+                        eprintln!("missing value for --checkpoint-ms");
                         return 2;
                     }
-                    // 值已由 main() 预扫描并用于初始化 tracing；这里只消费参数。
+                    match args[i].parse::<u64>() {
+                        Ok(v) if v > 0 => checkpoint_ms = Some(v),
+                        _ => {
+                            eprintln!("--checkpoint-ms must be a positive integer");
+                            return 2;
+                        }
+                    }
+                }
+                "--log-file" | "--db" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for {}", args[i - 1]);
+                        return 2;
+                    }
+                    // 值已由 main() 预扫描并用于初始化 tracing / 打开数据库；这里只消费参数。
                 }
                 other if url.is_none() && !other.starts_with("--") => url = Some(other.to_string()),
                 other => {
@@ -461,6 +483,25 @@ mod dl {
             crate::print_error(&format!("cannot create dir {}", dir.display()), &e);
             return 1;
         }
+
+        // 任务记录在创建时只写 url / dir / strategy / connections / state=Pending；
+        // 文件名、总长、ETag 等字段在 Probe 成功后由下载流程回填。
+        let task_id = match store
+            .create_task(NewTask {
+                url: url.clone(),
+                dir: dir.to_string_lossy().into_owned(),
+                strategy: format!("{strategy:?}"),
+                connections,
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                crate::print_error("cannot create task", &e);
+                return 1;
+            }
+        };
+        println!("TASK id={task_id}");
 
         let parsed_url = match Url::parse(&url) {
             Ok(u) => u,
@@ -562,7 +603,12 @@ mod dl {
         }
 
         let started = Instant::now();
-        let result = download(&url, pool.clone(), &opts, Some(signal.as_ref())).await;
+        let mut ctx = DownloadContext::new(Arc::clone(&store), task_id);
+        if let Some(ms) = checkpoint_ms {
+            ctx.checkpoint_interval = Duration::from_millis(ms);
+        }
+        let result =
+            download_with_store(&url, pool.clone(), &opts, Some(signal.as_ref()), Some(ctx)).await;
         let elapsed = started.elapsed();
         progress_task.abort();
         let snap = final_rx.borrow().clone();
@@ -608,6 +654,236 @@ mod dl {
                 1
             }
         }
+    }
+
+    /// `resume <id>`：续传（Paused / Failed / Finalizing）。
+    pub async fn run_resume(args: &[String], store: Arc<Store>) -> i32 {
+        let mut id: Option<i64> = None;
+        let mut max_speed: Option<u64> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--max-speed" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-speed");
+                        return 2;
+                    }
+                    match parse_max_speed(&args[i]) {
+                        Some(v) => max_speed = Some(v),
+                        None => {
+                            eprintln!("invalid --max-speed: {}", args[i]);
+                            return 2;
+                        }
+                    }
+                }
+                "--db" | "--log-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for {}", args[i - 1]);
+                        return 2;
+                    }
+                }
+                other if id.is_none() && !other.starts_with("--") => match other.parse::<i64>() {
+                    Ok(v) => id = Some(v),
+                    Err(_) => {
+                        eprintln!("invalid task id: {other}");
+                        return 2;
+                    }
+                },
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    return 2;
+                }
+            }
+            i += 1;
+        }
+        let id = match id {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "usage: idm-cli resume <id> [--max-speed 3M] [--db PATH] [--log-file PATH]"
+                );
+                return 2;
+            }
+        };
+        let rec = match store.get_task(id).await {
+            Ok(r) => r,
+            Err(e) => {
+                crate::print_error("cannot read task", &e);
+                return 1;
+            }
+        };
+        let strategy = match rec.strategy.as_str() {
+            "SetLen" => AllocationStrategy::SetLen,
+            "Reserve" => AllocationStrategy::Reserve,
+            "Sparse" => AllocationStrategy::Sparse,
+            _ => AllocationStrategy::Auto,
+        };
+        let opts = DownloadOptions {
+            config: DownloadConfig {
+                connections: (rec.connections as usize).clamp(1, 32),
+                ..DownloadConfig::default()
+            },
+            strategy,
+            dir: PathBuf::from(&rec.dir),
+            out_name: None,
+            progress_tx: None,
+            max_speed,
+        };
+        let pool = match DiskWriterPool::new(4, 16) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                crate::print_error("disk writer pool init failed", &e);
+                return 1;
+            }
+        };
+        let signal = Arc::new(CancelSignal::new());
+        let signal_task = Arc::clone(&signal);
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            signal_task.cancel();
+        });
+
+        let started = Instant::now();
+        let result = resume(id, Arc::clone(&store), pool, &opts, Some(signal.as_ref())).await;
+        let elapsed = started.elapsed();
+        let (outcome, rx) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                crate::print_error("resume failed", &e);
+                return 1;
+            }
+        };
+        let snap = rx.borrow().clone();
+        // G.5：续传完成时同样打印分块汇总表。
+        print_chunk_summary(&snap);
+        println!(
+            "RESULT status={outcome:?} task_id={id} total={:?} downloaded_this_run={} elapsed={:.2}s chunks={}",
+            rec.total_size,
+            snap.downloaded,
+            elapsed.as_secs_f64(),
+            snap.chunks.len()
+        );
+        match outcome {
+            DownloadOutcome::Completed => 0,
+            DownloadOutcome::Cancelled => {
+                eprintln!("resume cancelled; partial file retained");
+                1
+            }
+            DownloadOutcome::Paused(reason) => {
+                eprintln!("resume paused: {reason:?}; partial file retained");
+                1
+            }
+        }
+    }
+
+    /// `list`：列出所有任务（ID、文件名、状态、进度、最后错误）。
+    pub async fn run_list(args: &[String], store: Arc<Store>) -> i32 {
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--db" | "--log-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for {}", args[i - 1]);
+                        return 2;
+                    }
+                }
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    return 2;
+                }
+            }
+            i += 1;
+        }
+        let tasks = match store.list_tasks().await {
+            Ok(t) => t,
+            Err(e) => {
+                crate::print_error("cannot list tasks", &e);
+                return 1;
+            }
+        };
+        println!("ID | FILE | STATE | PAUSE | PROGRESS | LAST_ERROR");
+        for t in tasks {
+            let progress = match t.total_size {
+                Some(n) => format!("{}/{}", t.committed, n),
+                None => t.committed.to_string(),
+            };
+            let pause = t
+                .pause_reason
+                .map(|p| format!("{p:?}"))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{} | {} | {:?} | {} | {} | {}",
+                t.id,
+                t.file_name.as_deref().unwrap_or("-"),
+                t.state,
+                pause,
+                progress,
+                t.last_error.as_deref().unwrap_or("-")
+            );
+        }
+        0
+    }
+
+    /// `remove <id> [--delete-file]`：删除任务记录，可选删除 .idm-part。
+    pub async fn run_remove(args: &[String], store: Arc<Store>) -> i32 {
+        let mut id: Option<i64> = None;
+        let mut delete_file = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--delete-file" => delete_file = true,
+                "--db" | "--log-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for {}", args[i - 1]);
+                        return 2;
+                    }
+                }
+                other if id.is_none() && !other.starts_with("--") => match other.parse::<i64>() {
+                    Ok(v) => id = Some(v),
+                    Err(_) => {
+                        eprintln!("invalid task id: {other}");
+                        return 2;
+                    }
+                },
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    return 2;
+                }
+            }
+            i += 1;
+        }
+        let id = match id {
+            Some(v) => v,
+            None => {
+                eprintln!("usage: idm-cli remove <id> [--delete-file] [--db PATH]");
+                return 2;
+            }
+        };
+        let part = match store.delete_task(id).await {
+            Ok(p) => p,
+            Err(e) => {
+                crate::print_error("cannot delete task", &e);
+                return 1;
+            }
+        };
+        if delete_file && let Some(p) = part {
+            let path = PathBuf::from(&p);
+            if path.exists() {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => println!("deleted {}", path.display()),
+                    Err(e) => {
+                        crate::print_error("cannot delete .idm-part", &e);
+                        return 1;
+                    }
+                }
+            }
+        }
+        println!("removed task {id}");
+        0
     }
 
     #[cfg(test)]
@@ -685,15 +961,23 @@ fn print_error(prefix: &str, e: &(dyn std::error::Error + 'static)) {
 }
 
 /// 启动时预扫描 `--log-file`：tracing subscriber 必须在子命令参数解析之前初始化。
-fn find_log_file(args: &[String]) -> Option<std::path::PathBuf> {
+fn find_option(args: &[String], name: &str) -> Option<std::path::PathBuf> {
     let mut i = 0;
     while i + 1 < args.len() {
-        if args[i] == "--log-file" {
+        if args[i] == name {
             return Some(std::path::PathBuf::from(&args[i + 1]));
         }
         i += 1;
     }
     None
+}
+
+fn find_log_file(args: &[String]) -> Option<std::path::PathBuf> {
+    find_option(args, "--log-file")
+}
+
+fn find_db_path(args: &[String]) -> Option<std::path::PathBuf> {
+    find_option(args, "--db")
 }
 
 /// 初始化全局 tracing：stderr 保持原有级别，`--log-file` 额外以 debug 级别写文件。
@@ -750,7 +1034,16 @@ async fn main() {
         std::process::exit(1);
     }
 
-    if args.len() > 1 && args[1] == "bench-alloc" {
+    let sub = args.get(1).map(String::as_str).unwrap_or("");
+    if sub.is_empty() {
+        info!(
+            cli_version = env!("CARGO_PKG_VERSION"),
+            core_version = core_version(),
+            "idm-cli started"
+        );
+        return;
+    }
+    if sub == "bench-alloc" {
         #[cfg(windows)]
         {
             std::process::exit(bench::run(&args[2..]));
@@ -760,23 +1053,50 @@ async fn main() {
             eprintln!("bench-alloc is only supported on Windows");
             std::process::exit(2);
         }
-    } else if args.len() > 1 && args[1] == "download" {
-        #[cfg(windows)]
-        {
-            std::process::exit(dl::run(&args[2..]).await);
-        }
-        #[cfg(not(windows))]
-        {
-            eprintln!("download is only supported on Windows");
-            std::process::exit(2);
-        }
     }
 
-    info!(
-        cli_version = env!("CARGO_PKG_VERSION"),
-        core_version = core_version(),
-        "idm-cli started"
-    );
+    #[cfg(windows)]
+    {
+        // 所有持久化子命令都支持 --db；未指定时用默认路径。
+        let db_path = match find_db_path(&args) {
+            Some(p) => p,
+            None => match default_db_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    print_error("cannot resolve default db path", &e);
+                    std::process::exit(1);
+                }
+            },
+        };
+        let store = match Store::open(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                print_error("cannot open database", &e);
+                std::process::exit(1);
+            }
+        };
+        // 启动时自动执行一次启动恢复（9.4）。
+        if let Err(e) = store.recover().await {
+            print_error("startup recovery failed", &e);
+            std::process::exit(1);
+        }
+        let code = match sub {
+            "download" => dl::run(&args[2..], Arc::clone(&store)).await,
+            "resume" => dl::run_resume(&args[2..], Arc::clone(&store)).await,
+            "list" => dl::run_list(&args[2..], Arc::clone(&store)).await,
+            "remove" => dl::run_remove(&args[2..], Arc::clone(&store)).await,
+            other => {
+                eprintln!("unknown subcommand: {other}");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("{sub} is only supported on Windows");
+        std::process::exit(2);
+    }
 }
 
 #[cfg(test)]

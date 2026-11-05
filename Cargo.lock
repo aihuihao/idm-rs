@@ -570,6 +570,8 @@ name = "idm-cli"
 version = "0.1.0"
 dependencies = [
  "idm-core",
+ "rusqlite",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

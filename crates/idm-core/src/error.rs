@@ -111,6 +111,15 @@ pub enum Error {
     /// 无界区间与另一个区间冲突：同一文件上无界区间必须唯一。
     #[error("unbounded range conflict: chunk {chunk_id} cannot coexist with other ranges")]
     UnboundedRangeConflict { chunk_id: u64 },
+    /// SQLite 错误（连接、迁移、事务、查询）。
+    #[error("database error: {message}")]
+    Database { message: String },
+    /// 断点恢复错误：任务状态、.idm-part 或远端元信息不满足续传条件。
+    #[error("resume rejected: {message}")]
+    Resume { message: String },
+    /// 任务不存在。
+    #[error("task {id} not found")]
+    TaskNotFound { id: i64 },
 }
 
 /// 便捷 Result 别名。
