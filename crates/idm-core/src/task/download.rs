@@ -35,13 +35,19 @@ use crate::task::state::{ChunkState, TaskState};
 /// 检查点快照观察回调：参数是 (chunk_index, acked 绝对位置) 的快照 S。
 pub type SnapshotObserver = Arc<dyn Fn(&[(i64, u64)]) + Send + Sync>;
 
-/// 检查点测试钩子（F.4 / F.5）。
+/// 检查点测试钩子（F.4 / F.5 / 1c.1 退出路径测试）。
 #[derive(Clone, Default)]
 pub struct CheckpointHooks {
     /// 置位时 `sync` 视为失败：本次检查点放弃，不写数据库。
     pub fail_sync: Arc<AtomicBool>,
     /// 取得快照 S 之后、`sync` 之前调用，用于验证写入数据库的值不超过 S。
     pub observe_snapshot: Option<SnapshotObserver>,
+    /// 目标文件创建之后、分块任务启动之前调用。测试可在此触发外部取消，
+    /// 以精确命中"分块启动循环中取消"这条退出路径。
+    pub before_chunks: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Probe 成功之后、第一处"建文件之前取消"检查之前调用。测试可在此触发
+    /// 外部取消，以精确命中"Probe 之后、建文件之前取消"这条退出路径。
+    pub after_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for CheckpointHooks {
@@ -102,9 +108,14 @@ pub(crate) async fn run_checkpoint(
     acked: &[(i64, Arc<AtomicU64>)],
 ) -> Result<()> {
     // 步骤 1：快照 S。每个字节都在 sync 开始前收到了 pool.write 的成功回执。
+    //
+    // 内存顺序：分块任务用 `fetch_add(.., Release)` 推进 acked，这里用 `Acquire`
+    // 读取，构成 release/acquire 同步——看到某个 acked 值时，对应的 pool.write
+    // 成功回执及其之前的写入必然已完成，不会发生"值已推进但数据还没交回"
+    // 的情况。Relaxed 只能保证原子性，不能保证这一可见性，因此不能用。
     let snapshot: Vec<(i64, u64)> = acked
         .iter()
-        .map(|(db_index, a)| (*db_index, a.load(Ordering::Relaxed)))
+        .map(|(db_index, a)| (*db_index, a.load(Ordering::Acquire)))
         .collect();
     if let Some(observe) = &ctx.hooks.observe_snapshot {
         observe(&snapshot);
@@ -169,8 +180,54 @@ pub async fn download(
     download_with_store(url, pool, opts, cancel, None).await
 }
 
+/// 运行期需要统一收尾的资源。由 `run_download` 填充，`finalize_download` 消费。
+#[derive(Default)]
+struct DownloadRuntime {
+    /// 目标文件（已创建时 `Some`）。9.4 改名之前必须释放最后一个句柄。
+    target: Option<Arc<TargetFile>>,
+    /// 检查点任务及其停止信号；收尾时先发信号再 `await` 任务真正结束。
+    checkpoint_task: Option<(
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+    )>,
+    /// 外部取消 → 内部取消的转发任务。
+    forward_task: Option<tokio::task::JoinHandle<()>>,
+    /// 各分块的 acked 计数器（最终检查点的快照来源）。
+    acked: Vec<(i64, Arc<AtomicU64>)>,
+    /// 进度发布器（收尾时发布最终快照）。
+    progress: Option<Arc<Mutex<ProgressPublisher>>>,
+    /// 返回给调用者的进度接收端。
+    progress_rx: Option<watch::Receiver<ProgressSnapshot>>,
+    /// `.idm-part` 路径。
+    tmp_path: Option<PathBuf>,
+    /// 最终文件路径（完成阶段改名目标）。
+    final_path: Option<PathBuf>,
+    task_id: u64,
+}
+
+/// 所有退出路径的类别。`finalize_download` 是**唯一**收尾点，负责把这些类别
+/// 映射到数据库状态、返回值以及磁盘上的文件。
+enum ExitKind {
+    /// 路径 1、2：目标文件创建之前取消 → Paused(User)，part_path 为空，无文件。
+    CancelledBeforeCreate,
+    /// 路径 3：目标文件创建之前磁盘满 → Paused(DiskFull)，part_path 为空，无文件。
+    DiskFullBeforeCreate,
+    /// 路径 4 及其他失败：→ Failed 并记录错误。
+    Failed(Error),
+    /// 路径 5 及下载中取消：目标文件已创建 → Paused(User)，保留 .idm-part。
+    Cancelled,
+    /// 目标文件已创建，磁盘满暂停 → Paused(DiskFull)，保留 .idm-part。
+    PausedDiskFull,
+    /// 全部分块成功，等待 9.4 完成阶段（必须先过最终检查点门禁）。
+    ReadyToFinalize,
+}
+
 /// 带可选持久化的下载。`ctx` 为 `None` 时行为与 [`download`] 完全一致；
 /// `Some` 时启用 acked 跟踪、9.2 检查点循环、状态持久化与 9.4 完成顺序。
+///
+/// 本函数**只有两步**：运行内部流程、调用唯一的收尾函数。内部流程可以自由使用
+/// `return` / `?`，但无论它返回什么，结果都会经过 `finalize_download`；这里
+/// 不存在绕过收尾的 `return` 或 `?`。
 pub async fn download_with_store(
     url: &str,
     pool: Arc<DiskWriterPool>,
@@ -178,16 +235,29 @@ pub async fn download_with_store(
     cancel: Option<&CancelSignal>,
     ctx: Option<DownloadContext>,
 ) -> Result<(DownloadOutcome, watch::Receiver<ProgressSnapshot>)> {
-    // 任务 ID 由数据库自增主键提供；无持久化时仅用于日志（0）。
-    let task_id = ctx.as_ref().map_or(0, |c| c.task_id as u64);
-    let url = Url::parse(url).map_err(|e| Error::InvalidArgument {
+    let mut rt = DownloadRuntime::default();
+    let inner = run_download(url, &pool, opts, cancel, ctx.as_ref(), &mut rt).await;
+    finalize_download(&pool, opts, ctx.as_ref(), &mut rt, inner).await
+}
+
+/// 下载主流程：所有可能提前退出的逻辑都在这里，退出一律返回 `ExitKind`
+/// （或把错误通过 `?` 交给外层），由 `finalize_download` 统一收尾。
+async fn run_download(
+    raw_url: &str,
+    pool: &Arc<DiskWriterPool>,
+    opts: &DownloadOptions,
+    cancel: Option<&CancelSignal>,
+    ctx: Option<&DownloadContext>,
+    rt: &mut DownloadRuntime,
+) -> Result<ExitKind> {
+    let task_id = ctx.map_or(0, |c| c.task_id as u64);
+    rt.task_id = task_id;
+    let url = Url::parse(raw_url).map_err(|e| Error::InvalidArgument {
         message: format!("invalid URL: {e}"),
     })?;
     DownloadConfig::check_scheme(&url)?;
 
-    let mut state = TaskState::Pending;
     let cancelled_now = || cancel.is_some_and(|c| c.is_cancelled());
-    advance(&mut state, TaskState::Probing);
 
     // 元组：(client, probe_result, final_path, tmp_path, target, ranges,
     //       total_for_progress, streaming, db_indices)
@@ -196,14 +266,14 @@ pub async fn download_with_store(
     let (
         client,
         probe_result,
-        mut final_path,
+        final_path,
         tmp_path,
         target,
         ranges,
         total_for_progress,
         streaming,
         db_indices,
-    ) = if let Some(plan) = ctx.as_ref().and_then(|c| c.resume.clone()) {
+    ) = if let Some(plan) = ctx.and_then(|c| c.resume.clone()) {
         let client = opts.config.build_client()?;
         let pr = ProbeResult {
             final_url: plan.final_url,
@@ -215,7 +285,16 @@ pub async fn download_with_store(
             content_type: None,
         };
         // 9.4 / D.4：打开已有 .idm-part 并校验长度。
-        let tf = TargetFile::open_existing(&plan.tmp_path, plan.total_size)?;
+        let tf = match TargetFile::open_existing(&plan.tmp_path, plan.total_size) {
+            Ok(t) => t,
+            // 9.5：另一个进程持有可写句柄 → TaskInUse（数据库状态不变）。
+            Err(Error::Io { source, .. }) if crate::error::is_sharing_violation(&source) => {
+                return Err(Error::TaskInUse {
+                    id: ctx.map_or(0, |c| c.task_id),
+                });
+            }
+            Err(e) => return Err(e),
+        };
         let mut rs = Vec::new();
         let mut ids = Vec::new();
         for (db_index, &(_, end, committed)) in plan.chunks.iter().enumerate() {
@@ -245,27 +324,14 @@ pub async fn download_with_store(
         let mut fp = resolve_conflict(&opts.dir, &pre_name);
         let mut tp = part_path(&fp);
 
-        // 取消检查点 1：Probe 开始之前（此时还没有任何文件）。
+        // 路径 1：Probe 开始之前取消（此时还没有任何文件）。
         if cancelled_now() {
-            advance(&mut state, TaskState::Cancelled);
-            return early_cancelled();
+            return Ok(ExitKind::CancelledBeforeCreate);
         }
 
         let client = opts.config.build_client()?;
         let probe = Probe::new(&client, &opts.config);
-        let pr = match probe.probe(&url).await {
-            Ok(r) => r,
-            // Probe 阶段的异常（如 gzip）不创建任何文件；任务改为 Failed 并记录错误。
-            Err(e) => {
-                if let Some(c) = &ctx {
-                    let _ = c
-                        .store
-                        .update_state(c.task_id, TaskStateDb::Failed, None, Some(format!("{e}")))
-                        .await;
-                }
-                return Err(e);
-            }
-        };
+        let pr = probe.probe(&url).await?;
 
         // Probe 得到 Content-Disposition 后重算最终文件名（未显式指定 --out 时）。
         if opts.out_name.is_none() {
@@ -273,16 +339,19 @@ pub async fn download_with_store(
             tp = part_path(&fp);
         }
 
-        // 取消检查点 2：Probe 完成、创建目标文件之前（同样不创建任何文件）。
+        // 测试钩子：Probe 成功之后、第一处取消检查之前触发外部取消（路径 2）。
+        if let Some(hook) = ctx.and_then(|c| c.hooks.after_probe.as_ref()) {
+            hook();
+        }
+
+        // 路径 2（两处）：Probe 完成、创建目标文件之前取消。
         if cancelled_now() {
-            advance(&mut state, TaskState::Cancelled);
-            return early_cancelled();
+            return Ok(ExitKind::CancelledBeforeCreate);
         }
         // 让出一次，使外部取消有机会在"建文件之前"被观察到（协作式，不创建空文件）。
         tokio::task::yield_now().await;
         if cancelled_now() {
-            advance(&mut state, TaskState::Cancelled);
-            return early_cancelled();
+            return Ok(ExitKind::CancelledBeforeCreate);
         }
 
         // 选择模式：总长已知且支持 Range → 静态分块；否则单连接顺序（不预分配）。
@@ -292,28 +361,32 @@ pub async fn download_with_store(
         {
             let tf = match TargetFile::create(&tp, total, opts.strategy, SpaceCheck::Enforce) {
                 Ok(t) => t,
-                // 创建时磁盘满：文件尚未落盘，不留下任何文件。
+                // 路径 3：创建时磁盘满，文件尚未落盘，不留下任何文件。
                 Err(e) if e.is_disk_full() => {
-                    advance(&mut state, TaskState::Paused);
-                    let (_tx, rx) = watch::channel(ProgressSnapshot::default());
-                    return Ok((DownloadOutcome::Paused(PauseReason::DiskFull), rx));
+                    return Ok(ExitKind::DiskFullBeforeCreate);
                 }
+                // 路径 4：创建出错 → 收尾统一写 Failed 并记录错误。
                 Err(e) => return Err(e),
             };
             let rs = chunk_ranges(total, opts.config.connections, opts.config.min_chunk_size);
             (tf, rs, Some(total), false)
         } else {
+            // 顺序下载路径的 create 出错同样由收尾统一写 Failed。
             let tf = TargetFile::create(&tp, 0, opts.strategy, SpaceCheck::Skip)?;
             (tf, vec![(0, u64::MAX)], None, true)
         };
         let ids: Vec<i64> = (0..rs.len() as i64).collect();
         (client, pr, fp, tp, tf, rs, total, stream, ids)
     };
+
     let target = Arc::new(target);
-    advance(&mut state, TaskState::Downloading);
+    rt.target = Some(Arc::clone(&target));
+    rt.tmp_path = Some(tmp_path.clone());
+    rt.final_path = Some(final_path.clone());
 
     // Probe 成功后回填元信息；新建任务再写入初始分块（续传保留已有 committed）。
-    if let Some(c) = &ctx {
+    // 注意：路径 1~4 都在本语句之前退出，因此这些任务的 part_path 保持为空。
+    if let Some(c) = ctx {
         let file_name = final_path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
@@ -347,11 +420,10 @@ pub async fn download_with_store(
 
     // If-Range / 弱 ETag 校验策略：
     // - 强 ETag → 直接作为 If-Range；
-    // - 弱 ETag 但有 Last-Modified → 用 Last-Modified 作为 If-Range（弱 ETag 本身不能做
-    //   强一致性校验，但 Last-Modified 可以）；
+    // - 弱 ETag 但有 Last-Modified → 用 Last-Modified 作为 If-Range；
     // - 无 ETag → 用 Last-Modified（若有）作为 If-Range；
     // - 弱 ETag 且无 Last-Modified → 不发 If-Range。
-    // 无论强弱，都保留 `verify_etag` 用于逐分块校验响应中的 ETag（弱 ETag 一致性必查）。
+    // 无论强弱，都保留 `verify_etag` 用于逐分块校验响应中的 ETag。
     let if_range: Option<String> = match &probe_result.etag {
         Some((tag, weak)) if !*weak => Some(tag.clone()),
         Some(_) if probe_result.last_modified.is_some() => probe_result.last_modified.clone(),
@@ -367,49 +439,63 @@ pub async fn download_with_store(
         opts.progress_tx.clone(),
         !streaming,
     );
+    rt.progress_rx = Some(progress_rx);
     let progress = Arc::new(Mutex::new(progress_pub));
+    rt.progress = Some(Arc::clone(&progress));
     let download_url = probe_result.final_url.clone();
 
     // 整次下载唯一的限速器：所有分块通过 Arc 共享，限制的是总速度。
-    // 不限速时保持 None，读取循环里不插入任何等待，行为与之前完全一致。
     let limiter: Option<Arc<RateLimiter>> =
         opts.max_speed.map(|rate| Arc::new(RateLimiter::new(rate)));
 
-    // 内部取消信号：所有分块任务订阅它；外部取消/出错/panic 都会先触发它（协作式）。
+    // 内部取消信号：所有分块任务订阅它；外部取消/出错/panic 都会先触发它。
     let internal = CancelSignal::new();
     if let Some(ext) = cancel {
         let int = internal.clone();
         let ext = ext.clone();
-        tokio::spawn(async move {
+        rt.forward_task = Some(tokio::spawn(async move {
             ext.cancelled().await;
             int.cancel();
-        });
+        }));
     }
 
     // acked：每个分块的绝对写入位置，只在 pool.write 成功返回后推进。
-    // 元素为 (数据库 chunk_index, 计数器)，续传时只覆盖未完成的分块。
     let acked: Vec<(i64, Arc<AtomicU64>)> = ranges
         .iter()
         .zip(db_indices.iter())
         .map(|(&(start, _), &db_index)| (db_index, Arc::new(AtomicU64::new(start))))
         .collect();
+    rt.acked = acked.clone();
 
     // 每个任务独立运行一个检查点循环（9.2：定时触发，默认每 2 秒）。
-    let checkpoint_task = ctx.as_ref().map(|c| {
+    // 用 oneshot 作为停止信号，收尾时先发信号再 await 任务真正结束。
+    if let Some(c) = ctx {
         let c = c.clone();
-        let p = pool.clone();
-        let t = target.clone();
+        let p = Arc::clone(pool);
+        let t = Arc::clone(&target);
         let a = acked.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let mut ticker = tokio::time::interval(c.checkpoint_interval);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
-                ticker.tick().await;
-                if let Err(e) = run_checkpoint(&c, &p, &t, &a).await {
-                    warn!(error = %e, "checkpoint failed; database not updated");
+                tokio::select! {
+                    biased;
+                    _ = &mut stop_rx => break,
+                    _ = ticker.tick() => {
+                        if let Err(e) = run_checkpoint(&c, &p, &t, &a).await {
+                            warn!(error = %e, "checkpoint failed; database not updated");
+                        }
+                    }
                 }
             }
-        })
-    });
+        });
+        rt.checkpoint_task = Some((handle, stop_tx));
+    }
+
+    // 测试钩子：在目标文件创建之后、分块任务启动之前触发外部取消（路径 5）。
+    if let Some(hook) = ctx.and_then(|c| c.hooks.before_chunks.as_ref()) {
+        hook();
+    }
 
     let mut join_set: JoinSet<Result<ChunkResult>> = JoinSet::new();
     let mut aborted_before_all_spawned = false;
@@ -422,14 +508,14 @@ pub async fn download_with_store(
         let job = ChunkJob {
             client: client.clone(),
             url: download_url.clone(),
-            pool: pool.clone(),
-            target: target.clone(),
+            pool: Arc::clone(pool),
+            target: Arc::clone(&target),
             chunk_id: idx as u64,
             start,
             end,
             if_range: if_range.clone(),
             verify_etag: verify_etag.clone(),
-            progress: progress.clone(),
+            progress: Arc::clone(&progress),
             idx,
             streaming,
             cancel_rx: internal.subscribe(),
@@ -443,12 +529,11 @@ pub async fn download_with_store(
         tokio::task::yield_now().await;
     }
 
+    // 路径 5：分块启动循环中取消。收尾会先跑最终检查点，再写 Paused(User)。
     if aborted_before_all_spawned || internal.is_cancelled() {
         internal.cancel();
         drain(&mut join_set).await;
-        let _ = pool.sync(&target).await;
-        advance(&mut state, TaskState::Cancelled);
-        return Ok((DownloadOutcome::Cancelled, progress_rx));
+        return Ok(ExitKind::Cancelled);
     }
 
     let mut outcome: Option<Result<DownloadOutcome>> = None;
@@ -458,7 +543,6 @@ pub async fn download_with_store(
         }
         tokio::select! {
             biased;
-            // 内部信号（外部取消 / 某分块出错 / panic 触发）已置位：停止 select，进入协作式排空。
             _ = internal.cancelled() => {
                 outcome = Some(Ok(DownloadOutcome::Cancelled));
                 break;
@@ -468,7 +552,6 @@ pub async fn download_with_store(
                     Ok(Ok(ChunkResult::Completed)) => {}
                     Ok(Ok(ChunkResult::Cancelled)) => {}
                     Ok(Err(e)) => {
-                        // 任意分块出错：触发内部信号，让其余分块协作式退出。
                         internal.cancel();
                         outcome = Some(if e.is_disk_full() {
                             Ok(DownloadOutcome::Paused(PauseReason::DiskFull))
@@ -480,7 +563,6 @@ pub async fn download_with_store(
                     // abort_all 产生的 JoinError::Cancelled 属正常取消，不能当成 panic。
                     Err(e) if e.is_cancelled() => {}
                     Err(e) => {
-                        // 分块 panic：触发内部信号后，作为错误上报。
                         internal.cancel();
                         outcome = Some(Err(Error::Io {
                             operation: "download chunk task panicked",
@@ -511,132 +593,185 @@ pub async fn download_with_store(
         }
     }
 
-    if let Some(h) = &checkpoint_task {
-        h.abort();
+    Ok(match outcome {
+        Some(Ok(DownloadOutcome::Cancelled)) => ExitKind::Cancelled,
+        Some(Ok(DownloadOutcome::Paused(_))) => ExitKind::PausedDiskFull,
+        Some(Ok(DownloadOutcome::Completed)) => ExitKind::ReadyToFinalize,
+        Some(Err(e)) => ExitKind::Failed(e),
+        None => ExitKind::ReadyToFinalize,
+    })
+}
+
+/// **唯一收尾函数**（1c.1 第一部分）。所有退出路径都经过这里，负责：
+/// 1. 停止检查点任务，并 `await` 它真正结束（不能只调用 abort）；
+/// 2. 停止外部取消的转发任务；
+/// 3. 目标文件已创建时执行最后一次检查点（9.2），完成路径必须成功；
+/// 4. 写入最终的数据库状态（Cancelled → Paused(User)、DiskFull → Paused(DiskFull)、
+///    错误 → Failed；TaskInUse 不改状态）；
+/// 5. 非 Completed 时调用 purge；Completed 走 9.4 完成阶段。
+async fn finalize_download(
+    pool: &DiskWriterPool,
+    opts: &DownloadOptions,
+    ctx: Option<&DownloadContext>,
+    rt: &mut DownloadRuntime,
+    inner: Result<ExitKind>,
+) -> Result<(DownloadOutcome, watch::Receiver<ProgressSnapshot>)> {
+    // 1. 停止检查点任务：先发停止信号，再 await 任务真正结束。
+    //    只调用 abort 无法保证任务已经退出，它可能仍在持有 TargetFile 并写数据库。
+    if let Some((handle, stop_tx)) = rt.checkpoint_task.take() {
+        let _ = stop_tx.send(());
+        let _ = handle.await;
     }
-    // 9.2：任务暂停、取消、失败、完成之前，各触发一次最终检查点。
-    if let Some(c) = &ctx
-        && let Err(e) = run_checkpoint(c, &pool, &target, &acked).await
-    {
-        warn!(error = %e, "final checkpoint abandoned; committed not advanced");
-        // sync 失败且原因是磁盘已满 → 任务暂停，保留 .idm-part。
-        if e.is_disk_full() {
-            outcome = Some(Ok(DownloadOutcome::Paused(PauseReason::DiskFull)));
+    // 2. 停止外部取消转发任务。
+    if let Some(handle) = rt.forward_task.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    let mut kind = match inner {
+        Ok(k) => k,
+        Err(e) => ExitKind::Failed(e),
+    };
+
+    // 3. 目标文件已创建 → 最后一次检查点。
+    //    第二部分：完成路径上必须成功，否则不得进入 Finalizing。
+    if let Some(target) = rt.target.as_deref() {
+        if let Some(c) = ctx {
+            if let Err(e) = run_checkpoint(c, pool, target, &rt.acked).await {
+                warn!(error = %e, "final checkpoint abandoned; committed not advanced");
+                if matches!(kind, ExitKind::ReadyToFinalize) {
+                    kind = if e.is_disk_full() {
+                        ExitKind::PausedDiskFull
+                    } else {
+                        ExitKind::Failed(e)
+                    };
+                }
+            }
+        } else {
+            // 无持久化：保持 Phase 1b 的额外刷盘行为。
+            let _ = pool.sync(target).await;
         }
     }
 
-    match outcome {
-        Some(r) => {
-            // 失败/取消/暂停同样要发布最终快照，否则 CLI 的分块汇总表拿到的是
-            // 上一次 200ms 节流的旧数据（分块终态、耗时、平均速度都会缺失）。
-            progress.lock().await.publish_final();
-            // 持久化层映射：Cancelled → Paused(User)；Paused(DiskFull) → Paused(DiskFull)；
-            // 错误 → Failed。core 的返回值保持 Cancelled，原有测试不受影响。
-            if let Some(c) = &ctx {
-                match &r {
-                    Ok(DownloadOutcome::Cancelled) => {
-                        let _ = c
-                            .store
-                            .update_state(
-                                c.task_id,
-                                TaskStateDb::Paused,
-                                Some(PauseReasonDb::User),
-                                None,
-                            )
-                            .await;
-                    }
-                    Ok(DownloadOutcome::Paused(_)) => {
-                        let _ = c
-                            .store
-                            .update_state(
-                                c.task_id,
-                                TaskStateDb::Paused,
-                                Some(PauseReasonDb::DiskFull),
-                                None,
-                            )
-                            .await;
-                    }
-                    Ok(DownloadOutcome::Completed) => {}
-                    Err(e) => {
-                        let _ = c
-                            .store
-                            .update_state(
-                                c.task_id,
-                                TaskStateDb::Failed,
-                                None,
-                                Some(format!("{e}")),
-                            )
-                            .await;
-                    }
-                }
+    // 失败/取消同样发布最终快照，否则 CLI 的分块汇总表拿到的是旧数据。
+    if let Some(p) = &rt.progress {
+        p.lock().await.publish_final();
+    }
+    let rx = rt
+        .progress_rx
+        .take()
+        .unwrap_or_else(|| watch::channel(ProgressSnapshot::default()).1);
+
+    let mut state = TaskState::Pending;
+    advance(&mut state, TaskState::Probing);
+    advance(&mut state, TaskState::Downloading);
+
+    // 4. 写入最终的数据库状态。
+    if let Some(c) = ctx {
+        match &kind {
+            ExitKind::CancelledBeforeCreate | ExitKind::Cancelled => {
+                let _ = c
+                    .store
+                    .update_state(
+                        c.task_id,
+                        TaskStateDb::Paused,
+                        Some(PauseReasonDb::User),
+                        None,
+                    )
+                    .await;
+                advance(&mut state, TaskState::Cancelled);
             }
-            let _ = pool.sync(&target).await;
-            match r {
-                Ok(o) => {
-                    match o {
-                        DownloadOutcome::Cancelled => advance(&mut state, TaskState::Cancelled),
-                        DownloadOutcome::Paused(_) => advance(&mut state, TaskState::Paused),
-                        DownloadOutcome::Completed => {}
-                    }
-                    // 非 Completed 结束：调用 purge 兜底清理可能残留的写入器（panic/泄露时）。
-                    purge_if_needed(&pool, &target, task_id).await;
-                    info!(task_id, state = ?state, "download stopped");
-                    Ok((o, progress_rx))
-                }
-                Err(e) => {
-                    advance(&mut state, TaskState::Failed);
-                    purge_if_needed(&pool, &target, task_id).await;
-                    info!(task_id, state = ?state, error = %e, "download failed");
-                    Err(e)
-                }
+            ExitKind::DiskFullBeforeCreate | ExitKind::PausedDiskFull => {
+                let _ = c
+                    .store
+                    .update_state(
+                        c.task_id,
+                        TaskStateDb::Paused,
+                        Some(PauseReasonDb::DiskFull),
+                        None,
+                    )
+                    .await;
+                advance(&mut state, TaskState::Paused);
             }
+            ExitKind::Failed(e) => {
+                // 9.5：TaskInUse 说明另一个进程正在下载，数据库状态必须保持不变。
+                if !matches!(e, Error::TaskInUse { .. }) {
+                    let _ = c
+                        .store
+                        .update_state(c.task_id, TaskStateDb::Failed, None, Some(format!("{e}")))
+                        .await;
+                }
+                advance(&mut state, TaskState::Failed);
+            }
+            ExitKind::ReadyToFinalize => {}
         }
-        None => {
-            // 9.4：最终检查点（已在上面统一执行）→ 数据库状态改为 Finalizing
-            // → 释放所有分块和文件句柄 → 不覆盖地重命名 → 记录最终文件名并改为 Completed。
-            if let Some(c) = &ctx {
-                c.store
-                    .update_state(c.task_id, TaskStateDb::Finalizing, None, None)
-                    .await?;
-            }
-            advance(&mut state, TaskState::Finalizing);
-            progress.lock().await.publish_final();
-            pool.sync(&target).await?;
-            // 各分块已在 run_chunk 内 release；这里释放最后一个 TargetFile 句柄。
-            drop(target);
-            // 最终改名前再确认不覆盖：仅当最终文件名（不含 .idm-part）已被占用时，
-            // 才用 resolve_conflict 另选名字。注意：不能让自身的 .idm-part 触发避让，
-            // 否则会把已下载的文件误改名成 `name (1)`。
-            let desired = final_path
+    }
+
+    // 5a. 完成阶段（9.4）：最终检查点（上面已做且必须成功）→ Finalizing
+    //     → 释放所有分块和文件句柄 → 不覆盖地重命名 → 记录最终文件名并改为 Completed。
+    if matches!(kind, ExitKind::ReadyToFinalize) {
+        if let Some(c) = ctx {
+            c.store
+                .update_state(c.task_id, TaskStateDb::Finalizing, None, None)
+                .await?;
+        }
+        advance(&mut state, TaskState::Finalizing);
+        if let Some(target) = rt.target.as_deref() {
+            pool.sync(target).await?;
+        }
+        // 检查点任务已 await 结束，这里持有最后一个 Arc<TargetFile>；drop 后
+        // 句柄全部释放。共享模式不允许删除，只要还有句柄，改名就会失败。
+        rt.target.take();
+
+        let recorded = rt.final_path.as_deref().unwrap_or(opts.dir.as_path());
+        let desired = recorded
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let base = recorded.parent().unwrap_or(opts.dir.as_path());
+        let final_candidate = base.join(&desired);
+        let final_path = if final_candidate.exists() {
+            resolve_conflict(base, &desired)
+        } else {
+            final_candidate
+        };
+        let tmp_path = rt.tmp_path.clone().unwrap_or_default();
+        win32::move_file(&tmp_path, &final_path).map_err(|e| Error::Io {
+            operation: "rename (move_file)",
+            path: final_path.clone(),
+            offset: 0,
+            source: std::io::Error::other(format!("{e}")),
+        })?;
+        if let Some(c) = ctx {
+            let name = final_path
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            // 续传时 final_path 来自数据库记录，其父目录才是正确基准。
-            let base = final_path.parent().unwrap_or(opts.dir.as_path());
-            let final_candidate = base.join(&desired);
-            final_path = if final_candidate.exists() {
-                resolve_conflict(&opts.dir, &desired)
-            } else {
-                final_candidate
-            };
-            win32::move_file(&tmp_path, &final_path).map_err(|e| Error::Io {
-                operation: "rename (move_file)",
-                path: final_path.clone(),
-                offset: 0,
-                source: std::io::Error::other(format!("{e}")),
-            })?;
-            // 9.4 最后一步：记录最终文件名，状态改为 Completed。
-            if let Some(c) = &ctx {
-                let name = final_path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                c.store.set_final_name(c.task_id, &name).await?;
-            }
-            advance(&mut state, TaskState::Completed);
-            info!(task_id, state = ?state, "download completed");
-            Ok((DownloadOutcome::Completed, progress_rx))
+            c.store.set_final_name(c.task_id, &name).await?;
         }
+        advance(&mut state, TaskState::Completed);
+        info!(task_id = rt.task_id, state = ?state, "download completed");
+        return Ok((DownloadOutcome::Completed, rx));
+    }
+
+    // 5b. 非 Completed：purge 兜底清理可能残留的写入器（panic/泄露时）。
+    if let Some(target) = rt.target.as_deref() {
+        purge_if_needed(pool, target, rt.task_id).await;
+        let _ = pool.sync(target).await;
+    }
+    info!(task_id = rt.task_id, state = ?state, "download stopped");
+    match kind {
+        ExitKind::CancelledBeforeCreate | ExitKind::Cancelled => {
+            Ok((DownloadOutcome::Cancelled, rx))
+        }
+        ExitKind::DiskFullBeforeCreate | ExitKind::PausedDiskFull => {
+            Ok((DownloadOutcome::Paused(PauseReason::DiskFull), rx))
+        }
+        ExitKind::Failed(e) => {
+            info!(task_id = rt.task_id, error = %e, "download failed");
+            Err(e)
+        }
+        ExitKind::ReadyToFinalize => Ok((DownloadOutcome::Completed, rx)),
     }
 }
 
@@ -944,7 +1079,10 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
             trace!(task_id, chunk_id, len, "chunk data");
             pool.write(pc, bytes).await?;
             // 只有落盘线程池返回成功回执之后才推进 acked。
-            acked_counter.fetch_add(len, Ordering::Relaxed);
+            // Release 与检查点快照的 Acquire 配对：保证检查点读到这个位置时，
+            // pool.write 的成功回执（以及写入本身）已经完成，绝不把尚未落盘
+            // 的数据记成 committed。
+            acked_counter.fetch_add(len, Ordering::Release);
             received += len;
             received_counter.store(received, Ordering::Relaxed);
             let mut p = progress.lock().await;
@@ -1023,10 +1161,4 @@ fn part_path(final_path: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     final_path.with_file_name(format!("{name}.idm-part"))
-}
-
-/// 在目标文件创建之前取消：不创建任何文件，直接返回 `Cancelled`。
-fn early_cancelled() -> Result<(DownloadOutcome, watch::Receiver<ProgressSnapshot>)> {
-    let (_tx, rx) = watch::channel(ProgressSnapshot::default());
-    Ok((DownloadOutcome::Cancelled, rx))
 }

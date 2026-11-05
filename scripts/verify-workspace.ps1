@@ -347,6 +347,15 @@ if ($doc.ExitCode -ne 0) {
 Write-Host "PASS"
 
 # ---------------------------------------------------------------------------
+# STEP 16: crash_resume test runs on its own (--ignored --test-threads=1).
+#          It spawns 20 killed CLI subprocesses and is timing sensitive, so it
+#          must not run concurrently with the rest of the suite (STEP 5).
+# ---------------------------------------------------------------------------
+Step-Command -Name "cargo test -p idm-cli --test crash_resume --locked -- --ignored --test-threads=1" -ScriptBlock {
+    cargo test -p idm-cli --test crash_resume --locked -- --ignored --test-threads=1
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Host "=============================================="

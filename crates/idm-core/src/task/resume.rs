@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use reqwest::Url;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::disk::DiskWriterPool;
 use crate::disk::win32;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_sharing_violation};
 use crate::net::client::DownloadConfig;
+use crate::net::filename::resolve_conflict;
 use crate::net::probe::Probe;
 use crate::store::{Store, TaskRecord, TaskStateDb};
 use crate::task::cancel::CancelSignal;
@@ -37,6 +38,20 @@ pub async fn resume(
     cancel: Option<&CancelSignal>,
 ) -> Result<(DownloadOutcome, watch::Receiver<ProgressSnapshot>)> {
     let rec = store.get_task(task_id).await?;
+
+    // 9.5：无论任务当前处于什么状态，只要它记录的 .idm-part 正被另一个进程
+    // 以可写方式占用（错误码 32），就返回 TaskInUse。此判断必须早于状态检查，
+    // 否则"正在下载"的 Downloading 任务会先被普通的状态拒绝挡住。
+    // 这里没有执行任何数据库写入，因此状态保持不变。
+    if let Some(p) = rec.part_path.as_deref() {
+        match std::fs::OpenOptions::new().read(true).write(true).open(p) {
+            Ok(f) => drop(f), // 打开成功后立即关闭
+            Err(e) if is_sharing_violation(&e) => {
+                return Err(Error::TaskInUse { id: task_id });
+            }
+            Err(_) => {} // 文件不存在或其他错误，交给后续流程如实报告
+        }
+    }
 
     match rec.state {
         TaskStateDb::Finalizing => return finish_finalizing(&rec, &store).await,
@@ -169,13 +184,16 @@ async fn finish_finalizing(
         .file_name
         .as_deref()
         .ok_or_else(|| resume_err(format!("finalizing task {} has no file name", rec.id)))?;
-    let final_path = PathBuf::from(&rec.dir).join(file_name);
+    let base = PathBuf::from(&rec.dir);
+    let mut final_path = base.join(file_name);
     if final_path.exists() {
-        return Err(resume_err(format!(
-            "finalizing task {}: final file {} already exists (never overwrite)",
-            rec.id,
-            final_path.display()
-        )));
+        // 与正常下载流程保持一致：绝不覆盖，另选一个不冲突的名字。
+        final_path = resolve_conflict(&base, file_name);
+        warn!(
+            task_id = rec.id,
+            path = ?final_path,
+            "finalizing: final file name already taken; chose a non-conflicting name"
+        );
     }
 
     // 本函数没有打开任何文件句柄，因此"释放句柄"一步无需操作。
@@ -186,7 +204,11 @@ async fn finish_finalizing(
         offset: 0,
         source: std::io::Error::other(format!("{e}")),
     })?;
-    store.set_final_name(rec.id, file_name).await?;
+    let final_name = final_path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    store.set_final_name(rec.id, &final_name).await?;
     info!(task_id = rec.id, "finalizing task completed by resume");
     let (_tx, rx) = watch::channel(ProgressSnapshot::default());
     Ok((DownloadOutcome::Completed, rx))

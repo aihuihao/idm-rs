@@ -5,10 +5,17 @@
 //! 创建前先查可用空间，空间不足直接报错且不创建文件；创建中途失败会删除半成品。
 
 use std::fs::{File, OpenOptions};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tracing::warn;
+
+/// 9.5 多进程所有权：只允许其他程序读，不允许写和删除。
+/// `FILE_SHARE_READ = 0x1`；不设置 `FILE_SHARE_WRITE`(0x2) 与
+/// `FILE_SHARE_DELETE`(0x4)，因此另一个进程无法以可写方式打开或改名/删除
+/// 正在下载的 `.idm-part`。
+const FILE_SHARE_READ: u32 = 0x1;
 
 use crate::disk::range::{ChunkRange, RangeRegistry};
 use crate::disk::win32;
@@ -90,6 +97,7 @@ impl TargetFile {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .share_mode(FILE_SHARE_READ)
             .open(&path)
             .map_err(|e| Error::Io {
                 operation: "create",
@@ -173,6 +181,7 @@ impl TargetFile {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
+            .share_mode(FILE_SHARE_READ)
             .open(&path)
             .map_err(|e| Error::Io {
                 operation: "open",

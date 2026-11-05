@@ -90,3 +90,9 @@
 程序启动时的恢复规则：
 - 状态为 Downloading 的任务，改为 Paused（原因：Interrupted）
 - 状态为 Finalizing 的任务：.idm-part 存在 → 保持 Finalizing，续传时直接完成重命名；.idm-part 不存在但最终文件存在且大小正确 → 改为 Completed；其他情况 → Failed，并记录原因
+
+### 9.5 多进程所有权
+- 一个任务的 .idm-part 同一时间只能被一个进程以可写方式打开：TargetFile 使用 FILE_SHARE_READ 共享模式。
+- 启动恢复只把"无人占用"的 Downloading 任务改为 Paused(Interrupted)。.idm-part 被占用（错误码 32）说明另一个进程正在下载，跳过这个任务。
+- resume 遇到被占用的 .idm-part 时返回 TaskInUse，数据库状态不变。
+- 所有文件句柄都必须在改名之前释放；由于共享模式不允许删除，只要还有句柄没释放，改名就会失败。

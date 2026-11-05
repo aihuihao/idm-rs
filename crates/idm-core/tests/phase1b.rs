@@ -741,21 +741,62 @@ async fn cancel_after_probe_before_create() -> TestResult {
 }
 
 /// 取消时机 4：下载进行中（数据正在到达）→ 文件已创建、保留 .idm-part、无残留句柄。
+///
+/// 1c.1 第五部分 1：不再用固定的 200 毫秒延迟（高负载下它可能落在建文件之前，
+/// 而按 1b.1 规则那时本就不该留下文件）。改为等到进度确实显示已写入数据再取消。
 #[tokio::test]
 async fn cancel_during_download() -> TestResult {
-    run_cancel_case(
-        ServerConfig {
-            size: 8 * MIB,
-            chunk_delay: Some(Duration::from_millis(20)),
-            ..ServerConfig::default()
-        },
-        "cancel_mid.bin",
-        8,
-        false,
-        Some(Duration::from_millis(200)),
-        true,
+    let size = 8 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        chunk_delay: Some(Duration::from_millis(20)),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(4, 16)?);
+    let (progress_tx, mut progress_rx) = watch::channel(ProgressSnapshot::default());
+    let opts = DownloadOptions {
+        progress_tx: Some(progress_tx),
+        ..options(tmp.path(), 8, 64 * KIB, "cancel_mid.bin")
+    };
+    let sig = Arc::new(CancelSignal::new());
+    let s = Arc::clone(&sig);
+    let cancel_task = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if progress_rx.borrow().downloaded > 0 || Instant::now() >= deadline {
+                break;
+            }
+            if progress_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        s.cancel();
+    });
+
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        download(
+            &srv.url("/file.bin"),
+            Arc::clone(&pool),
+            &opts,
+            Some(sig.as_ref()),
+        ),
     )
-    .await
+    .await?;
+    let (outcome, _rx) = r?;
+    assert_eq!(outcome, DownloadOutcome::Cancelled);
+    let part = part_path(tmp.path(), "cancel_mid.bin");
+    assert!(
+        part.exists(),
+        ".idm-part must be kept when cancelled mid-download"
+    );
+    assert_no_residual_handle(&part, size)?;
+    cancel_task.abort();
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

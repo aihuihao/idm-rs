@@ -6,7 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,6 +53,9 @@ pub struct ServerConfig {
     pub redirect: bool,
     /// 写到该绝对字节位置后断开连接。
     pub break_at: Option<u64>,
+    /// 只对前 N 个非 Probe 响应生效（配合 `break_at`）；`None` 表示所有响应。
+    /// 用于"真实中途断开 → resume"测试：第一次下载断开，之后的续传不再断开。
+    pub break_responses: Option<u64>,
     /// 每发送一块数据后的延迟（慢速但持续发送，用于验证空闲超时不会误杀）。
     pub chunk_delay: Option<Duration>,
     /// 写到该绝对字节位置后，静默停顿 `freeze_duration` 再关闭连接（用于触发读取空闲超时）。
@@ -77,6 +80,7 @@ impl Default for ServerConfig {
             change_etag_after: None,
             redirect: false,
             break_at: None,
+            break_responses: None,
             chunk_delay: None,
             freeze_after: None,
             freeze_duration: None,
@@ -117,6 +121,9 @@ pub fn verify_file(path: &Path, size: u64) -> Result<(), Box<dyn std::error::Err
 pub struct TestServer {
     base: String,
     handle: tokio::task::JoinHandle<()>,
+    /// 运行期 ETag 切换开关（真实事件）：置位后所有响应改用 `"v2"` 并变更
+    /// Last-Modified，使 resume 时的重新 Probe 能观察到远端变化。
+    pub etag_switched: Arc<AtomicBool>,
 }
 
 impl TestServer {
@@ -125,8 +132,9 @@ impl TestServer {
         format!("{}{}", self.base, path)
     }
 
-    /// 停止 accept 循环（已建立的短连接会自行结束）。
+    /// 停止 accept 循环（已建立的短连接会自行结束），并复位运行期 ETag 开关。
     pub fn shutdown(&self) {
+        self.etag_switched.store(false, Ordering::SeqCst);
         self.handle.abort();
     }
 }
@@ -138,20 +146,27 @@ pub async fn start(config: ServerConfig) -> std::io::Result<TestServer> {
     let base = format!("http://127.0.0.1:{port}");
     let cfg = Arc::new(config);
     let counter = Arc::new(AtomicU64::new(0));
+    let etag_switched = Arc::new(AtomicBool::new(false));
+    let switch_for_loop = Arc::clone(&etag_switched);
     let handle = tokio::spawn(async move {
         loop {
             let (sock, _) = match listener.accept().await {
                 Ok(v) => v,
                 Err(_) => break,
             };
-            let c = cfg.clone();
-            let n = counter.clone();
+            let c = Arc::clone(&cfg);
+            let n = Arc::clone(&counter);
+            let e = Arc::clone(&switch_for_loop);
             tokio::spawn(async move {
-                let _ = handle_conn(sock, c, n, port).await;
+                let _ = handle_conn(sock, c, n, e, port).await;
             });
         }
     });
-    Ok(TestServer { base, handle })
+    Ok(TestServer {
+        base,
+        handle,
+        etag_switched,
+    })
 }
 
 async fn read_headers(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
@@ -190,6 +205,7 @@ async fn handle_conn(
     mut sock: TcpStream,
     cfg: Arc<ServerConfig>,
     counter: Arc<AtomicU64>,
+    etag_switch: Arc<AtomicBool>,
     port: u16,
 ) -> std::io::Result<()> {
     let raw = read_headers(&mut sock).await?;
@@ -228,9 +244,11 @@ async fn handle_conn(
     } else {
         counter.fetch_add(1, Ordering::Relaxed) + 1
     };
-    let changed = cfg
-        .change_etag_after
-        .is_some_and(|threshold| request_no > threshold);
+    // 运行期开关（真实事件）或基于请求数的阈值，都会让 ETag / Last-Modified 变化。
+    let changed = etag_switch.load(Ordering::SeqCst)
+        || cfg
+            .change_etag_after
+            .is_some_and(|threshold| request_no > threshold);
 
     let prefix = if cfg.weak_etag { "W/" } else { "" };
     let base_etag = cfg.etag.clone().unwrap_or_else(|| "\"v1\"".to_string());
@@ -344,9 +362,15 @@ async fn handle_conn(
                 return Ok(());
             }
         }
+        // 只对前 N 个非 Probe 响应断开：`break_responses` 为 None 时对所有响应生效。
+        // 请求编号是服务器全局递增的，因此续传时的新请求自然落在范围之外。
+        let break_active = match cfg.break_responses {
+            Some(n_responses) => !is_probe && request_no <= n_responses,
+            None => true,
+        };
         // 提前断开：只写到 break_at 为止就关闭连接，保证 Content-Length 声明的
         // 长度无法被满足，客户端必须观察到响应体被截断。
-        if let Some(b) = cfg.break_at {
+        if let Some(b) = cfg.break_at.filter(|_| break_active) {
             let abs = start + written;
             if abs >= b {
                 return Ok(());

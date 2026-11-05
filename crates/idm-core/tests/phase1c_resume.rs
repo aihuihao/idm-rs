@@ -6,6 +6,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use idm_core::disk::{AllocationStrategy, DiskWriterPool};
@@ -50,7 +51,7 @@ struct Half {
     srv: TestServer,
     store: Arc<Store>,
     pool: Arc<DiskWriterPool>,
-    db_path: PathBuf,
+    _db_path: PathBuf,
     part_path: PathBuf,
     id: i64,
     size: u64,
@@ -74,12 +75,21 @@ impl Drop for Half {
 
 /// 下载到一半取消：任务应停在 Paused(User)，且 committed 严格介于 0 与总长之间。
 async fn half_download(size: u64, out: &str) -> TestResult<Half> {
-    let srv = start(ServerConfig {
-        size,
-        chunk_delay: Some(Duration::from_millis(30)),
-        ..ServerConfig::default()
-    })
-    .await?;
+    half_download_with(
+        ServerConfig {
+            size,
+            chunk_delay: Some(Duration::from_millis(30)),
+            ..ServerConfig::default()
+        },
+        out,
+    )
+    .await
+}
+
+/// 与 [`half_download`] 相同，但允许自定义服务器配置（真实事件测试用）。
+async fn half_download_with(cfg: ServerConfig, out: &str) -> TestResult<Half> {
+    let size = cfg.size;
+    let srv = start(cfg).await?;
     let tmp = tempdir()?;
     let db_path = tmp.path().join("idm.db");
     let store = Store::open(&db_path)?;
@@ -118,7 +128,7 @@ async fn half_download(size: u64, out: &str) -> TestResult<Half> {
         srv,
         store,
         pool,
-        db_path,
+        _db_path: db_path,
         id,
         size,
         out: out.to_string(),
@@ -155,14 +165,23 @@ async fn resume_after_pause_produces_byte_exact_file() -> TestResult {
 
 #[tokio::test]
 async fn resume_detects_remote_etag_change() -> TestResult {
-    let h = half_download(8 * MIB, "etag.bin").await?;
-    {
-        let conn = rusqlite::Connection::open(&h.db_path)?;
-        conn.execute(
-            "UPDATE tasks SET etag='\"changed-by-test\"' WHERE id=?1",
-            [h.id],
-        )?;
-    }
+    // 真实事件：服务器带可切换的 ETag，下载到一半后在服务器侧切换，
+    // 不再通过直接改数据库伪造"远端变化"。
+    let h = half_download_with(
+        ServerConfig {
+            size: 8 * MIB,
+            etag: Some("\"v1\"".to_string()),
+            chunk_delay: Some(Duration::from_millis(30)),
+            ..ServerConfig::default()
+        },
+        "etag.bin",
+    )
+    .await?;
+    assert!(
+        h.store.get_task(h.id).await?.etag.is_some(),
+        "Probe 时应记录到切换前的 ETag"
+    );
+    h.srv.etag_switched.store(true, Ordering::SeqCst);
     let r = resume(
         h.id,
         Arc::clone(&h.store),
@@ -305,27 +324,43 @@ async fn non_resumable_task_restarts_from_scratch() -> TestResult {
 
 #[tokio::test]
 async fn failed_task_can_be_resumed() -> TestResult {
-    let h = half_download(8 * MIB, "failed.bin").await?;
-    // 把取消后的 Paused(User) 改为 Failed，模拟中途失败后的状态。
-    h.store
-        .update_state(
-            h.id,
-            TaskStateDb::Failed,
-            None,
-            Some("simulated mid-transfer failure".into()),
-        )
-        .await?;
-    let (outcome, _rx) = resume(
-        h.id,
-        Arc::clone(&h.store),
-        Arc::clone(&h.pool),
-        &h.opts(),
-        None,
-    )
+    // 真实事件：服务器只对前 4 个分块响应在 2 MiB 处断开，第一次下载因此
+    // 真的失败（UnexpectedEof），而不是手工把状态改成 Failed。
+    let size = 4 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        break_at: Some(2 * MIB),
+        break_responses: Some(4),
+        chunk_delay: Some(Duration::from_millis(5)),
+        ..ServerConfig::default()
+    })
     .await?;
+    let tmp = tempdir()?;
+    let store = Store::open(tmp.path().join("idm.db"))?;
+    let id = store
+        .create_task(new_task(&srv.url("/file.bin"), tmp.path()))
+        .await?;
+    let mut ctx = DownloadContext::new(Arc::clone(&store), id);
+    ctx.checkpoint_interval = Duration::from_millis(100);
+    let pool = Arc::new(DiskWriterPool::new(4, 16)?);
+    let opts = options(tmp.path(), "broken.bin");
+    let r = download_with_store(
+        &srv.url("/file.bin"),
+        Arc::clone(&pool),
+        &opts,
+        None,
+        Some(ctx),
+    )
+    .await;
+    assert!(r.is_err(), "真实中途断开必须导致下载失败");
+    assert_eq!(store.get_task(id).await?.state, TaskStateDb::Failed);
+    assert!(tmp.path().join("broken.bin.idm-part").exists());
+
+    // 续传时的请求编号已超过 break_responses，服务器不再断开。
+    let (outcome, _rx) = resume(id, Arc::clone(&store), Arc::clone(&pool), &opts, None).await?;
     assert_eq!(outcome, DownloadOutcome::Completed);
-    assert_eq!(h.store.get_task(h.id).await?.state, TaskStateDb::Completed);
-    verify_file(&h.dir().join(&h.out), h.size)?;
+    assert_eq!(store.get_task(id).await?.state, TaskStateDb::Completed);
+    verify_file(&tmp.path().join("broken.bin"), size)?;
     Ok(())
 }
 

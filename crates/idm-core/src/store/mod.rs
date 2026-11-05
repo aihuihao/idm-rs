@@ -8,6 +8,7 @@
 //! 检查点的事务严格实现 ARCHITECTURE.md 9.2 的 `committed = MAX(committed, S)`：
 //! 调用方必须先取 acked 快照 S、再 `sync`、成功后才把 S 交给本模块。
 
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_sharing_violation};
 
 // ---------------------------------------------------------------------------
 // 迁移：数组下标 i 对应 user_version = i + 1
@@ -71,11 +72,27 @@ fn db_err(e: rusqlite::Error) -> Error {
     }
 }
 
-fn now_text() -> String {
+/// 毫秒级时间戳。秒级精度不足以让"检查点任务已停止"的断言区分
+/// 两次相邻检查点（默认间隔 2 秒，测试中可更短），故统一使用毫秒。
+fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn now_text() -> String {
+    now_millis().to_string()
+}
+
+/// 兼容读取 Phase 1c 早期写入的秒级时间戳；统一返回毫秒。
+fn parse_timestamp(s: &str) -> u64 {
+    let v = s.parse::<u64>().unwrap_or(0);
+    if v < 100_000_000_000 {
+        v.saturating_mul(1000)
+    } else {
+        v
+    }
 }
 
 /// 依次执行缺失的迁移；每条迁移在自己的事务内完成并更新 `user_version`。
@@ -257,13 +274,17 @@ pub struct TaskSummary {
     pub part_path: Option<String>,
 }
 
-/// 启动恢复统计（9.4）。
+/// 启动恢复统计（9.4 / 9.5）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub interrupted: u64,
     pub kept_finalizing: u64,
     pub completed: u64,
     pub failed: u64,
+    /// 因 `.idm-part` 被另一个进程占用（错误码 32）而跳过的 Downloading 任务数。
+    pub skipped: u64,
+    /// 因 Pending / Probing 状态停留超过 5 分钟而改为 Failed 的任务数。
+    pub stale_before_download: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -823,20 +844,94 @@ struct FinalizingRow {
 /// - Downloading → Paused(Interrupted)
 /// - Finalizing：.idm-part 存在 → 保持；否则最终文件存在且大小正确 → Completed；其余 → Failed
 fn recover(conn: &Connection) -> Result<RecoveryReport> {
-    let interrupted = conn
-        .execute(
-            "UPDATE tasks SET state=?1, pause_reason=?2, updated_at=?3 WHERE state='Downloading'",
+    let mut report = RecoveryReport::default();
+    let now = now_millis();
+
+    // 第四部分 2：Pending / Probing 且停留超过 5 分钟 → Failed 并记录原因。
+    // Probe 的总超时只有 60 秒，正在运行的进程不可能在这两个状态停留 5 分钟。
+    struct StaleRow {
+        id: i64,
+        updated_at: String,
+    }
+    let stale_rows: Vec<StaleRow> = {
+        let mut stmt = conn
+            .prepare("SELECT id, updated_at FROM tasks WHERE state IN ('Pending','Probing')")
+            .map_err(db_err)?;
+        stmt.query_map([], |r| {
+            Ok(StaleRow {
+                id: r.get(0)?,
+                updated_at: r.get(1)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_err)?
+    };
+    for row in stale_rows {
+        if now.saturating_sub(parse_timestamp(&row.updated_at)) > 5 * 60 * 1000 {
+            conn.execute(
+                "UPDATE tasks SET state=?2, last_error=?3, updated_at=?4 WHERE id=?1",
+                params![
+                    row.id,
+                    TaskStateDb::Failed.as_str(),
+                    "interrupted before download started",
+                    now_text()
+                ],
+            )
+            .map_err(db_err)?;
+            report.stale_before_download += 1;
+        }
+    }
+
+    // 9.5：Downloading 任务先探测 .idm-part 是否被另一个进程占用。
+    // 只有"无人占用"的任务才改为 Paused(Interrupted)。
+    struct DownloadingRow {
+        id: i64,
+        part_path: Option<String>,
+    }
+    let downloading: Vec<DownloadingRow> = {
+        let mut stmt = conn
+            .prepare("SELECT id, part_path FROM tasks WHERE state='Downloading'")
+            .map_err(db_err)?;
+        stmt.query_map([], |r| {
+            Ok(DownloadingRow {
+                id: r.get(0)?,
+                part_path: r.get(1)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_err)?
+    };
+    for row in downloading {
+        // 以读写方式打开：若另一个进程持有 FILE_SHARE_READ 句柄，Windows 返回
+        // ERROR_SHARING_VIOLATION(32)，说明它正在下载，跳过且状态不变。
+        let in_use = match row.part_path.as_deref() {
+            Some(p) if !p.is_empty() => match OpenOptions::new().read(true).write(true).open(p) {
+                Ok(f) => {
+                    drop(f); // 打开成功后立即关闭
+                    false
+                }
+                Err(e) => is_sharing_violation(&e),
+            },
+            _ => false,
+        };
+        if in_use {
+            report.skipped += 1;
+            continue;
+        }
+        conn.execute(
+            "UPDATE tasks SET state=?2, pause_reason=?3, updated_at=?4 WHERE id=?1",
             params![
+                row.id,
                 TaskStateDb::Paused.as_str(),
                 PauseReasonDb::Interrupted.as_str(),
                 now_text()
             ],
         )
-        .map_err(db_err)? as u64;
-    let mut report = RecoveryReport {
-        interrupted,
-        ..RecoveryReport::default()
-    };
+        .map_err(db_err)?;
+        report.interrupted += 1;
+    }
 
     let rows: Vec<FinalizingRow> = {
         let mut stmt = conn

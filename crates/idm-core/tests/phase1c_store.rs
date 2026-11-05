@@ -219,17 +219,26 @@ async fn sync_failure_does_not_advance_committed() -> TestResult {
     ctx.checkpoint_interval = Duration::from_millis(50);
     ctx.hooks.fail_sync = Arc::new(AtomicBool::new(true));
     let pool = Arc::new(DiskWriterPool::new(4, 16)?);
-    let (outcome, _rx) = download_with_store(
+    let r = download_with_store(
         &srv.url("/file.bin"),
         Arc::clone(&pool),
         &options(tmp.path(), "sync_fail.bin"),
         None,
         Some(ctx),
     )
-    .await?;
-    assert_eq!(outcome, DownloadOutcome::Completed);
-    verify_file(&tmp.path().join("sync_fail.bin"), size)?;
+    .await;
+    // 1c.1 第二部分：最后一次检查点失败时不得完成，也不得改名。
+    assert!(
+        r.is_err(),
+        "final checkpoint failure must prevent completion"
+    );
+    assert!(
+        !tmp.path().join("sync_fail.bin").exists(),
+        "must not rename .idm-part when final checkpoint fails"
+    );
+    verify_file(&tmp.path().join("sync_fail.bin.idm-part"), size)?;
     let rec = store.get_task(id).await?;
+    assert_eq!(rec.state, TaskStateDb::Failed);
     assert!(!rec.chunks.is_empty());
     for c in &rec.chunks {
         assert_eq!(
@@ -268,6 +277,8 @@ async fn checkpoint_never_writes_more_than_acked_snapshot() -> TestResult {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(s.to_vec());
         })),
+        before_chunks: None,
+        after_probe: None,
     };
     let pool = Arc::new(DiskWriterPool::new(4, 16)?);
     let (outcome, _rx) = download_with_store(

@@ -120,6 +120,10 @@ pub enum Error {
     /// 任务不存在。
     #[error("task {id} not found")]
     TaskNotFound { id: i64 },
+    /// 任务的 `.idm-part` 正被另一个进程以可写方式占用（Windows 错误码 32
+    /// ERROR_SHARING_VIOLATION），此时不得续传，也不得改动数据库状态。
+    #[error("task {id} is in use by another process")]
+    TaskInUse { id: i64 },
 }
 
 /// 便捷 Result 别名。
@@ -134,6 +138,12 @@ impl Error {
             Error::DiskFull { .. } | Error::DiskFullDuringWrite { .. }
         )
     }
+}
+
+/// Windows `ERROR_SHARING_VIOLATION`(32)：文件正被另一个进程以不兼容的
+/// 共享模式占用（9.5 多进程所有权）。
+pub(crate) fn is_sharing_violation(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(32)
 }
 
 /// 把底层 IO 错误包装为强类型错误，并把系统错误码 112 / 39 统一映射为
