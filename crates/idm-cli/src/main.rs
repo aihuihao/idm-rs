@@ -311,6 +311,30 @@ mod dl {
         );
     }
 
+    /// 生成每个分块的汇总表：编号、区间、已写入字节数、耗时、平均速度、最终状态。
+    /// 下载成功、取消、失败都会输出（数据源是外部进度通道的最后一份快照）。
+    fn format_chunk_summary(snap: &ProgressSnapshot) -> String {
+        let mut text =
+            String::from("CHUNK SUMMARY: id | range | written | elapsed | avg_speed | state");
+        for (id, c) in snap.chunks.iter().enumerate() {
+            text.push_str(&format!(
+                "\nCHUNK id={} range=[{}-{}] written={} elapsed={:.2}s avg_speed={:.0} B/s state={:?}",
+                id,
+                c.start,
+                c.end.saturating_sub(1),
+                c.current.saturating_sub(c.start),
+                c.elapsed_secs,
+                c.avg_speed,
+                c.state
+            ));
+        }
+        text
+    }
+
+    fn print_chunk_summary(snap: &ProgressSnapshot) {
+        println!("{}", format_chunk_summary(snap));
+    }
+
     pub async fn run(args: &[String]) -> i32 {
         let mut url: Option<String> = None;
         let mut dir: Option<String> = None;
@@ -402,6 +426,14 @@ mod dl {
                         }
                     }
                 }
+                "--log-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --log-file");
+                        return 2;
+                    }
+                    // 值已由 main() 预扫描并用于初始化 tracing；这里只消费参数。
+                }
                 other if url.is_none() && !other.starts_with("--") => url = Some(other.to_string()),
                 other => {
                     eprintln!("unknown argument: {other}");
@@ -415,7 +447,7 @@ mod dl {
             Some(u) => u,
             None => {
                 eprintln!(
-                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto] [--cancel-after SECONDS] [--max-speed 500K|3M]"
+                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto] [--cancel-after SECONDS] [--max-speed 500K|3M] [--log-file PATH]"
                 );
                 return 2;
             }
@@ -426,19 +458,19 @@ mod dl {
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("cannot create dir {}: {e}", dir.display());
+            crate::print_error(&format!("cannot create dir {}", dir.display()), &e);
             return 1;
         }
 
         let parsed_url = match Url::parse(&url) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("invalid URL: {e}");
+                crate::print_error("invalid URL", &e);
                 return 2;
             }
         };
         if let Err(e) = DownloadConfig::check_scheme(&parsed_url) {
-            eprintln!("{e}");
+            crate::print_error("invalid URL", &e);
             return 2;
         }
 
@@ -449,7 +481,7 @@ mod dl {
         let client = match config.build_client() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("cannot build HTTP client: {e}");
+                crate::print_error("cannot build HTTP client", &e);
                 return 1;
             }
         };
@@ -458,7 +490,7 @@ mod dl {
         let probe_result = match Probe::new(&client, &config).probe(&parsed_url).await {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("probe failed: {e}");
+                crate::print_error("probe failed", &e);
                 return 1;
             }
         };
@@ -506,7 +538,7 @@ mod dl {
         let pool = match DiskWriterPool::new(4, 16) {
             Ok(p) => Arc::new(p),
             Err(e) => {
-                eprintln!("disk writer pool init failed: {e}");
+                crate::print_error("disk writer pool init failed", &e);
                 return 1;
             }
         };
@@ -534,10 +566,12 @@ mod dl {
         let elapsed = started.elapsed();
         progress_task.abort();
         let snap = final_rx.borrow().clone();
+        // A：无论成功还是失败，都打印每个分块的汇总表。
+        print_chunk_summary(&snap);
         let (outcome, _rx) = match result {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("download failed: {e}");
+                crate::print_error("download failed", &e);
                 return 1;
             }
         };
@@ -578,7 +612,31 @@ mod dl {
 
     #[cfg(test)]
     mod tests {
-        use super::parse_max_speed;
+        use idm_core::task::progress::ChunkProgress;
+
+        use super::{ChunkState, ProgressSnapshot, format_chunk_summary, parse_max_speed};
+
+        #[test]
+        fn chunk_summary_contains_all_columns() {
+            let snap = ProgressSnapshot {
+                chunks: vec![ChunkProgress {
+                    start: 0,
+                    current: 1024,
+                    end: 1024,
+                    state: ChunkState::Done,
+                    elapsed_secs: 2.0,
+                    avg_speed: 512.0,
+                }],
+                ..ProgressSnapshot::default()
+            };
+            let text = format_chunk_summary(&snap);
+            assert!(text.contains("id=0"), "{text}");
+            assert!(text.contains("range=[0-1023]"), "{text}");
+            assert!(text.contains("written=1024"), "{text}");
+            assert!(text.contains("elapsed=2.00s"), "{text}");
+            assert!(text.contains("avg_speed=512 B/s"), "{text}");
+            assert!(text.contains("state=Done"), "{text}");
+        }
 
         #[test]
         fn parses_plain_and_suffixed_speeds() {
@@ -608,23 +666,90 @@ mod dl {
     }
 }
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+/// 把错误本身与逐层 `source()` 展开成多行文本，供失败时打印完整错误链。
+fn format_error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = format!("{e}");
+    let mut src = e.source();
+    let mut level = 1usize;
+    while let Some(cause) = src {
+        text.push_str(&format!("\n  caused by [{level}]: {cause}"));
+        src = cause.source();
+        level += 1;
+    }
+    text
+}
+
+/// 打印错误链（前缀 + 错误本身 + 逐层 source）。
+fn print_error(prefix: &str, e: &(dyn std::error::Error + 'static)) {
+    eprintln!("{prefix}: {}", format_error_chain(e));
+}
+
+/// 启动时预扫描 `--log-file`：tracing subscriber 必须在子命令参数解析之前初始化。
+fn find_log_file(args: &[String]) -> Option<std::path::PathBuf> {
+    let mut i = 0;
+    while i + 1 < args.len() {
+        if args[i] == "--log-file" {
+            return Some(std::path::PathBuf::from(&args[i + 1]));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 初始化全局 tracing：stderr 保持原有级别，`--log-file` 额外以 debug 级别写文件。
+fn init_tracing(log_file: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let stderr_layer = fmt::layer()
         .with_thread_ids(true)
         .with_target(true)
         .with_ansi(false)
-        .init();
+        .with_writer(std::io::stderr)
+        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
+
+    let file_layer = match log_file {
+        Some(path) => {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            Some(
+                fmt::layer()
+                    .with_thread_ids(true)
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_filter(EnvFilter::new("debug")),
+            )
+        }
+        None => None,
+    };
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
+        .try_init()
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("tracing init failed: {e}").into()
+        })?;
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() {
-    init_tracing();
-
     let args: Vec<String> = std::env::args().collect();
+    let log_file = find_log_file(&args);
+    if let Err(e) = init_tracing(log_file.as_deref()) {
+        eprintln!("cannot init tracing: {e}");
+        std::process::exit(1);
+    }
+
     if args.len() > 1 && args[1] == "bench-alloc" {
         #[cfg(windows)]
         {
@@ -652,4 +777,57 @@ async fn main() {
         core_version = core_version(),
         "idm-cli started"
     );
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{find_log_file, format_error_chain};
+
+    #[derive(Debug)]
+    struct Wrapped(std::io::Error);
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer layer")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn error_chain_lists_each_source() {
+        let inner = std::io::Error::other("root cause");
+        let outer = Wrapped(inner);
+        let text = format_error_chain(&outer);
+        assert!(text.starts_with("outer layer"), "{text}");
+        assert!(text.contains("caused by [1]: root cause"), "{text}");
+    }
+
+    #[test]
+    fn error_chain_without_source_has_no_caused_by_line() {
+        let e = std::io::Error::from_raw_os_error(5);
+        let text = format_error_chain(&e);
+        assert!(!text.contains("caused by"), "{text}");
+    }
+
+    #[test]
+    fn finds_log_file_from_args() {
+        let args = vec![
+            "download".to_string(),
+            "--log-file".to_string(),
+            "D:\\logs\\x.log".to_string(),
+            "--max-speed".to_string(),
+            "3M".to_string(),
+        ];
+        assert_eq!(
+            find_log_file(&args),
+            Some(std::path::PathBuf::from("D:\\logs\\x.log"))
+        );
+        assert_eq!(find_log_file(&args[..1]), None);
+        assert_eq!(find_log_file(&[]), None);
+    }
 }

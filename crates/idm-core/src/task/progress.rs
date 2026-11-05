@@ -16,6 +16,11 @@ pub struct ChunkProgress {
     pub current: u64,
     pub end: u64,
     pub state: ChunkState,
+    /// 分块从开始到退出的耗时（秒）。分块尚未退出时为 0。
+    /// 用于 CLI 在下载结束时打印分块汇总表。
+    pub elapsed_secs: f64,
+    /// 分块平均写入速度（字节/秒）= 已写入字节数 / 耗时。
+    pub avg_speed: f64,
 }
 
 /// 全局进度快照。
@@ -58,6 +63,8 @@ impl ProgressPublisher {
                 current: start,
                 end,
                 state: ChunkState::Pending,
+                elapsed_secs: 0.0,
+                avg_speed: 0.0,
             })
             .collect();
         let snap = ProgressSnapshot {
@@ -117,6 +124,20 @@ impl ProgressPublisher {
             .get_mut(idx)
         {
             c.current = current;
+        }
+    }
+
+    /// 记录某分块退出时的耗时与平均写入速度（供分块汇总表使用）。
+    pub fn set_chunk_timing(&self, idx: usize, elapsed_secs: f64, avg_speed: f64) {
+        if let Some(c) = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chunks
+            .get_mut(idx)
+        {
+            c.elapsed_secs = elapsed_secs;
+            c.avg_speed = avg_speed;
         }
     }
 

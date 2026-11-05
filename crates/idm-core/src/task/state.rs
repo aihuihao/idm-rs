@@ -23,6 +23,8 @@ pub enum ChunkState {
     Downloading,
     Done,
     Failed,
+    /// 协作式取消导致分块提前退出（不算失败，也不是完成）。
+    Cancelled,
 }
 
 /// 非法状态转换错误（泛型，复用于任务与分块状态机）。
@@ -83,7 +85,10 @@ impl ChunkState {
         use ChunkState::*;
         matches!(
             (self, to),
-            (Pending, Downloading) | (Downloading, Done) | (Downloading, Failed)
+            (Pending, Downloading)
+                | (Downloading, Done)
+                | (Downloading, Failed)
+                | (Downloading, Cancelled)
         )
     }
 }
@@ -136,5 +141,20 @@ mod tests {
             })
         );
         assert!(ChunkState::Done.transition(ChunkState::Failed).is_err());
+    }
+
+    #[test]
+    fn chunk_cancelled_is_a_terminal_state() {
+        let s = ChunkState::Downloading
+            .transition(ChunkState::Cancelled)
+            .unwrap();
+        assert_eq!(s, ChunkState::Cancelled);
+        assert!(
+            ChunkState::Pending
+                .transition(ChunkState::Cancelled)
+                .is_err()
+        );
+        assert!(ChunkState::Done.transition(ChunkState::Cancelled).is_err());
+        assert!(ChunkState::Cancelled.transition(ChunkState::Done).is_err());
     }
 }

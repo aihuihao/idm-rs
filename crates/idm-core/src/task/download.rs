@@ -293,6 +293,9 @@ pub async fn download(
 
     match outcome {
         Some(r) => {
+            // 失败/取消/暂停同样要发布最终快照，否则 CLI 的分块汇总表拿到的是
+            // 上一次 200ms 节流的旧数据（分块终态、耗时、平均速度都会缺失）。
+            progress.lock().await.publish_final();
             let _ = pool.sync(&target).await;
             match r {
                 Ok(o) => {
@@ -421,10 +424,33 @@ async fn run_chunk(job: ChunkJob) -> Result<ChunkResult> {
     let mut cs = next_chunk_state(ChunkState::Pending, ChunkState::Downloading);
     progress.lock().await.set_chunk_state(idx, cs);
 
+    let chunk_started = Instant::now();
     let inner = run_chunk_inner(job, &pc).await;
+    let elapsed_secs = chunk_started.elapsed().as_secs_f64();
     // 无论成功、失败还是取消，都统一 release，避免文件句柄在 worker 线程中残留。
     let released = pool.release(pc).await;
     let received = received_counter.load(Ordering::Relaxed);
+
+    // 分块汇总表数据：已写入字节数取进度快照的 current - start（该位置只在
+    // pool.write 成功返回后才推进）；耗时为本分块从开始到读取结束的墙钟时间。
+    let written = {
+        let p = progress.lock().await;
+        let snap = p.snapshot();
+        let guard = snap.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .chunks
+            .get(idx)
+            .map_or(0, |c| c.current.saturating_sub(c.start))
+    };
+    let avg_speed = if elapsed_secs > 0.0 {
+        written as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+    progress
+        .lock()
+        .await
+        .set_chunk_timing(idx, elapsed_secs, avg_speed);
 
     match inner {
         Ok(ChunkExit::Completed) => {
@@ -445,6 +471,8 @@ async fn run_chunk(job: ChunkJob) -> Result<ChunkResult> {
             Ok(ChunkResult::Completed)
         }
         Ok(ChunkExit::Cancelled) => {
+            cs = next_chunk_state(cs, ChunkState::Cancelled);
+            progress.lock().await.set_chunk_state(idx, cs);
             info!(task_id, chunk_id, start, end, received, "chunk cancelled");
             Ok(ChunkResult::Cancelled)
         }
