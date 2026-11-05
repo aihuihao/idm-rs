@@ -43,6 +43,7 @@ fn options(dir: &Path, connections: usize, min_chunk: u64, out: &str) -> Downloa
         dir: dir.to_path_buf(),
         out_name: Some(out.to_string()),
         progress_tx: None,
+        max_speed: None,
     }
 }
 
@@ -58,6 +59,21 @@ fn options_with(dir: &Path, cfg: DownloadConfig, out: &str) -> DownloadOptions {
         dir: dir.to_path_buf(),
         out_name: Some(out.to_string()),
         progress_tx: None,
+        max_speed: None,
+    }
+}
+
+/// 带总限速的下载选项。
+fn options_limited(
+    dir: &Path,
+    connections: usize,
+    min_chunk: u64,
+    out: &str,
+    max_speed: u64,
+) -> DownloadOptions {
+    DownloadOptions {
+        max_speed: Some(max_speed),
+        ..options(dir, connections, min_chunk, out)
     }
 }
 
@@ -1077,6 +1093,139 @@ async fn stress_1gb_16_connections() -> TestResult {
         verify_elapsed.as_secs_f64(),
         t0.elapsed().as_secs_f64()
     );
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1b 收尾：下载限速（全部使用本地测试服务器，不访问外网）
+// ---------------------------------------------------------------------------
+
+/// 2 MiB/s 下载 10 MiB，单连接：理论 5 秒，允许 ±15%（4.25 ~ 5.75 秒）。
+#[tokio::test]
+async fn ratelimit_single_connection_2mibps_10mib() -> TestResult {
+    let size = 10 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(4, 16)?);
+    let opts = options_limited(tmp.path(), 1, 64 * KIB, "rl_single.bin", 2 * MIB);
+    let t0 = Instant::now();
+    let (outcome, _rx) = download(&srv.url("/file.bin"), pool.clone(), &opts, None).await?;
+    let elapsed = t0.elapsed().as_secs_f64();
+    println!("RATELIMIT_SINGLE connections=1 size={size} elapsed={elapsed:.2}s expected=5.00s");
+    assert_eq!(outcome, DownloadOutcome::Completed);
+    assert!(
+        (4.25..=5.75).contains(&elapsed),
+        "elapsed {elapsed:.2}s outside 4.25..=5.75"
+    );
+    verify_file(&tmp.path().join("rl_single.bin"), size)?;
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
+}
+
+/// 8 个连接共用同一个限速器：总速度仍被限制为 2 MiB/s（若每连接各自限速，
+/// 10 MiB 只需约 0.625 秒，测试会立刻失败）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ratelimit_eight_connections_share_one_budget() -> TestResult {
+    let size = 10 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(4, 16)?);
+    let opts = options_limited(tmp.path(), 8, 64 * KIB, "rl_eight.bin", 2 * MIB);
+    let t0 = Instant::now();
+    let (outcome, _rx) = download(&srv.url("/file.bin"), pool.clone(), &opts, None).await?;
+    let elapsed = t0.elapsed().as_secs_f64();
+    println!("RATELIMIT_EIGHT connections=8 size={size} elapsed={elapsed:.2}s expected=5.00s");
+    assert_eq!(outcome, DownloadOutcome::Completed);
+    assert!(
+        (4.25..=5.75).contains(&elapsed),
+        "elapsed {elapsed:.2}s outside 4.25..=5.75; per-connection limiting suspected"
+    );
+    verify_file(&tmp.path().join("rl_eight.bin"), size)?;
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
+}
+
+/// 限速等待期间取消：必须在 2 秒内返回 `Cancelled`，且 `.idm-part` 保留。
+#[tokio::test]
+async fn ratelimit_cancel_returns_cancelled_within_two_seconds() -> TestResult {
+    let size = 10 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(4, 16)?);
+    let opts = options_limited(tmp.path(), 4, 64 * KIB, "rl_cancel.bin", 2 * MIB);
+    let sig = Arc::new(CancelSignal::new());
+    let s = sig.clone();
+    let cancel_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        s.cancel();
+    });
+    let t0 = Instant::now();
+    let timed = tokio::time::timeout(
+        Duration::from_secs(2),
+        download(
+            &srv.url("/file.bin"),
+            pool.clone(),
+            &opts,
+            Some(sig.as_ref()),
+        ),
+    )
+    .await;
+    let elapsed = t0.elapsed().as_secs_f64();
+    println!(
+        "RATELIMIT_CANCEL elapsed={elapsed:.2}s timed_out={}",
+        timed.is_err()
+    );
+    let (outcome, _rx) = timed??;
+    assert_eq!(outcome, DownloadOutcome::Cancelled);
+    assert!(elapsed <= 2.0, "cancel took {elapsed:.2}s");
+    assert!(
+        part_path(tmp.path(), "rl_cancel.bin").exists(),
+        "cancelled download must retain .idm-part"
+    );
+    cancel_task.await?;
+    shutdown_pool(pool).await?;
+    srv.shutdown();
+    Ok(())
+}
+
+/// `max_speed: None` 时不插入任何等待，行为与加入限速字段之前一致。
+#[tokio::test]
+async fn unlimited_download_is_not_delayed() -> TestResult {
+    let size = 10 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let pool = Arc::new(DiskWriterPool::new(4, 16)?);
+    let opts = options(tmp.path(), 8, 64 * KIB, "rl_unlimited.bin");
+    let t0 = Instant::now();
+    let (outcome, _rx) = download(&srv.url("/file.bin"), pool.clone(), &opts, None).await?;
+    let elapsed = t0.elapsed().as_secs_f64();
+    println!("RATELIMIT_UNLIMITED size={size} elapsed={elapsed:.2}s");
+    assert_eq!(outcome, DownloadOutcome::Completed);
+    assert!(
+        elapsed < 3.0,
+        "unlimited download was delayed: {elapsed:.2}s"
+    );
+    verify_file(&tmp.path().join("rl_unlimited.bin"), size)?;
     shutdown_pool(pool).await?;
     srv.shutdown();
     Ok(())

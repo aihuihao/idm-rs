@@ -22,6 +22,7 @@ use tracing::{info, trace, warn};
 use crate::disk::win32;
 use crate::disk::{AllocationStrategy, DiskWriterPool, PoolChunk, SpaceCheck, TargetFile};
 use crate::error::{Error, Result};
+use crate::net::RateLimiter;
 use crate::net::client::DownloadConfig;
 use crate::net::filename::{infer_filename, resolve_conflict, sanitize_windows_filename};
 use crate::net::headers::parse_content_range;
@@ -57,6 +58,9 @@ pub struct DownloadOptions {
     /// 可选的外部进度通道发送端：调用方可在下载开始前订阅 `watch::Receiver`，
     /// 从而在下载过程中实时读取进度。传 `None` 时由库内部创建通道。
     pub progress_tx: Option<watch::Sender<ProgressSnapshot>>,
+    /// 整次下载的总限速（字节/秒）。`None` 表示不限速，行为与本字段加入前一致。
+    /// `Some(rate)` 时所有分块共用同一个 `RateLimiter`，限制的是这次下载的总速度。
+    pub max_speed: Option<u64>,
 }
 
 /// 执行一次下载。返回结果，以及进度快照的 `watch` 接收端（可不读）。
@@ -172,6 +176,11 @@ pub async fn download(
     let progress = Arc::new(Mutex::new(progress_pub));
     let download_url = probe_result.final_url.clone();
 
+    // 整次下载唯一的限速器：所有分块通过 Arc 共享，限制的是总速度。
+    // 不限速时保持 None，读取循环里不插入任何等待，行为与之前完全一致。
+    let limiter: Option<Arc<RateLimiter>> =
+        opts.max_speed.map(|rate| Arc::new(RateLimiter::new(rate)));
+
     // 内部取消信号：所有分块任务订阅它；外部取消/出错/panic 都会先触发它（协作式）。
     let internal = CancelSignal::new();
     if let Some(ext) = cancel {
@@ -205,6 +214,7 @@ pub async fn download(
             idx,
             streaming,
             cancel_rx: internal.subscribe(),
+            limiter: limiter.clone(),
             task_id,
             received: Arc::new(AtomicU64::new(0)),
         };
@@ -375,6 +385,7 @@ struct ChunkJob {
     idx: usize,
     streaming: bool,
     cancel_rx: watch::Receiver<bool>,
+    limiter: Option<Arc<RateLimiter>>,
     task_id: u64,
     received: Arc<AtomicU64>,
 }
@@ -462,6 +473,7 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
         idx,
         streaming,
         mut cancel_rx,
+        limiter,
         task_id,
         received: received_counter,
         target: _,
@@ -593,6 +605,16 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
             });
         }
         if len > 0 {
+            // 限速：读到一块数据之后、交给写入线程池之前领取配额。等待被延后后，
+            // TCP 接收窗口填满，服务器端随之放慢发送，从而真正限制网络流量。
+            // acquire 与取消信号并列，等待令牌时也能立刻响应取消。
+            if let Some(rl) = &limiter {
+                tokio::select! {
+                    biased;
+                    _ = wait_cancelled(&mut cancel_rx) => return Ok(ChunkExit::Cancelled),
+                    _ = rl.acquire(len) => {}
+                }
+            }
             // 写磁盘之前检查取消。
             if rx_cancelled(&cancel_rx) {
                 return Ok(ChunkExit::Cancelled);

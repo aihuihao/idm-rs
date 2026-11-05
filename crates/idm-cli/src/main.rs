@@ -271,6 +271,28 @@ mod dl {
     };
     use tokio::sync::watch;
 
+    /// 解析限速值：纯字节数，或带 `K`/`k`（1024）、`M`/`m`（1024*1024）后缀。
+    /// 格式非法、溢出或值为 0 时返回 `None`（调用方以退出码 2 报错）。
+    fn parse_max_speed(raw: &str) -> Option<u64> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let (digits, mult) = match s.as_bytes().last().copied()? {
+            b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
+            b'M' | b'm' => (&s[..s.len() - 1], 1024 * 1024),
+            _ => (s, 1u64),
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n = digits.parse::<u64>().ok()?;
+        if n == 0 {
+            return None;
+        }
+        n.checked_mul(mult)
+    }
+
     fn print_progress(snap: &ProgressSnapshot) {
         let total = snap.total_size.unwrap_or(0);
         let pct = if total > 0 {
@@ -295,6 +317,7 @@ mod dl {
         let mut connections: usize = 8;
         let mut out_name: Option<String> = None;
         let mut cancel_after: Option<u64> = None;
+        let mut max_speed: Option<u64> = None;
         // B5：`--strategy` 默认 Auto（卷支持稀疏文件则 Sparse，否则 SetLen）。
         let mut strategy = AllocationStrategy::Auto;
 
@@ -362,6 +385,23 @@ mod dl {
                         }
                     };
                 }
+                "--max-speed" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-speed");
+                        return 2;
+                    }
+                    match parse_max_speed(&args[i]) {
+                        Some(v) => max_speed = Some(v),
+                        None => {
+                            eprintln!(
+                                "invalid --max-speed: {} (expected e.g. 500K, 3M, or a plain byte count)",
+                                args[i]
+                            );
+                            return 2;
+                        }
+                    }
+                }
                 other if url.is_none() && !other.starts_with("--") => url = Some(other.to_string()),
                 other => {
                     eprintln!("unknown argument: {other}");
@@ -375,7 +415,7 @@ mod dl {
             Some(u) => u,
             None => {
                 eprintln!(
-                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto] [--cancel-after SECONDS]"
+                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto] [--cancel-after SECONDS] [--max-speed 500K|3M]"
                 );
                 return 2;
             }
@@ -460,6 +500,7 @@ mod dl {
             dir: dir.clone(),
             out_name,
             progress_tx: Some(progress_tx),
+            max_speed,
         };
 
         let pool = match DiskWriterPool::new(4, 16) {
@@ -531,6 +572,37 @@ mod dl {
             DownloadOutcome::Paused(reason) => {
                 eprintln!("download paused: {reason:?}; partial file retained");
                 1
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_max_speed;
+
+        #[test]
+        fn parses_plain_and_suffixed_speeds() {
+            assert_eq!(parse_max_speed("500K"), Some(500 * 1024));
+            assert_eq!(parse_max_speed("3M"), Some(3 * 1024 * 1024));
+            assert_eq!(parse_max_speed("1m"), Some(1024 * 1024));
+            assert_eq!(parse_max_speed("1048576"), Some(1048576));
+            assert_eq!(parse_max_speed("1572864"), Some(1572864));
+        }
+
+        #[test]
+        fn rejects_invalid_speeds() {
+            for bad in [
+                "",
+                "0",
+                "3G",
+                "-1",
+                "3.5M",
+                "M",
+                "1MB",
+                "abc",
+                "999999999999999999999M",
+            ] {
+                assert_eq!(parse_max_speed(bad), None, "should reject {bad:?}");
             }
         }
     }
