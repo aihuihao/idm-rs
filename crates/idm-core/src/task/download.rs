@@ -44,6 +44,10 @@ pub type SnapshotObserver = Arc<dyn Fn(&[(i64, u64)]) + Send + Sync>;
 pub struct CheckpointHooks {
     /// 置位时 `sync` 视为失败：本次检查点放弃，不写数据库。
     pub fail_sync: Arc<AtomicBool>,
+    /// 置位时 `sync` 返回磁盘满错误（Windows 错误码 112 `ERROR_DISK_FULL`）：
+    /// 错误经真实的系统错误分类转换成 `DiskFullDuringWrite`，用于验证"最后一次
+    /// 检查点磁盘满 → `Paused(DiskFull)`"这条退出路径。
+    pub fail_sync_disk_full: Arc<AtomicBool>,
     /// 取得快照 S 之后、`sync` 之前调用，用于验证写入数据库的值不超过 S。
     pub observe_snapshot: Option<SnapshotObserver>,
     /// 目标文件创建之后、分块任务启动之前调用。测试可在此触发外部取消，
@@ -125,6 +129,15 @@ pub(crate) async fn run_checkpoint(
         observe(&snapshot);
     }
 
+    // 测试钩子：让 sync 以系统错误码 112 失败（真实错误分类，而非直接构造）。
+    if ctx.hooks.fail_sync_disk_full.load(Ordering::SeqCst) {
+        return Err(crate::error::io_error(
+            "fsync",
+            target.path().to_path_buf(),
+            0,
+            std::io::Error::from_raw_os_error(112),
+        ));
+    }
     // 步骤 2：sync。失败 → 直接返回，绝不写数据库。
     if ctx.hooks.fail_sync.load(Ordering::SeqCst) {
         return Err(Error::Io {
@@ -528,8 +541,8 @@ async fn run_download(
             received: Arc::new(AtomicU64::new(0)),
             acked: acked[idx].1.clone(),
             max_retries: opts.config.max_retries,
-            backoff_base: opts.config.retry_backoff_base,
-            backoff_cap: opts.config.retry_backoff_cap,
+            backoff_base: opts.config.retry_base_delay,
+            backoff_cap: opts.config.retry_max_delay,
         };
         join_set.spawn(run_chunk(job));
         // 给外部取消一个插入点，使"分块全部启动之前取消"可被真实触发。

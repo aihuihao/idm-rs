@@ -276,6 +276,7 @@ async fn checkpoint_never_writes_more_than_acked_snapshot() -> TestResult {
     ctx.checkpoint_interval = Duration::from_millis(50);
     ctx.hooks = CheckpointHooks {
         fail_sync: Arc::new(AtomicBool::new(false)),
+        fail_sync_disk_full: Arc::new(AtomicBool::new(false)),
         observe_snapshot: Some(Arc::new(move |s| {
             sink.lock()
                 .unwrap_or_else(|e| e.into_inner())

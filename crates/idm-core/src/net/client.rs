@@ -24,12 +24,12 @@ pub struct DownloadConfig {
     /// 分块连续失败次数上限（Phase 1d）。单次尝试写入 ≥1 MiB 时清零计数。
     /// 0 表示不重试。另有每分块总尝试次数硬上限（`retry::MAX_TOTAL_ATTEMPTS`）。
     pub max_retries: u32,
-    /// 退避基准：第一次重试等待该时长，之后每次翻倍，封顶 `retry_backoff_cap`。
+    /// 退避基准：第一次重试等待该时长，之后每次翻倍，封顶 `retry_max_delay`。
     /// 默认 1 秒；测试可调小以加速。
-    pub retry_backoff_base: Duration,
+    pub retry_base_delay: Duration,
     /// 退避封顶。默认 30 秒；叠加随机抖动后仍会被钳制到该上限，因此单次等待
-    /// 永远不会超过 30 秒。
-    pub retry_backoff_cap: Duration,
+    /// 永远不会超过该值。
+    pub retry_max_delay: Duration,
 }
 
 impl Default for DownloadConfig {
@@ -42,8 +42,8 @@ impl Default for DownloadConfig {
             user_agent: "idm-rs/0.1.0".to_string(),
             max_redirects: 10,
             max_retries: 5,
-            retry_backoff_base: Duration::from_secs(1),
-            retry_backoff_cap: Duration::from_secs(30),
+            retry_base_delay: Duration::from_secs(1),
+            retry_max_delay: Duration::from_secs(30),
         }
     }
 }

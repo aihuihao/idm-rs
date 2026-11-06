@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -78,6 +78,14 @@ pub struct ServerConfig {
     /// 收到的每个请求的 `Range` 头都会被 push 到这里（Phase 1d 测试 2：
     /// 验证重试请求的起点等于断开前已写入的位置）。
     pub range_sink: Option<Arc<Mutex<Vec<String>>>>,
+    /// 非 Probe 请求计数（Phase 1d：验证"服务器一共收到 N 次请求"/
+    /// "该分块只收到 1 次请求"）。
+    pub request_counter: Option<Arc<AtomicU64>>,
+    /// 非 Probe 请求的到达时间（Phase 1d 测试 4：测量两次请求之间的间隔）。
+    pub request_times: Option<Arc<Mutex<Vec<Instant>>>>,
+    /// 只对非 Probe 响应发送 `content_encoding`（Phase 1d 测试 7：让 gzip 在
+    /// 下载阶段而非 Probe 阶段被拒绝，从而统计该分块的请求次数）。
+    pub chunk_only_encoding: bool,
     /// 每发送一块数据后的延迟（慢速但持续发送，用于验证空闲超时不会误杀）。
     pub chunk_delay: Option<Duration>,
     /// 写到该绝对字节位置后，静默停顿 `freeze_duration` 再关闭连接（用于触发读取空闲超时）。
@@ -111,6 +119,9 @@ impl Default for ServerConfig {
             error_responses: None,
             error_switch: None,
             range_sink: None,
+            request_counter: None,
+            request_times: None,
+            chunk_only_encoding: false,
             chunk_delay: None,
             freeze_after: None,
             freeze_duration: None,
@@ -265,6 +276,17 @@ async fn handle_conn(
             .unwrap_or_else(|e| e.into_inner())
             .push(range_header.clone().unwrap_or_default());
     }
+    // Phase 1d：统计非 Probe 请求次数与到达时间（重试次数、Retry-After 间隔）。
+    if !is_probe {
+        if let Some(c) = &cfg.request_counter {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(t) = &cfg.request_times {
+            t.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Instant::now());
+        }
+    }
     // Phase 1d 错误状态模式：只作用于非 Probe 响应。
     let should_error = if is_probe {
         false
@@ -374,7 +396,11 @@ async fn handle_conn(
         head.push_str(&format!("Content-Disposition: {cd}\r\n"));
     }
     if let Some(ce) = &cfg.content_encoding {
-        head.push_str(&format!("Content-Encoding: {ce}\r\n"));
+        // `chunk_only_encoding`：Probe 响应保持干净，只在分块响应里声明编码，
+        // 用于在下载阶段触发不可重试的 UnsupportedContentEncoding。
+        if !cfg.chunk_only_encoding || !is_probe {
+            head.push_str(&format!("Content-Encoding: {ce}\r\n"));
+        }
     }
     if cfg.etag.is_some() || changed {
         head.push_str(&format!("ETag: {current_etag}\r\n"));
