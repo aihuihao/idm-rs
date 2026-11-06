@@ -1,7 +1,8 @@
 //! Phase 2：动态切分与工作窃取（全部使用本地测试服务器，不访问外网）。
 //!
-//! 单元测试（切分点计算、10.2 写入截断、10.3 第 4 步竞争）在
-//! `src/task/split.rs` 的 `tests` 模块里；本文件覆盖第 4 ~ 10 项集成测试。
+//! 单元测试（切分点计算、10.2 写入截断、10.3 第 4 步竞争，以及 Phase 2.1 的
+//! 速度窗口 / 被切分分块选择）在 `src/task/split.rs` 的 `tests` 模块里；
+//! 本文件覆盖 Phase 2 第 4 ~ 10 项与 Phase 2.1 的集成测试。
 
 #![cfg(windows)]
 
@@ -15,17 +16,17 @@ mod verify;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use idm_core::disk::{AllocationStrategy, DiskWriterPool};
 use idm_core::net::client::DownloadConfig;
-use idm_core::store::{NewTask, PauseReasonDb, Store, TaskStateDb};
+use idm_core::store::{ChunkRow, NewTask, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
 use idm_core::task::{
     CancelSignal, DownloadContext, DownloadOptions, DownloadOutcome, ProgressSnapshot,
     download_with_store, resume,
 };
-use support::{ServerConfig, TestServer, start};
+use support::{ServerConfig, StallConfig, TestServer, start};
 use tempfile::{TempDir, tempdir};
 use verify::verify_file;
 
@@ -578,6 +579,183 @@ async fn server_side_concurrency_never_exceeds_connections() -> TestResult {
     assert!(
         snap.split_count + snap.chunks.len() as u64 >= connections as u64,
         "切分不得减少有效连接数"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.1 第一部分：续传时编号最大的分块（切分产生）已经完成
+// ---------------------------------------------------------------------------
+
+/// 直接构造一个已暂停的任务：编号 2 是切分产物且已下完（committed == end），
+/// 编号 0、1 未完成。续传时 `inits` 的最大编号只有 1，新分块若按 1+1=2 分配
+/// 会与已完成的分块 2 主键冲突。修复后必须从**全部**记录的最大值 2 起算 3。
+#[tokio::test]
+async fn resume_when_largest_split_chunk_already_completed() -> TestResult {
+    let size = 16 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        // 第 0 号分块慢、第 1 号分块全速：第 1 号先完成 → 空闲连接触发切分。
+        speed: Some(speed::slow_in_prefix(4 * MIB, 2 * MIB)),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempdir()?;
+    let dir = tmp.path();
+    let url = srv.url("/file.bin");
+    let store = Store::open(dir.join("idm.db"))?;
+    let id = store.create_task(new_task(&url, dir, 2)).await?;
+    let part = dir.join("resume.bin.idm-part");
+    store
+        .update_probe(
+            id,
+            ProbeInfo {
+                final_url: url.clone(),
+                file_name: "resume.bin".to_string(),
+                part_path: part.to_string_lossy().into_owned(),
+                total_size: Some(size),
+                supports_range: true,
+                etag: None,
+                etag_weak: false,
+                last_modified: None,
+                resumable: true,
+            },
+        )
+        .await?;
+    store
+        .save_chunks(
+            id,
+            vec![
+                ChunkRow {
+                    chunk_index: 0,
+                    start: 0,
+                    end: 4 * MIB,
+                    committed: MIB,
+                    parent: None,
+                },
+                ChunkRow {
+                    chunk_index: 1,
+                    start: 8 * MIB,
+                    end: 16 * MIB,
+                    committed: 8 * MIB,
+                    parent: None,
+                },
+                // 编号最大、由切分产生、且已经完成。
+                ChunkRow {
+                    chunk_index: 2,
+                    start: 4 * MIB,
+                    end: 8 * MIB,
+                    committed: 8 * MIB,
+                    parent: Some(0),
+                },
+            ],
+        )
+        .await?;
+    store
+        .update_state(id, TaskStateDb::Paused, Some(PauseReasonDb::User), None)
+        .await?;
+
+    // .idm-part：已提交区间 [0,1 MiB) 与 [4 MiB,8 MiB) 必须逐字节正确，
+    // 其余区间由续传重新下载。
+    let mut data = vec![0u8; size as usize];
+    for (a, b) in [(0u64, MIB), (4 * MIB, 8 * MIB)] {
+        for off in a..b {
+            data[off as usize] = support::byte_at(off);
+        }
+    }
+    std::fs::write(&part, &data)?;
+
+    let pool = Arc::new(DiskWriterPool::new(4, 16)?);
+    let opts = options(
+        dir,
+        "resume.bin",
+        DownloadConfig {
+            connections: 2,
+            ..DownloadConfig::default()
+        },
+        None,
+    );
+    let (outcome, rx) = resume(id, Arc::clone(&store), Arc::clone(&pool), &opts, None).await?;
+    srv.shutdown();
+    assert_eq!(outcome, DownloadOutcome::Completed);
+
+    let snap = rx.borrow().clone();
+    assert!(
+        snap.split_count >= 1,
+        "续传后必须至少再切分一次，实际 {} 次",
+        snap.split_count
+    );
+    let rec = store.get_task(id).await?;
+    assert_eq!(rec.state, TaskStateDb::Completed);
+    let indices: Vec<i64> = rec.chunks.iter().map(|c| c.chunk_index).collect();
+    let mut unique = indices.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), indices.len(), "分块编号必须唯一: {indices:?}");
+    assert!(
+        indices.iter().any(|i| *i >= 3),
+        "新分块编号必须接在全部已有编号（含已完成的 2）之后: {indices:?}"
+    );
+    assert_chunks_partition(&store, id, size).await?;
+    verify_file(&dir.join("resume.bin"), size)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.1 第三部分集成测试：第 0 号分块完全停住
+// ---------------------------------------------------------------------------
+
+/// 服务器让第 0 号分块写出 256 KiB 后完全停住（保持连接、不发送、不关闭；
+/// 最长 6 s < 默认 30 s read_timeout，因此不会触发重试），其余分块正常。
+///
+/// 切分产生的新分块请求落在第 0 号分块内部，服务器据此提前放行被停住的连接；
+/// 开启切分时下载远早于 6 s 完成，`--no-split` 则必须等满 6 s。
+#[tokio::test]
+async fn stalled_first_chunk_is_split_and_beats_no_split() -> TestResult {
+    let size = 8 * MIB;
+    let stall_max = Duration::from_secs(6);
+    let cfg = || ServerConfig {
+        size,
+        stall: Some(StallConfig {
+            after_bytes: 256 * KIB,
+            scope_end: 4 * MIB,
+            max: stall_max,
+            release: Arc::new(AtomicBool::new(false)),
+        }),
+        ..ServerConfig::default()
+    };
+
+    let split = run_download(cfg(), 2, true, "stall-split.bin").await?;
+    assert!(split.snap.split_count >= 1, "第 0 号分块停住时必须发生切分");
+    let victim = split
+        .snap
+        .chunks
+        .iter()
+        .find(|c| c.db_index == 0)
+        .ok_or("missing chunk 0")?;
+    assert!(
+        victim.end < 4 * MIB,
+        "停住的第 0 号分块区间应被缩小: end={}",
+        victim.end
+    );
+
+    let no_split = run_download(cfg(), 2, false, "stall-nosplit.bin").await?;
+    assert_eq!(no_split.snap.split_count, 0, "--no-split 时不得切分");
+
+    assert!(
+        split.elapsed < stall_max / 2,
+        "开启切分时应在停住时长 {stall_max:?} 的一半内完成，实际 {:?}",
+        split.elapsed
+    );
+    assert!(
+        split.elapsed.as_secs_f64() * 2.0 < no_split.elapsed.as_secs_f64(),
+        "切分应显著缩短耗时: split={:?} no_split={:?}",
+        split.elapsed,
+        no_split.elapsed
+    );
+    println!(
+        "split={:?} ({} 次切分) no_split={:?} stall_max={:?}",
+        split.elapsed, split.snap.split_count, no_split.elapsed, stall_max
     );
     Ok(())
 }

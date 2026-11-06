@@ -46,6 +46,24 @@ impl std::fmt::Debug for SpeedPolicy {
     }
 }
 
+/// Phase 2.1：让起点为 0 的响应"完全停住"（保持连接、不发送、不关闭）。
+///
+/// 停到 `release` 被置位或达到 `max` 为止；`max` 必须小于客户端的 `read_timeout`，
+/// 所以不会触发重试。任何 `0 < start < scope_end` 的非 Probe 请求会置位 `release`：
+/// 切分产生的新分块请求正好落在第 0 号分块内部，于是切分能提前解除停住，
+/// 而没有切分时连接会停满 `max`。
+#[derive(Debug, Clone)]
+pub struct StallConfig {
+    /// 相对响应起点发送这么多字节之后停住。
+    pub after_bytes: u64,
+    /// 放行信号的有效区间上界（一般是第 0 号分块的 end）。
+    pub scope_end: u64,
+    /// 最长停住时长（必须小于客户端 `read_timeout`）。
+    pub max: Duration,
+    /// 放行信号。
+    pub release: Arc<AtomicBool>,
+}
+
 /// 服务器配置；所有字段都在请求处理中被读取。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -113,6 +131,8 @@ pub struct ServerConfig {
     pub probe_delay: Option<Duration>,
     /// 非 Probe 响应的速度策略（Phase 2）。
     pub speed: Option<SpeedPolicy>,
+    /// 起点为 0 的响应在写出一部分数据后完全停住（Phase 2.1）。
+    pub stall: Option<StallConfig>,
     /// 服务器端"当前正在发送正文的响应数"（Phase 2：验证最大并发连接数）。
     pub active: Option<Arc<AtomicU64>>,
     /// 服务器端并发峰值。
@@ -149,6 +169,7 @@ impl Default for ServerConfig {
             last_modified: None,
             probe_delay: None,
             speed: None,
+            stall: None,
             active: None,
             max_active: None,
         }
@@ -436,6 +457,16 @@ async fn handle_conn(
     head.push_str("Connection: close\r\n\r\n");
     sock.write_all(head.as_bytes()).await?;
 
+    // Phase 2.1：切分产生的新请求（起点落在第 0 号分块内部）放行被停住的连接。
+    // 初始的其它分块起点等于 scope_end，不会放行；--no-split 时也没有这种请求。
+    if !is_probe
+        && let Some(st) = &cfg.stall
+        && start > 0
+        && start < st.scope_end
+    {
+        st.release.store(true, Ordering::SeqCst);
+    }
+
     // Phase 2：统计服务器端同时在发送正文的响应数（最大并发请求数）。
     let _concurrency = ActiveGuard::enter(&cfg, !is_probe);
     // Phase 2：本次响应的限速（字节/秒）。
@@ -448,7 +479,22 @@ async fn handle_conn(
     // 提前断开模式：Content-Length 仍声明完整长度，但写到 break_at 后直接关闭
     // 连接，让客户端观察到响应体被截断。
     let mut written = 0u64;
+    let mut stalled = false;
     while written < length {
+        // Phase 2.1 第三部分集成测试：起点为 0 的响应写出 after_bytes 之后完全停住，
+        // 既不继续发数据，也不关闭连接；直到放行信号置位或达到 max（< read_timeout）。
+        if let Some(st) = &cfg.stall
+            && !is_probe
+            && start == 0
+            && !stalled
+            && written >= st.after_bytes
+        {
+            stalled = true;
+            let deadline = Instant::now() + st.max;
+            while !st.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
         let n = ((length - written) as usize).min(BLOCK);
         let mut buf = vec![0u8; n];
         fill_block(&mut buf, start + written);

@@ -44,6 +44,10 @@ struct SharedInner {
     reserved: u64,
     /// 当前区间终点，可被切分缩小。
     end: u64,
+    /// 分块启动时刻（Phase 2.1：区分"刚创建"与"已卡住超过一个速度窗口"）。
+    started: Instant,
+    /// 是否已经写入过任何数据。
+    has_data: bool,
     /// 速度采样：(采样时间, 当时的 acked 位置)。
     samples: VecDeque<(Instant, u64)>,
 }
@@ -52,7 +56,8 @@ impl ChunkShared {
     pub(super) fn new(start: u64, end: u64, db_index: i64) -> Self {
         let acked = Arc::new(AtomicU64::new(start));
         let mut samples = VecDeque::with_capacity(8);
-        samples.push_back((Instant::now(), start));
+        let now = Instant::now();
+        samples.push_back((now, start));
         ChunkShared {
             start,
             db_index,
@@ -60,6 +65,8 @@ impl ChunkShared {
             inner: StdMutex::new(SharedInner {
                 reserved: start,
                 end,
+                started: now,
+                has_data: false,
                 samples,
             }),
         }
@@ -103,24 +110,48 @@ impl ChunkShared {
     pub(super) fn record(&self, pos: u64) {
         let now = Instant::now();
         let mut g = self.lock();
+        if pos > self.start {
+            g.has_data = true;
+        }
         g.samples.push_back((now, pos));
         prune_samples(&mut g.samples, now);
     }
 
-    /// 最近 [`SPEED_WINDOW`] 内的平均速度（字节/秒）；样本不足时返回 0。
+    /// 最近 [`SPEED_WINDOW`] 内的平均速度（字节/秒）。
+    ///
+    /// Phase 2.1 第二部分：分母是**当前时间**与窗口起点的时间差，而不是
+    /// "最后一个采样与第一个采样的时间差"。连接卡住后不再有采样，分母会持续
+    /// 变大，速度随之下降；最近 [`SPEED_WINDOW`] 内没有任何新采样时直接返回 0，
+    /// 这样"卡住/退避重试"才能被识别为速度为 0。
     fn recent_speed(&self) -> f64 {
-        let now = Instant::now();
+        self.recent_speed_at(Instant::now())
+    }
+
+    fn recent_speed_at(&self, now: Instant) -> f64 {
         let mut g = self.lock();
         prune_samples(&mut g.samples, now);
-        let (Some(&(t0, p0)), Some(&(t1, p1))) = (g.samples.front(), g.samples.back()) else {
+        let Some(&(t_last, p_last)) = g.samples.back() else {
             return 0.0;
         };
-        let dt = t1.saturating_duration_since(t0).as_secs_f64();
+        // 窗口内没有任何新采样 → 速度为 0。
+        if now.saturating_duration_since(t_last) > SPEED_WINDOW {
+            return 0.0;
+        }
+        let Some(&(t0, p0)) = g.samples.front() else {
+            return 0.0;
+        };
+        let dt = now.saturating_duration_since(t0).as_secs_f64();
         if dt <= 0.0 {
             0.0
         } else {
-            p1.saturating_sub(p0) as f64 / dt
+            p_last.saturating_sub(p0) as f64 / dt
         }
+    }
+
+    /// Phase 2.1 第三部分第 2 条：启动不满一个速度窗口，且还没有写入任何数据。
+    fn is_fresh(&self, now: Instant) -> bool {
+        let g = self.lock();
+        !g.has_data && now.saturating_duration_since(g.started) < SPEED_WINDOW
     }
 
     /// 剩余未落盘字节数。
@@ -187,25 +218,60 @@ impl ChunkSlot {
     }
 }
 
-/// 10.3 第 1 步：在所有正在下载的分块中，选预计剩余时间（剩余字节 / 最近速度）
-/// 最长的；速度为 0（例如正在退避重试）的视为无穷大，优先选中。
+/// 10.3 第 1 步：在**能切分成功**的分块中，选预计剩余时间（剩余字节 / 最近速度）
+/// 最长的；速度为 0（卡住或正在退避重试）的视为无穷大，优先选中。
 ///
-/// 返回 `(下标, 预计剩余秒数, 最近速度)`。
-fn select_victim(slots: &[ChunkSlot]) -> Option<(usize, f64, f64)> {
+/// Phase 2.1 第三部分：
+/// 1. 先按 [`compute_split_point`] 过滤，不能切分（剩余太少）的分块不参与比较，
+///    这样它不会导致本次切分整体被放弃；
+/// 2. 刚创建（启动不满一个速度窗口且还没写入任何数据）的分块不按速度 0 处理，
+///    改用本任务所有"正在下载且有速度数据"分块的平均速度估算；一个这样的分块
+///    都没有时按无穷大处理；
+/// 3. 启动超过一个速度窗口、窗口内又没有数据的分块（卡住/退避重试）速度为 0，
+///    预计剩余时间为无穷大，优先被切分。
+///
+/// 返回 `(下标, 预计剩余秒数, 用于估算的速度)`。
+fn select_victim(shared: &[Arc<ChunkShared>], min_split: u64) -> Option<(usize, f64, f64)> {
+    let now = Instant::now();
+    // 每个分块只取一次状态快照：(剩余字节, 最近速度, 能否切分, 是否刚创建)。
+    let states: Vec<(u64, f64, bool, bool)> = shared
+        .iter()
+        .map(|s| {
+            let (reserved, end) = s.reserved_end();
+            (
+                s.remaining(),
+                s.recent_speed(),
+                compute_split_point(reserved, end, min_split).is_some(),
+                s.is_fresh(now),
+            )
+        })
+        .collect();
+    // 平均速度只统计"正在下载且有速度数据"的分块；一个都没有时按无穷大处理。
+    let (sum, count) = states
+        .iter()
+        .filter(|(remaining, speed, _, _)| *remaining > 0 && *speed > 0.0)
+        .fold((0.0f64, 0usize), |(s, n), (_, v, _, _)| (s + *v, n + 1));
+    let avg_speed = if count == 0 { 0.0 } else { sum / count as f64 };
+
     let mut best: Option<(usize, f64, f64)> = None;
-    for (i, slot) in slots.iter().enumerate() {
-        let remaining = slot.shared.remaining();
-        if remaining == 0 {
+    for (i, (remaining, speed, splittable, fresh)) in states.iter().enumerate() {
+        if !*splittable || *remaining == 0 {
             continue;
         }
-        let speed = slot.shared.recent_speed();
-        let eta = if speed <= 0.0 {
-            f64::INFINITY
+        let effective_speed = if *speed > 0.0 {
+            *speed
+        } else if *fresh {
+            avg_speed
         } else {
-            remaining as f64 / speed
+            0.0
+        };
+        let eta = if effective_speed > 0.0 {
+            *remaining as f64 / effective_speed
+        } else {
+            f64::INFINITY
         };
         if best.is_none_or(|(_, best_eta, _)| eta > best_eta) {
-            best = Some((i, eta, speed));
+            best = Some((i, eta, effective_speed));
         }
     }
     best
@@ -224,8 +290,10 @@ pub(super) async fn try_split(
     min_split: u64,
     join_set: &mut JoinSet<Result<ChunkResult>>,
 ) -> Result<bool> {
-    // 第 1 步：选择被切分分块。
-    let Some((victim_i, eta, speed)) = select_victim(slots) else {
+    // 第 1 步：选择被切分分块。只把共享状态交给选择器，写器句柄仍留在 slots 中
+    // 供第 6 步 shrink_end 使用；这也让选择器可以直接用构造好的 ChunkShared 做单测。
+    let shared: Vec<Arc<ChunkShared>> = slots.iter().map(|s| Arc::clone(&s.shared)).collect();
+    let Some((victim_i, eta, speed)) = select_victim(&shared, min_split) else {
         return Ok(false);
     };
 
@@ -305,9 +373,53 @@ pub(super) async fn try_split(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     type T = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    /// 直接构造分块的共享状态，便于单元测试"卡住 / 刚创建 / 正常"三种情形。
+    /// `samples` 的元素是 (距现在的时长, 绝对位置)，由本函数换算成绝对时刻。
+    fn set_state(
+        s: &ChunkShared,
+        reserved: u64,
+        acked: u64,
+        started_age: Duration,
+        has_data: bool,
+        samples: &[(Duration, u64)],
+    ) {
+        s.acked.store(acked, Ordering::Release);
+        let now = Instant::now();
+        let mut g = s.lock();
+        g.reserved = reserved;
+        g.started = now - started_age;
+        g.has_data = has_data;
+        g.samples = samples
+            .iter()
+            .map(|(age, pos)| (now - *age, *pos))
+            .collect();
+    }
+
+    fn chunk(start: u64, end: u64, idx: i64) -> Arc<ChunkShared> {
+        Arc::new(ChunkShared::new(start, end, idx))
+    }
+
+    /// 已经卡住超过一个速度窗口、速度为 0 的采样。
+    fn stuck_samples(start: u64) -> Vec<(Duration, u64)> {
+        vec![
+            (Duration::from_secs(6), start),
+            (Duration::from_secs(5), start + 64 * KIB),
+        ]
+    }
+
+    /// 最近 1 秒写入 `progress` 字节的正常分块采样。
+    fn moving_samples(start: u64, progress: u64) -> Vec<(Duration, u64)> {
+        vec![
+            (Duration::from_secs(1), start),
+            (Duration::ZERO, start + progress),
+        ]
+    }
 
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * 1024;
@@ -417,6 +529,128 @@ mod tests {
         if let Some(next) = compute_split_point(reserved_after, end_after, MIB) {
             assert!(next > reserved_after);
         }
+        Ok(())
+    }
+
+    /// Phase 2.1 第二部分：采样若干次后停止采样，等待超过窗口长度，速度必须为 0。
+    #[test]
+    fn recent_speed_drops_to_zero_when_stalled() -> T {
+        let s = ChunkShared::new(0, 16 * MIB, 0);
+        for i in 1..=5u64 {
+            s.record(i * 64 * KIB);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(s.recent_speed() > 0.0, "采样期间速度必须大于 0");
+
+        // 停止采样，等待超过一个速度窗口：窗口内没有任何新采样。
+        std::thread::sleep(SPEED_WINDOW + Duration::from_millis(200));
+        assert_eq!(
+            s.recent_speed(),
+            0.0,
+            "卡住超过一个窗口后速度必须降为 0，不能停留在卡住前的值"
+        );
+
+        // 恢复采样后速度重新为正（窗口按当前时间重新起算）。
+        s.record(6 * 64 * KIB);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(s.recent_speed() > 0.0, "恢复写入后速度应重新为正");
+        Ok(())
+    }
+
+    /// Phase 2.1 第三部分第 1 条：先过滤再比较。剩余太小（不能切分）、速度为 0
+    /// 的分块不能让本次切分整体放弃，也不能被选中。
+    #[test]
+    fn victim_selection_skips_unsplittable_chunks() -> T {
+        let small = chunk(0, MIB, 0);
+        set_state(
+            &small,
+            64 * KIB,
+            64 * KIB,
+            Duration::from_secs(6),
+            true,
+            &stuck_samples(0),
+        );
+        assert_eq!(small.recent_speed(), 0.0);
+        assert_eq!(compute_split_point(0, MIB, MIB), None);
+
+        let slow = chunk(MIB, 9 * MIB, 1);
+        set_state(
+            &slow,
+            MIB + 64 * KIB,
+            MIB + 64 * KIB,
+            Duration::from_secs(1),
+            true,
+            &moving_samples(MIB, 64 * KIB),
+        );
+
+        let (idx, eta, _) = select_victim(&[Arc::clone(&small), Arc::clone(&slow)], MIB)
+            .ok_or("应选中可切分、剩余时间长的慢分块")?;
+        assert_eq!(idx, 1, "不可切分的分块不能因为 ETA 无穷大而抢占切分");
+        assert!(eta.is_finite(), "慢分块应有有限的预计剩余时间");
+        Ok(())
+    }
+
+    /// Phase 2.1 第三部分第 2 条：刚创建、没有数据的分块用全体平均速度估算，
+    /// 不能按速度 0（无穷大）被优先切分。
+    #[test]
+    fn victim_selection_estimates_fresh_chunk_with_average_speed() -> T {
+        let fresh = chunk(0, 8 * MIB, 0);
+        assert_eq!(fresh.recent_speed(), 0.0);
+
+        let normal = chunk(8 * MIB, 40 * MIB, 1);
+        set_state(
+            &normal,
+            9 * MIB,
+            9 * MIB,
+            Duration::from_secs(1),
+            true,
+            &moving_samples(8 * MIB, MIB),
+        );
+
+        let (idx, _, _) = select_victim(&[Arc::clone(&fresh), Arc::clone(&normal)], MIB)
+            .ok_or("应选中预计剩余时间更长的正常分块")?;
+        assert_eq!(
+            idx, 1,
+            "刚创建的 8 MiB 分块按 1 MiB/s 估算为 8 秒，短于 31 秒"
+        );
+        Ok(())
+    }
+
+    /// Phase 2.1 第三部分第 3 条：启动超过 4 秒且窗口内没有数据的分块
+    /// 速度为 0、ETA 无穷大，优先于几个正常分块被切分。
+    #[test]
+    fn victim_selection_prefers_stuck_chunk() -> T {
+        let stuck = chunk(0, 8 * MIB, 0);
+        set_state(
+            &stuck,
+            64 * KIB,
+            64 * KIB,
+            Duration::from_secs(6),
+            true,
+            &stuck_samples(0),
+        );
+        assert_eq!(stuck.recent_speed(), 0.0);
+        assert!(!stuck.is_fresh(Instant::now()), "启动已超过一个窗口");
+
+        let mut chunks = vec![stuck];
+        for i in 1..=3i64 {
+            let start = i as u64 * 8 * MIB;
+            let c = chunk(start, start + 8 * MIB, i);
+            set_state(
+                &c,
+                start + MIB,
+                start + MIB,
+                Duration::from_secs(1),
+                true,
+                &moving_samples(start, MIB),
+            );
+            chunks.push(c);
+        }
+
+        let (idx, eta, speed) = select_victim(&chunks, MIB).ok_or("应选中卡住的分块")?;
+        assert_eq!(idx, 0);
+        assert!(eta.is_infinite());
+        assert_eq!(speed, 0.0);
         Ok(())
     }
 }

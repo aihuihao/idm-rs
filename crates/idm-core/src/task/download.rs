@@ -299,6 +299,13 @@ async fn run_download(
 
     let cancelled_now = || cancel.is_some_and(|c| c.is_cancelled());
 
+    // Phase 2.1 第一部分：续传时新分块编号必须避开数据库里**所有**已有编号。
+    // 编号最大的分块可能已经下载完（被 `committed < end` 过滤掉），只看 inits 会让
+    // 切分事务插入重复主键。`plan.chunks` 由 resume() 从全部分块记录构造。
+    let resume_max_chunk_index = ctx
+        .and_then(|c| c.resume.as_ref())
+        .and_then(|p| p.chunks.iter().map(|c| c.index).max());
+
     // 元组：(client, probe_result, final_path, tmp_path, target, inits,
     //       total_for_progress, streaming)
     // 续传时 Probe 比较已由 resume() 完成，直接复用既有 .idm-part；
@@ -562,7 +569,10 @@ async fn run_download(
 
     let mut join_set: JoinSet<Result<ChunkResult>> = JoinSet::new();
     let mut slots: Vec<ChunkSlot> = Vec::with_capacity(inits.len());
-    let mut next_db_index: i64 = inits.iter().map(|c| c.db_index).max().map_or(0, |m| m + 1);
+    // 续传用数据库全部分块记录的最大编号；新建下载用初始分块的最大编号。
+    let mut next_db_index: i64 = resume_max_chunk_index
+        .or_else(|| inits.iter().map(|c| c.db_index).max())
+        .map_or(0, |m| m + 1);
     let mut aborted_before_all_spawned = false;
     for (idx, init) in inits.iter().enumerate() {
         // 取消检查点 3：分块任务全部启动之前。
@@ -572,7 +582,16 @@ async fn run_download(
         }
         let shared = Arc::new(ChunkShared::new(init.start, init.end, init.db_index));
         // 写器在主流程分配并注册，主流程借此保留句柄做切分（10.3 第 6 步）。
-        let pc = spawner.open(&shared).await?;
+        // 分配失败时不能让 JoinSet 直接 drop 掉已经启动的分块任务：先触发内部
+        // 取消信号，再走与主循环相同的协作式排空，最后才返回错误。
+        let pc = match spawner.open(&shared).await {
+            Ok(pc) => pc,
+            Err(e) => {
+                internal.cancel();
+                cooperative_drain(&mut join_set).await;
+                return Err(e);
+            }
+        };
         acked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -653,19 +672,7 @@ async fn run_download(
 
     // 协作式排空：等待剩余分块自行退出（它们会走到 pool.release 释放写器），最多 5 秒；
     // 超时（例如某分块卡死）才 abort_all 强制结束。
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !join_set.is_empty() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, join_set.join_next()).await {
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => {
-                join_set.abort_all();
-                drain(&mut join_set).await;
-                break;
-            }
-        }
-    }
+    cooperative_drain(&mut join_set).await;
 
     Ok(match outcome {
         Some(Ok(DownloadOutcome::Cancelled)) => ExitKind::Cancelled,
@@ -1447,6 +1454,27 @@ async fn drain(set: &mut JoinSet<Result<ChunkResult>>) {
     while set.join_next().await.is_some() {}
 }
 
+/// 协作式排空：调用方先触发内部取消信号，本函数再等待剩余分块任务自行退出
+/// （它们会走到 `pool.release` 释放写器），最多 5 秒；超时才 `abort_all`。
+///
+/// 主循环结束与"初始分块启动循环中 `spawner.open` 失败"这两条错误路径共用它，
+/// 后者不能让已经启动的任务随着 `JoinSet` 被 drop 而强行中止。
+async fn cooperative_drain(set: &mut JoinSet<Result<ChunkResult>>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !set.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, set.join_next()).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => {
+                set.abort_all();
+                drain(set).await;
+                break;
+            }
+        }
+    }
+}
+
 /// 同步读取某个分块接收端的取消状态（`watch` 保存状态，不会漏掉）。
 fn rx_cancelled(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow()
@@ -1471,4 +1499,26 @@ fn part_path(final_path: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     final_path.with_file_name(format!("{name}.idm-part"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 2.1 第四部分：协作式排空必须等待已启动的分块任务**自行退出**，
+    /// 而不是让它们随着 `JoinSet` 被 drop 而强行中止。
+    #[tokio::test]
+    async fn cooperative_drain_waits_for_started_tasks() {
+        let mut set: JoinSet<Result<ChunkResult>> = JoinSet::new();
+        let exited = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&exited);
+        set.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(ChunkResult::Completed)
+        });
+        cooperative_drain(&mut set).await;
+        assert!(exited.load(Ordering::SeqCst), "任务必须有机会正常退出");
+        assert!(set.is_empty(), "排空之后 JoinSet 必须为空");
+    }
 }
