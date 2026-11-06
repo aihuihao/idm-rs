@@ -46,22 +46,21 @@ impl std::fmt::Debug for SpeedPolicy {
     }
 }
 
-/// Phase 2.1：让起点为 0 的响应"完全停住"（保持连接、不发送、不关闭）。
+/// Phase 2.2：让起点为 0 的响应"完全停住"（保持连接、不发送、不关闭）。
 ///
-/// 停到 `release` 被置位或达到 `max` 为止；`max` 必须小于客户端的 `read_timeout`，
-/// 所以不会触发重试。任何 `0 < start < scope_end` 的非 Probe 请求会置位 `release`：
-/// 切分产生的新分块请求正好落在第 0 号分块内部，于是切分能提前解除停住，
-/// 而没有切分时连接会停满 `max`。
+/// 真实服务器不会像 2.1 那样在新请求到达时放开连接：停住期间除了**读**对端是否
+/// 关闭，什么都不做；只有停满 `duration`（小于客户端 `read_timeout`）才继续发送
+/// 剩余数据。客户端若因接管而提前关闭连接，服务器把这次关闭记录下来。
 #[derive(Debug, Clone)]
 pub struct StallConfig {
     /// 相对响应起点发送这么多字节之后停住。
     pub after_bytes: u64,
-    /// 放行信号的有效区间上界（一般是第 0 号分块的 end）。
-    pub scope_end: u64,
-    /// 最长停住时长（必须小于客户端 `read_timeout`）。
-    pub max: Duration,
-    /// 放行信号。
-    pub release: Arc<AtomicBool>,
+    /// 停住时长（必须小于客户端 `read_timeout`，例如 20s < 30s）。
+    pub duration: Duration,
+    /// 服务器是否观察到客户端在停住期满之前就关闭了这条连接。
+    pub closed_early: Arc<AtomicBool>,
+    /// 从开始停住到检测到关闭的毫秒数；未提前关闭时保持 `u64::MAX`。
+    pub close_after_ms: Arc<AtomicU64>,
 }
 
 /// 服务器配置；所有字段都在请求处理中被读取。
@@ -85,6 +84,9 @@ pub struct ServerConfig {
     pub redirect: bool,
     /// 写到该绝对字节位置后断开连接。
     pub break_at: Option<u64>,
+    /// 只对"起点 == 前者"的那个请求，在写到后者的绝对位置后断开（Phase 2.2
+    /// 退避期间被接管测试：只让第 0 号分块断一次，不受请求到达顺序影响）。
+    pub break_at_start: Option<(u64, u64)>,
     /// 只对前 N 个非 Probe 响应生效（配合 `break_at` / `break_after_bytes`）；`None`
     /// 表示所有响应。用于"真实中途断开 → resume"测试：第一次下载断开，之后的
     /// 续传不再断开。
@@ -111,6 +113,8 @@ pub struct ServerConfig {
     /// 收到的每个请求的 `Range` 头都会被 push 到这里（Phase 1d 测试 2：
     /// 验证重试请求的起点等于断开前已写入的位置）。
     pub range_sink: Option<Arc<Mutex<Vec<String>>>>,
+    /// 只记录**非 Probe** 请求的 Range 头（Phase 2.2：断言没有起点等于终点的请求）。
+    pub chunk_range_sink: Option<Arc<Mutex<Vec<String>>>>,
     /// 非 Probe 请求计数（Phase 1d：验证"服务器一共收到 N 次请求"/
     /// "该分块只收到 1 次请求"）。
     pub request_counter: Option<Arc<AtomicU64>>,
@@ -131,7 +135,10 @@ pub struct ServerConfig {
     pub probe_delay: Option<Duration>,
     /// 非 Probe 响应的速度策略（Phase 2）。
     pub speed: Option<SpeedPolicy>,
-    /// 起点为 0 的响应在写出一部分数据后完全停住（Phase 2.1）。
+    /// 响应体每块的大小；`None` 用默认 64 KiB。Phase 2.2 的 10 KiB/s 极慢分块
+    /// 需要更小的块，才能形成"持续有数据但很慢"而不是"发一块就静默 6 秒"。
+    pub block: Option<usize>,
+    /// 起点为 0 的响应在写出一部分数据后完全停住（Phase 2.2）。
     pub stall: Option<StallConfig>,
     /// 服务器端"当前正在发送正文的响应数"（Phase 2：验证最大并发连接数）。
     pub active: Option<Arc<AtomicU64>>,
@@ -151,6 +158,7 @@ impl Default for ServerConfig {
             change_etag_after: None,
             redirect: false,
             break_at: None,
+            break_at_start: None,
             break_responses: None,
             break_after_bytes: None,
             freeze_after_bytes: None,
@@ -160,6 +168,7 @@ impl Default for ServerConfig {
             error_responses: None,
             error_switch: None,
             range_sink: None,
+            chunk_range_sink: None,
             request_counter: None,
             request_times: None,
             chunk_only_encoding: false,
@@ -169,6 +178,7 @@ impl Default for ServerConfig {
             last_modified: None,
             probe_delay: None,
             speed: None,
+            block: None,
             stall: None,
             active: None,
             max_active: None,
@@ -321,6 +331,12 @@ async fn handle_conn(
             .unwrap_or_else(|e| e.into_inner())
             .push(range_header.clone().unwrap_or_default());
     }
+    // Phase 2.2：只记录分块请求（排除 Probe 的 bytes=0-0）。
+    if !is_probe && let Some(sink) = &cfg.chunk_range_sink {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(range_header.clone().unwrap_or_default());
+    }
     // Phase 1d：统计非 Probe 请求次数与到达时间（重试次数、Retry-After 间隔）。
     if !is_probe {
         if let Some(c) = &cfg.request_counter {
@@ -457,16 +473,6 @@ async fn handle_conn(
     head.push_str("Connection: close\r\n\r\n");
     sock.write_all(head.as_bytes()).await?;
 
-    // Phase 2.1：切分产生的新请求（起点落在第 0 号分块内部）放行被停住的连接。
-    // 初始的其它分块起点等于 scope_end，不会放行；--no-split 时也没有这种请求。
-    if !is_probe
-        && let Some(st) = &cfg.stall
-        && start > 0
-        && start < st.scope_end
-    {
-        st.release.store(true, Ordering::SeqCst);
-    }
-
     // Phase 2：统计服务器端同时在发送正文的响应数（最大并发请求数）。
     let _concurrency = ActiveGuard::enter(&cfg, !is_probe);
     // Phase 2：本次响应的限速（字节/秒）。
@@ -480,9 +486,11 @@ async fn handle_conn(
     // 连接，让客户端观察到响应体被截断。
     let mut written = 0u64;
     let mut stalled = false;
+    let block = cfg.block.unwrap_or(BLOCK).max(1);
     while written < length {
-        // Phase 2.1 第三部分集成测试：起点为 0 的响应写出 after_bytes 之后完全停住，
-        // 既不继续发数据，也不关闭连接；直到放行信号置位或达到 max（< read_timeout）。
+        // Phase 2.2：起点为 0 的响应写出 after_bytes 之后完全停住。停住期间绝不
+        // 发送任何数据，也不主动关闭连接；只读取对端，观察客户端是否提前关闭。
+        // 停满 duration（< read_timeout）后才继续发送剩余数据。
         if let Some(st) = &cfg.stall
             && !is_probe
             && start == 0
@@ -490,12 +498,26 @@ async fn handle_conn(
             && written >= st.after_bytes
         {
             stalled = true;
-            let deadline = Instant::now() + st.max;
-            while !st.release.load(Ordering::SeqCst) && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            let stall_started = Instant::now();
+            let mut probe = [0u8; 64];
+            let closed = tokio::time::timeout(st.duration, async {
+                loop {
+                    match sock.read(&mut probe).await {
+                        Ok(0) | Err(_) => return true,
+                        Ok(_) => continue, // 客户端不会在响应期间发数据
+                    }
+                }
+            })
+            .await;
+            if matches!(closed, Ok(true)) {
+                st.closed_early.store(true, Ordering::SeqCst);
+                st.close_after_ms
+                    .store(stall_started.elapsed().as_millis() as u64, Ordering::SeqCst);
+                // 对端已经关闭，本端也无需再发送；这不是"服务器主动关闭"。
+                return Ok(());
             }
         }
-        let n = ((length - written) as usize).min(BLOCK);
+        let n = ((length - written) as usize).min(block);
         let mut buf = vec![0u8; n];
         fill_block(&mut buf, start + written);
         // 冻结模式：已写到 freeze_after 之后，静默停顿 freeze_duration 再关闭连接。
@@ -524,9 +546,14 @@ async fn handle_conn(
         // 提前断开：只写到 break_at 为止就关闭连接，保证 Content-Length 声明的
         // 长度无法被满足，客户端必须观察到响应体被截断。
         let break_point = cfg
-            .break_after_bytes
-            .filter(|n| *n < length)
-            .map(|n| start.saturating_add(n))
+            .break_at_start
+            .filter(|(only_start, _)| *only_start == start)
+            .map(|(_, at)| at)
+            .or_else(|| {
+                cfg.break_after_bytes
+                    .filter(|n| *n < length)
+                    .map(|n| start.saturating_add(n))
+            })
             .or(cfg.break_at);
         if let Some(b) = break_point.filter(|_| break_active && !is_probe) {
             let abs = start + written;

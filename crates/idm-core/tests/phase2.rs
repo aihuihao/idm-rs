@@ -16,6 +16,7 @@ mod verify;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use idm_core::disk::{AllocationStrategy, DiskWriterPool};
 use idm_core::net::client::DownloadConfig;
 use idm_core::store::{ChunkRow, NewTask, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
 use idm_core::task::{
-    CancelSignal, DownloadContext, DownloadOptions, DownloadOutcome, ProgressSnapshot,
+    CancelSignal, ChunkState, DownloadContext, DownloadOptions, DownloadOutcome, ProgressSnapshot,
     download_with_store, resume,
 };
 use support::{ServerConfig, StallConfig, TestServer, start};
@@ -81,6 +82,22 @@ async fn run_download(
     dynamic_split: bool,
     out: &str,
 ) -> TestResult<Run> {
+    let config = DownloadConfig {
+        connections,
+        dynamic_split,
+        ..DownloadConfig::default()
+    };
+    run_download_ex(cfg, connections, out, config).await
+}
+
+/// 与 [`run_download`] 相同，但允许注入自定义 `DownloadConfig`
+/// （Phase 2.2 退避接管测试需要把退避基数设为 10 秒）。
+async fn run_download_ex(
+    cfg: ServerConfig,
+    connections: usize,
+    out: &str,
+    config: DownloadConfig,
+) -> TestResult<Run> {
     let size = cfg.size;
     let srv = start(cfg).await?;
     let tmp = tempdir()?;
@@ -90,16 +107,7 @@ async fn run_download(
         .create_task(new_task(&srv.url("/file.bin"), tmp.path(), connections))
         .await?;
     let pool = Arc::new(DiskWriterPool::new(4, 16)?);
-    let opts = options(
-        tmp.path(),
-        out,
-        DownloadConfig {
-            connections,
-            dynamic_split,
-            ..DownloadConfig::default()
-        },
-        None,
-    );
+    let opts = options(tmp.path(), out, config, None);
     let started = Instant::now();
     let (outcome, rx) = download_with_store(
         &srv.url("/file.bin"),
@@ -702,60 +710,194 @@ async fn resume_when_largest_split_chunk_already_completed() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2.1 第三部分集成测试：第 0 号分块完全停住
+// Phase 2.2 第三部分：卡住 / 极慢 / 退避期间被接管
 // ---------------------------------------------------------------------------
 
-/// 服务器让第 0 号分块写出 256 KiB 后完全停住（保持连接、不发送、不关闭；
-/// 最长 6 s < 默认 30 s read_timeout，因此不会触发重试），其余分块正常。
-///
-/// 切分产生的新分块请求落在第 0 号分块内部，服务器据此提前放行被停住的连接；
-/// 开启切分时下载远早于 6 s 完成，`--no-split` 则必须等满 6 s。
-#[tokio::test]
-async fn stalled_first_chunk_is_split_and_beats_no_split() -> TestResult {
-    let size = 8 * MIB;
-    let stall_max = Duration::from_secs(6);
-    let cfg = || ServerConfig {
+/// 构造"第 0 号分块写出 256 KiB 后完全停住"的服务器：停住期间不发送任何数据，
+/// 也不主动关闭连接；只观察客户端是否提前关闭。返回服务器观察用的原子量。
+fn stall_cfg(size: u64, duration: Duration) -> (ServerConfig, Arc<AtomicBool>, Arc<AtomicU64>) {
+    let closed_early = Arc::new(AtomicBool::new(false));
+    let close_after_ms = Arc::new(AtomicU64::new(u64::MAX));
+    let cfg = ServerConfig {
         size,
         stall: Some(StallConfig {
             after_bytes: 256 * KIB,
-            scope_end: 4 * MIB,
-            max: stall_max,
-            release: Arc::new(AtomicBool::new(false)),
+            duration,
+            closed_early: Arc::clone(&closed_early),
+            close_after_ms: Arc::clone(&close_after_ms),
         }),
         ..ServerConfig::default()
     };
+    (cfg, closed_early, close_after_ms)
+}
 
-    let split = run_download(cfg(), 2, true, "stall-split.bin").await?;
-    assert!(split.snap.split_count >= 1, "第 0 号分块停住时必须发生切分");
-    let victim = split
+/// 停顿 20 秒（< 默认 30 秒 read_timeout，不会触发重试）。开启切分时，
+/// 卡住的分块在满一个速度窗口（4 秒）后被接管、被唤醒并以 Completed 退出，
+/// 客户端因此提前关闭那条连接；`--no-split` 必须等满 20 秒。
+#[tokio::test]
+async fn stalled_first_chunk_is_taken_over() -> TestResult {
+    let size = 8 * MIB;
+    let stall = Duration::from_secs(20);
+
+    let (cfg_split, closed_split, ms_split) = stall_cfg(size, stall);
+    let split = run_download(cfg_split, 2, true, "stall-takeover.bin").await?;
+    assert!(
+        split.snap.takeover_count >= 1,
+        "卡住的分块必须触发接管: {:?}",
+        split.snap.chunks
+    );
+    assert!(
+        split.elapsed < Duration::from_secs(5),
+        "开启切分时必须在 5 秒内完成，实际 {:?}",
+        split.elapsed
+    );
+    // 服务器端负责记录连接关闭；给它一点收尾调度时间。
+    for _ in 0..50 {
+        if closed_split.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let closed_ms = ms_split.load(Ordering::SeqCst);
+    assert!(
+        closed_split.load(Ordering::SeqCst),
+        "服务器必须观察到第 0 号分块的连接在 20 秒到期之前被客户端关闭"
+    );
+    assert!(
+        closed_ms < stall.as_millis() as u64,
+        "连接关闭时间 {closed_ms}ms 必须早于停住期满 {}ms",
+        stall.as_millis()
+    );
+
+    let (cfg_no, closed_no, ms_no) = stall_cfg(size, stall);
+    let no_split = run_download(cfg_no, 2, false, "stall-nosplit.bin").await?;
+    assert_eq!(no_split.snap.split_count, 0, "--no-split 时不得切分");
+    assert!(
+        no_split.elapsed >= stall,
+        "--no-split 必须等满 20 秒，实际 {:?}",
+        no_split.elapsed
+    );
+    println!(
+        "STALL split={:?} takeovers={} no_split={:?} stall={:?} client_close_after={}ms no_split_closed_early={}",
+        split.elapsed,
+        split.snap.takeover_count,
+        no_split.elapsed,
+        stall,
+        closed_ms,
+        closed_no.load(Ordering::SeqCst)
+    );
+    let _ = ms_no;
+    Ok(())
+}
+
+/// 极慢分块：第 0 号分块 10 KiB/s（1 KiB 小块持续发送），其余分块分别
+/// 128 KiB/s 与 96 KiB/s，切分出来的新分块全速。3 个 320 KiB 分块保证
+/// 接管后仍有 ≥256 KiB 可交给新分块。
+#[tokio::test]
+async fn very_slow_first_chunk_is_taken_over() -> TestResult {
+    let size = 960 * KIB; // 3 × 320 KiB
+    let connections = 3;
+    let cfg = || ServerConfig {
+        size,
+        // 4 KiB 块：极慢分块每块 ~0.4s（持续有数据，不会被判成"卡住"），
+        // 其它分块每块 ~16/26ms，两者速度差足以触发 10.5 的"明显慢"。
+        block: Some(4096),
+        speed: Some(speed::slow_first_and_two_others(
+            10 * KIB,
+            320 * KIB,
+            256 * KIB,
+            640 * KIB,
+            160 * KIB,
+        )),
+        ..ServerConfig::default()
+    };
+    let config = |dynamic_split: bool| DownloadConfig {
+        connections,
+        min_chunk_size: 320 * KIB,
+        dynamic_split,
+        ..DownloadConfig::default()
+    };
+
+    let split = run_download_ex(cfg(), connections, "slow-takeover.bin", config(true)).await?;
+    assert!(
+        split.snap.takeover_count >= 1,
+        "10 KiB/s 的分块必须触发接管: {:?}",
+        split.snap.chunks
+    );
+    let no_split = run_download_ex(cfg(), connections, "slow-nosplit.bin", config(false)).await?;
+    assert_eq!(no_split.snap.split_count, 0, "--no-split 时不得切分");
+    assert!(
+        split.elapsed.as_secs_f64() * 3.0 < no_split.elapsed.as_secs_f64(),
+        "接管应显著缩短耗时: split={:?} no_split={:?}",
+        split.elapsed,
+        no_split.elapsed
+    );
+    println!(
+        "SLOW split={:?} takeovers={} no_split={:?}",
+        split.elapsed, split.snap.takeover_count, no_split.elapsed
+    );
+    Ok(())
+}
+
+/// 解析 `bytes=a-b`；用于断言没有"起点等于终点"（空/倒置）的 Range 请求。
+fn range_bounds(h: &str) -> Option<(u64, u64)> {
+    let v = h.strip_prefix("bytes=")?;
+    let (a, b) = v.split_once('-')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// 退避期间被接管：第 0 号分块写到 256 KiB 时断开，进入 10 秒退避；
+/// 退避中被接管到 acked 并唤醒，以 Completed 结束，不再发任何请求。
+#[tokio::test]
+async fn backoff_wait_is_taken_over() -> TestResult {
+    let size = 8 * MIB;
+    let ranges: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cfg = ServerConfig {
+        size,
+        break_at_start: Some((0, 256 * KIB)),
+        chunk_range_sink: Some(Arc::clone(&ranges)),
+        ..ServerConfig::default()
+    };
+    let config = DownloadConfig {
+        connections: 2,
+        retry_base_delay: Duration::from_secs(10),
+        retry_max_delay: Duration::from_secs(10),
+        ..DownloadConfig::default()
+    };
+    let run = run_download_ex(cfg, 2, "backoff-takeover.bin", config).await?;
+    assert!(
+        run.snap.takeover_count >= 1,
+        "退避期间必须发生接管: {:?}",
+        run.snap.chunks
+    );
+    let victim = run
         .snap
         .chunks
         .iter()
         .find(|c| c.db_index == 0)
         .ok_or("missing chunk 0")?;
-    assert!(
-        victim.end < 4 * MIB,
-        "停住的第 0 号分块区间应被缩小: end={}",
-        victim.end
-    );
+    assert_eq!(victim.state, ChunkState::Done, "第 0 号分块必须以完成结束");
 
-    let no_split = run_download(cfg(), 2, false, "stall-nosplit.bin").await?;
-    assert_eq!(no_split.snap.split_count, 0, "--no-split 时不得切分");
-
-    assert!(
-        split.elapsed < stall_max / 2,
-        "开启切分时应在停住时长 {stall_max:?} 的一半内完成，实际 {:?}",
-        split.elapsed
-    );
-    assert!(
-        split.elapsed.as_secs_f64() * 2.0 < no_split.elapsed.as_secs_f64(),
-        "切分应显著缩短耗时: split={:?} no_split={:?}",
-        split.elapsed,
-        no_split.elapsed
+    let recorded = ranges.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(!recorded.is_empty(), "服务器必须记录到分块请求");
+    for h in &recorded {
+        let (a, b) = range_bounds(h).ok_or_else(|| format!("无法解析 Range 头: {h}"))?;
+        assert!(b >= a, "不允许发出起点等于终点/倒置的 Range 请求: {h}");
+        assert_ne!(h, "bytes=0-0", "分块请求不得使用旧的 bytes=0-0 兜底分支");
+    }
+    // 起点 256 KiB 的请求只应有一次：接管产生的新分块。若旧分块在退避结束后
+    // 又重试了一次，这里会变成 2 次。
+    let from_acked = recorded
+        .iter()
+        .filter(|h| range_bounds(h).is_some_and(|(a, _)| a == 256 * KIB))
+        .count();
+    assert_eq!(
+        from_acked, 1,
+        "退避被接管后不应再有旧分块的重试请求: {recorded:?}"
     );
     println!(
-        "split={:?} ({} 次切分) no_split={:?} stall_max={:?}",
-        split.elapsed, split.snap.split_count, no_split.elapsed, stall_max
+        "BACKOFF elapsed={:?} takeovers={} requests={:?}",
+        run.elapsed, run.snap.takeover_count, recorded
     );
     Ok(())
 }

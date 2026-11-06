@@ -10,6 +10,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
@@ -22,6 +23,26 @@ use crate::task::progress::ChunkInit;
 pub(super) const SPEED_WINDOW: Duration = Duration::from_secs(4);
 /// 切分点对齐粒度（ARCHITECTURE 10.3 第 2 步：向下对齐到 64 KiB）。
 pub(super) const SPLIT_ALIGN: u64 = 64 * 1024;
+/// 10.5：接管的切分点向上对齐到 64 KiB，且新分块至少要有 256 KiB。
+pub(super) const TAKEOVER_MIN_REMAIN: u64 = 256 * 1024;
+
+/// 10.5：一次切分的方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SplitMode {
+    /// 普通对半切（10.3 第 2 步）。
+    Half,
+    /// 接管：把除已预留部分之外的整个尾部交给新分块。
+    Takeover,
+}
+
+impl SplitMode {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            SplitMode::Half => "half",
+            SplitMode::Takeover => "takeover",
+        }
+    }
+}
 
 /// 单个分块的共享状态（ARCHITECTURE 10.1）。
 ///
@@ -37,6 +58,10 @@ pub(super) struct ChunkShared {
     pub(super) acked: Arc<AtomicU64>,
     /// reserved / end / 速度采样。
     inner: StdMutex<SharedInner>,
+    /// 10.5 唤醒通道：`watch` 镜像当前 end，状态语义，订阅之后发生的缩小不会漏掉。
+    /// 持有接收端可保证发送端始终有效。
+    end_tx: watch::Sender<u64>,
+    end_rx: watch::Receiver<u64>,
 }
 
 struct SharedInner {
@@ -58,6 +83,7 @@ impl ChunkShared {
         let mut samples = VecDeque::with_capacity(8);
         let now = Instant::now();
         samples.push_back((now, start));
+        let (end_tx, end_rx) = watch::channel(end);
         ChunkShared {
             start,
             db_index,
@@ -69,11 +95,21 @@ impl ChunkShared {
                 has_data: false,
                 samples,
             }),
+            end_tx,
+            end_rx,
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SharedInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 订阅 end 变更（10.5 唤醒）。返回的接收端把"当前值"标记为已读，
+    /// 因此只会收到订阅之后发生的缩小；`watch` 是状态语义，不会漏掉通知。
+    pub(super) fn subscribe_end(&self) -> watch::Receiver<u64> {
+        let mut rx = self.end_rx.clone();
+        let _ = rx.borrow_and_update();
+        rx
     }
 
     /// 10.2 第 1 步：在锁内预留，返回本次可写长度。
@@ -154,20 +190,42 @@ impl ChunkShared {
         !g.has_data && now.saturating_duration_since(g.started) < SPEED_WINDOW
     }
 
+    /// 10.5「卡住」：启动已超过一个速度窗口，并且窗口内没有任何新数据。
+    fn is_stalled(&self, now: Instant) -> bool {
+        let g = self.lock();
+        if now.saturating_duration_since(g.started) < SPEED_WINDOW {
+            return false;
+        }
+        match g.samples.back() {
+            Some(&(t, _)) => now.saturating_duration_since(t) > SPEED_WINDOW,
+            None => true,
+        }
+    }
+
     /// 剩余未落盘字节数。
     fn remaining(&self) -> u64 {
         let acked = self.acked.load(Ordering::Acquire);
         self.lock().end.saturating_sub(acked)
     }
 
-    /// ARCHITECTURE 10.3 第 4 步：再次确认 `reserved < split`（被切分方可能在此期间
-    /// 又前进了），满足则把 end 改为 split；返回是否切分成功。
-    fn commit_split(&self, split: u64, expected_end: u64) -> bool {
-        let mut g = self.lock();
-        if g.reserved >= split || g.end != expected_end {
-            return false;
+    /// ARCHITECTURE 10.3 第 4 步：再次确认 reserved 与 split 的关系
+    /// （10.5：接管放宽为 `reserved <= split`，对半切仍为 `reserved < split`），
+    /// 满足则把 end 改为 split 并通过 watch 唤醒等待中的分块任务。
+    pub(super) fn commit_split(&self, split: u64, expected_end: u64, takeover: bool) -> bool {
+        {
+            let mut g = self.lock();
+            let allowed = if takeover {
+                g.reserved <= split
+            } else {
+                g.reserved < split
+            };
+            if !allowed || g.end != expected_end {
+                return false;
+            }
+            g.end = split;
         }
-        g.end = split;
+        // 锁外通知：唤醒等待网络数据 / 正在退避等待的分块任务。
+        let _ = self.end_tx.send_replace(split);
         true
     }
 }
@@ -187,6 +245,25 @@ pub(super) fn compute_split_point(reserved: u64, end: u64, min_split: u64) -> Op
         return None;
     }
     Some(split)
+}
+
+/// 接管模式的切分点（ARCHITECTURE 10.5）：
+/// `split = reserved` 向上对齐到 64 KiB（已对齐时就是 reserved），
+/// 并且新分块 `[split, end)` 至少要有 [`TAKEOVER_MIN_REMAIN`] 字节。
+pub(super) fn compute_takeover_point(reserved: u64, end: u64) -> Option<u64> {
+    let split = reserved.div_ceil(SPLIT_ALIGN).checked_mul(SPLIT_ALIGN)?;
+    if split >= end || end - split < TAKEOVER_MIN_REMAIN {
+        return None;
+    }
+    Some(split)
+}
+
+/// 按方式计算切分点（10.3 第 2 步 / 10.5）。
+fn split_point(mode: SplitMode, reserved: u64, end: u64, min_split: u64) -> Option<u64> {
+    match mode {
+        SplitMode::Half => compute_split_point(reserved, end, min_split),
+        SplitMode::Takeover => compute_takeover_point(reserved, end),
+    }
 }
 
 /// 丢弃窗口之外的采样，但至少保留两个样本（否则无法计算速度）。
@@ -230,32 +307,57 @@ impl ChunkSlot {
 /// 3. 启动超过一个速度窗口、窗口内又没有数据的分块（卡住/退避重试）速度为 0，
 ///    预计剩余时间为无穷大，优先被切分。
 ///
-/// 返回 `(下标, 预计剩余秒数, 用于估算的速度)`。
-fn select_victim(shared: &[Arc<ChunkShared>], min_split: u64) -> Option<(usize, f64, f64)> {
+/// 10.5：被选中的分块若"卡住"或"明显慢"则用接管，否则用普通对半切。
+/// 明显慢要求该分块确实有速度数据（不是刚创建、速度还没测出来），否则刚生成的
+/// 新分块会立刻被再次接管，导致无限生成空区间。
+///
+/// 返回 `(下标, 预计剩余秒数, 用于估算的速度, 切分方式)`。
+fn select_victim(
+    shared: &[Arc<ChunkShared>],
+    min_split: u64,
+) -> Option<(usize, f64, f64, SplitMode)> {
     let now = Instant::now();
-    // 每个分块只取一次状态快照：(剩余字节, 最近速度, 能否切分, 是否刚创建)。
-    let states: Vec<(u64, f64, bool, bool)> = shared
+    // 每个分块只取一次状态快照。
+    let states: Vec<(u64, u64, u64, f64, bool, bool)> = shared
         .iter()
         .map(|s| {
             let (reserved, end) = s.reserved_end();
             (
                 s.remaining(),
+                reserved,
+                end,
                 s.recent_speed(),
-                compute_split_point(reserved, end, min_split).is_some(),
                 s.is_fresh(now),
+                s.is_stalled(now),
             )
         })
         .collect();
-    // 平均速度只统计"正在下载且有速度数据"的分块；一个都没有时按无穷大处理。
+    // 平均速度只统计"正在下载且有速度数据"的分块（2.1 / 10.5 共用）。
     let (sum, count) = states
         .iter()
-        .filter(|(remaining, speed, _, _)| *remaining > 0 && *speed > 0.0)
-        .fold((0.0f64, 0usize), |(s, n), (_, v, _, _)| (s + *v, n + 1));
+        .filter(|(remaining, _, _, speed, _, _)| *remaining > 0 && *speed > 0.0)
+        .fold((0.0f64, 0usize), |(s, n), (_, _, _, v, _, _)| {
+            (s + *v, n + 1)
+        });
     let avg_speed = if count == 0 { 0.0 } else { sum / count as f64 };
 
-    let mut best: Option<(usize, f64, f64)> = None;
-    for (i, (remaining, speed, splittable, fresh)) in states.iter().enumerate() {
-        if !*splittable || *remaining == 0 {
+    let mut best: Option<(usize, f64, f64, SplitMode)> = None;
+    for (i, (remaining, reserved, end, speed, fresh, stalled)) in states.iter().enumerate() {
+        if *remaining == 0 {
+            continue;
+        }
+        let takeover = *stalled || (*speed > 0.0 && !*fresh && *speed < avg_speed / 4.0);
+        let mode = if takeover {
+            SplitMode::Takeover
+        } else {
+            SplitMode::Half
+        };
+        // 2.1 第三部分第 1 条：先过滤再比较。只在该方式真的能切出合法切分点
+        // 时才参与比较；接管还要求 split > start（写器区间不能缩成空区间）。
+        let Some(split) = split_point(mode, *reserved, *end, min_split) else {
+            continue;
+        };
+        if mode == SplitMode::Takeover && split <= shared[i].start {
             continue;
         }
         let effective_speed = if *speed > 0.0 {
@@ -270,8 +372,8 @@ fn select_victim(shared: &[Arc<ChunkShared>], min_split: u64) -> Option<(usize, 
         } else {
             f64::INFINITY
         };
-        if best.is_none_or(|(_, best_eta, _)| eta > best_eta) {
-            best = Some((i, eta, effective_speed));
+        if best.is_none_or(|(_, best_eta, _, _)| eta > best_eta) {
+            best = Some((i, eta, effective_speed, mode));
         }
     }
     best
@@ -293,20 +395,27 @@ pub(super) async fn try_split(
     // 第 1 步：选择被切分分块。只把共享状态交给选择器，写器句柄仍留在 slots 中
     // 供第 6 步 shrink_end 使用；这也让选择器可以直接用构造好的 ChunkShared 做单测。
     let shared: Vec<Arc<ChunkShared>> = slots.iter().map(|s| Arc::clone(&s.shared)).collect();
-    let Some((victim_i, eta, speed)) = select_victim(&shared, min_split) else {
+    let Some((victim_i, eta, speed, mode)) = select_victim(&shared, min_split) else {
         return Ok(false);
     };
 
-    // 第 2、3 步：加锁读取 reserved 与 end，切分点取剩余区间的中点并向下对齐到
-    // 64 KiB；切分后两段都必须不小于最小切分大小。
+    // 第 2、3 步：加锁读取 reserved 与 end，按 10.5 判定的方式计算切分点。
+    // 对半切取剩余区间中点向下对齐 64 KiB，两段都不小于 min_split；
+    // 接管取 reserved 向上对齐 64 KiB，新分块至少 256 KiB。
     let (reserved, end) = slots[victim_i].shared.reserved_end();
-    let Some(split) = compute_split_point(reserved, end, min_split) else {
+    let Some(split) = split_point(mode, reserved, end, min_split) else {
         return Ok(false);
     };
+    if mode == SplitMode::Takeover && split <= slots[victim_i].shared.start {
+        return Ok(false);
+    }
 
-    // 第 4 步：再次确认 reserved < split（被切分方可能在此期间又前进了）；
-    // 满足则把 end 改为 split。
-    if !slots[victim_i].shared.commit_split(split, end) {
+    // 第 4 步：再次确认 reserved 与 split 的关系（10.5 接管放宽为 <=）；
+    // 满足则把 end 改为 split，并通过 watch 唤醒等待中的分块任务。
+    if !slots[victim_i]
+        .shared
+        .commit_split(split, end, mode == SplitMode::Takeover)
+    {
         return Ok(false);
     }
     let db_index = slots[victim_i].shared.db_index;
@@ -349,8 +458,14 @@ pub(super) async fn try_split(
         start: split,
         end,
         parent: Some(db_index),
+        takeover: mode == SplitMode::Takeover,
     });
-    spawner.progress.lock().await.add_split();
+    let progress = spawner.progress.lock().await;
+    progress.add_split();
+    if mode == SplitMode::Takeover {
+        progress.add_takeover();
+    }
+    drop(progress);
     acked
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -361,6 +476,7 @@ pub(super) async fn try_split(
         victim = db_index,
         split,
         new_chunk = new_index,
+        mode = mode.as_str(),
         speed_bps = speed as u64,
         eta_secs = if eta.is_finite() { eta } else { -1.0 },
         "chunk split"
@@ -475,7 +591,7 @@ mod tests {
         // 切分缩小 end 之后同样截断：reserved 已到 1024，新的 end 是 2048。
         let s = ChunkShared::new(0, 4096, 0);
         assert_eq!(s.reserve(1024), 1024);
-        assert!(s.commit_split(2048, 4096));
+        assert!(s.commit_split(2048, 4096, false));
         assert_eq!(s.reserve(4096), 1024, "只能写到新的 end 为止");
         assert_eq!(s.reserve(1), 0);
 
@@ -515,7 +631,7 @@ mod tests {
 
         // 第 4 步的再次确认必须失败，且 end 保持不变。
         assert!(
-            !s.commit_split(split, end),
+            !s.commit_split(split, end, false),
             "reserved >= split 时必须放弃切分"
         );
         let (reserved_after, end_after) = s.reserved_end();
@@ -559,9 +675,12 @@ mod tests {
 
     /// Phase 2.1 第三部分第 1 条：先过滤再比较。剩余太小（不能切分）、速度为 0
     /// 的分块不能让本次切分整体放弃，也不能被选中。
+    ///
+    /// Phase 2.2 起"太小"要同时小于 10.5 接管的 256 KiB 门槛，否则卡住的
+    /// 分块本来就应该被接管选中；这里用 200 KiB 保持在两种模式下都不可切分。
     #[test]
     fn victim_selection_skips_unsplittable_chunks() -> T {
-        let small = chunk(0, MIB, 0);
+        let small = chunk(0, 200 * KIB, 0);
         set_state(
             &small,
             64 * KIB,
@@ -571,7 +690,8 @@ mod tests {
             &stuck_samples(0),
         );
         assert_eq!(small.recent_speed(), 0.0);
-        assert_eq!(compute_split_point(0, MIB, MIB), None);
+        assert_eq!(compute_split_point(64 * KIB, 200 * KIB, MIB), None);
+        assert_eq!(compute_takeover_point(64 * KIB, 200 * KIB), None);
 
         let slow = chunk(MIB, 9 * MIB, 1);
         set_state(
@@ -583,7 +703,7 @@ mod tests {
             &moving_samples(MIB, 64 * KIB),
         );
 
-        let (idx, eta, _) = select_victim(&[Arc::clone(&small), Arc::clone(&slow)], MIB)
+        let (idx, eta, _, _) = select_victim(&[Arc::clone(&small), Arc::clone(&slow)], MIB)
             .ok_or("应选中可切分、剩余时间长的慢分块")?;
         assert_eq!(idx, 1, "不可切分的分块不能因为 ETA 无穷大而抢占切分");
         assert!(eta.is_finite(), "慢分块应有有限的预计剩余时间");
@@ -607,7 +727,7 @@ mod tests {
             &moving_samples(8 * MIB, MIB),
         );
 
-        let (idx, _, _) = select_victim(&[Arc::clone(&fresh), Arc::clone(&normal)], MIB)
+        let (idx, _, _, _) = select_victim(&[Arc::clone(&fresh), Arc::clone(&normal)], MIB)
             .ok_or("应选中预计剩余时间更长的正常分块")?;
         assert_eq!(
             idx, 1,
@@ -647,10 +767,78 @@ mod tests {
             chunks.push(c);
         }
 
-        let (idx, eta, speed) = select_victim(&chunks, MIB).ok_or("应选中卡住的分块")?;
+        let (idx, eta, speed, mode) = select_victim(&chunks, MIB).ok_or("应选中卡住的分块")?;
         assert_eq!(idx, 0);
         assert!(eta.is_infinite());
         assert_eq!(speed, 0.0);
+        assert_eq!(mode, SplitMode::Takeover, "卡住的分块必须用接管方式");
+        Ok(())
+    }
+
+    /// Phase 2.2 第三部分第 1 项：10.5 接管的切分点——向上对齐到 64 KiB、
+    /// 已对齐时等于 reserved、剩余不足 256 KiB 时放弃。
+    #[test]
+    fn takeover_split_point_aligns_up_and_requires_minimum_remaining() -> T {
+        const REMAIN: u64 = TAKEOVER_MIN_REMAIN;
+
+        // 已对齐：split == reserved。
+        assert_eq!(compute_takeover_point(0, 4 * MIB), Some(0));
+        assert_eq!(compute_takeover_point(2 * MIB, 4 * MIB), Some(2 * MIB));
+
+        // 未对齐：向上对齐到 64 KiB。
+        assert_eq!(compute_takeover_point(1, 4 * MIB), Some(64 * KIB));
+        assert_eq!(compute_takeover_point(100 * KIB, 4 * MIB), Some(128 * KIB));
+        assert_eq!(
+            compute_takeover_point(2 * MIB + 1, 4 * MIB),
+            Some(2 * MIB + 64 * KIB)
+        );
+
+        // 剩余恰好 256 KiB 允许，少 1 字节放弃。
+        assert_eq!(compute_takeover_point(0, REMAIN), Some(0));
+        assert_eq!(compute_takeover_point(0, REMAIN - 1), None);
+        assert_eq!(
+            compute_takeover_point(64 * KIB, 64 * KIB + REMAIN - 1),
+            None
+        );
+        // reserved 已经到达 end。
+        assert_eq!(compute_takeover_point(4 * MIB, 4 * MIB), None);
+        Ok(())
+    }
+
+    /// Phase 2.2 第三部分第 1 项：10.5 第 4 步的确认条件——接管允许
+    /// `reserved <= split`，普通对半切仍然要求 `reserved < split`。
+    #[test]
+    fn takeover_commit_allows_reserved_equal_split() -> T {
+        let split = 2 * MIB; // 64 KiB 对齐
+        let takeover = ChunkShared::new(0, 8 * MIB, 0);
+        set_state(
+            &takeover,
+            split,
+            split,
+            Duration::from_secs(6),
+            true,
+            &stuck_samples(0),
+        );
+        assert!(
+            takeover.commit_split(split, 8 * MIB, true),
+            "reserved == split 时接管必须确认成功"
+        );
+        assert_eq!(takeover.end(), split);
+
+        let half = ChunkShared::new(0, 8 * MIB, 0);
+        set_state(
+            &half,
+            split,
+            split,
+            Duration::from_secs(6),
+            true,
+            &stuck_samples(0),
+        );
+        assert!(
+            !half.commit_split(split, 8 * MIB, false),
+            "reserved == split 时对半切必须放弃"
+        );
+        assert_eq!(half.end(), 8 * MIB);
         Ok(())
     }
 }

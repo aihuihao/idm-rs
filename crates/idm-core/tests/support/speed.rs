@@ -36,6 +36,28 @@ pub fn slow_in_prefix(prefix_end: u64, bps: u64) -> SpeedPolicy {
     ))
 }
 
+/// Phase 2.2 极慢分块测试：起点 0 的请求按 `slow_bps` 持续慢速发送，
+/// 另外两个初始分块各自按指定起点/速度发送，切分产生的新分块（其它起点）全速。
+pub fn slow_first_and_two_others(
+    slow_bps: u64,
+    second_start: u64,
+    second_bps: u64,
+    third_start: u64,
+    third_bps: u64,
+) -> SpeedPolicy {
+    SpeedPolicy(Arc::new(move |start, _| {
+        if start == 0 {
+            Some(slow_bps)
+        } else if start == second_start {
+            Some(second_bps)
+        } else if start == third_start {
+            Some(third_bps)
+        } else {
+            None
+        }
+    }))
+}
+
 /// 按种子为每个请求生成 0.25x ~ 2.0x 的确定性速度倍率（并发压力测试）。
 pub fn seeded(seed: u64, base_bps: u64) -> SpeedPolicy {
     SpeedPolicy(Arc::new(move |_, request_no| {

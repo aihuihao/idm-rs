@@ -18,6 +18,8 @@ pub struct ChunkInit {
     pub end: u64,
     /// 来源：`None` 表示初始分块，`Some(i)` 表示从第 i 号分块切出。
     pub parent: Option<i64>,
+    /// Phase 2.2：该分块是否由"接管"产生（汇总表的 source 列用来区分两种方式）。
+    pub takeover: bool,
 }
 
 /// 单个分块的进度。
@@ -27,6 +29,8 @@ pub struct ChunkProgress {
     pub db_index: i64,
     /// 来源：`None` = 初始分块，`Some(i)` = 从第 i 号分块切出。
     pub parent: Option<i64>,
+    /// Phase 2.2：接管产生（`source=takeover_from_N`）；否则为普通对半切。
+    pub takeover: bool,
     pub start: u64,
     pub current: u64,
     pub end: u64,
@@ -51,8 +55,10 @@ pub struct ProgressSnapshot {
     /// 是否可断点续传：仅静态分块（总长已知且支持 Range）为 `true`；
     /// 总长未知/不支持 Range 的单连接顺序下载为 `false`（供 Phase 1c 使用）。
     pub resumable: bool,
-    /// 本次运行发生的动态切分次数（Phase 2）。
+    /// 本次运行发生的动态切分次数（Phase 2，含接管）。
     pub split_count: u64,
+    /// 其中属于 10.5「接管」的次数（Phase 2.2）。
+    pub takeover_count: u64,
 }
 
 /// 进度发布器：内部持有共享快照与 `watch::Sender`，按 200ms 节流发布。
@@ -80,6 +86,7 @@ impl ProgressPublisher {
             .map(|c| ChunkProgress {
                 db_index: c.db_index,
                 parent: c.parent,
+                takeover: c.takeover,
                 start: c.start,
                 current: c.start,
                 end: c.end,
@@ -96,6 +103,7 @@ impl ProgressPublisher {
             speed: 0.0,
             resumable,
             split_count: 0,
+            takeover_count: 0,
         };
         let current = Arc::new(Mutex::new(snap.clone()));
         let (tx, rx) = match tx {
@@ -183,6 +191,7 @@ impl ProgressPublisher {
         snap.chunks.push(ChunkProgress {
             db_index: init.db_index,
             parent: init.parent,
+            takeover: init.takeover,
             start: init.start,
             current: init.start,
             end: init.end,
@@ -207,12 +216,20 @@ impl ProgressPublisher {
         }
     }
 
-    /// 切分次数加一（Phase 2）。
+    /// 切分次数加一（Phase 2，含接管）。
     pub fn add_split(&self) {
         self.current
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .split_count += 1;
+    }
+
+    /// 10.5 接管次数加一（Phase 2.2，用于在日志/汇总中区分两种方式）。
+    pub fn add_takeover(&self) {
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .takeover_count += 1;
     }
 
     /// 若距上次发布已超过 200ms 则发布一次。即使无人读取也不阻塞。

@@ -343,6 +343,7 @@ async fn run_download(
                     start: c.committed,
                     end: c.end,
                     parent: c.parent,
+                    takeover: false,
                 })
                 .collect();
             (
@@ -417,6 +418,7 @@ async fn run_download(
                             start,
                             end,
                             parent: None,
+                            takeover: false,
                         })
                         .collect();
                 (tf, init, Some(total), false)
@@ -428,6 +430,7 @@ async fn run_download(
                     start: 0,
                     end: u64::MAX,
                     parent: None,
+                    takeover: false,
                 }];
                 (tf, init, None, true)
             };
@@ -609,6 +612,13 @@ async fn run_download(
         return Ok(ExitKind::Cancelled);
     }
 
+    // Phase 2.2：连接空闲时定期重试切分。10.5 的「卡住」要等满一个速度窗口
+    // （4 秒）才成立，只在"某个分块完成"时尝试一次是不够的；有空闲连接却暂时
+    // 没有合法候选时，必须继续重试，否则被卡住的分块永远等不到接管。
+    let mut split_retry = tokio::time::interval(Duration::from_millis(100));
+    split_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let max_concurrent = inits.len().max(1);
+
     let mut outcome: Option<Result<DownloadOutcome>> = None;
     loop {
         if join_set.is_empty() {
@@ -665,6 +675,27 @@ async fn run_download(
                         }));
                         break;
                     }
+                }
+            }
+            // 有空闲连接时定期重试切分（10.5：卡住/明显慢是随时间的判定）。
+            _ = split_retry.tick() => {
+                if opts.config.dynamic_split
+                    && !streaming
+                    && join_set.len() < max_concurrent
+                    && let Err(e) = try_split(
+                        ctx,
+                        &spawner,
+                        &mut slots,
+                        &acked,
+                        &mut next_db_index,
+                        opts.config.min_split_size,
+                        &mut join_set,
+                    )
+                    .await
+                {
+                    internal.cancel();
+                    outcome = Some(Err(e));
+                    break;
                 }
             }
         }
@@ -1080,6 +1111,28 @@ impl From<Error> for AttemptError {
     }
 }
 
+/// 10.5 唤醒：等待 end 被缩小的通知（状态语义，订阅之后发生的缩小不会漏掉）。
+///
+/// 被唤醒后加锁读取 end：`acked == end` 时返回 `Some(Completed)`，调用方立即
+/// 丢弃响应（关闭连接）或停止退避等待；否则返回 `None`，继续原来的等待。
+async fn wake_on_shrink(
+    end_rx: &mut watch::Receiver<u64>,
+    shared: &ChunkShared,
+    acked: &AtomicU64,
+) -> Option<ChunkExit> {
+    if end_rx.changed().await.is_err() {
+        // 发送端随 ChunkShared 一同存活，这里不会发生；防御性让出一次，避免自旋。
+        tokio::task::yield_now().await;
+        return None;
+    }
+    let end = shared.end();
+    if acked.load(Ordering::Acquire) >= end {
+        Some(ChunkExit::Completed)
+    } else {
+        None
+    }
+}
+
 /// 分块主体（Phase 1d 重试循环）：每一步网络读取与磁盘写入之前都检查取消。
 /// 分块请求**不**设总时长超时（依赖 Client 级别的 `connect_timeout` 与
 /// `read_timeout`），避免大分块在慢速网络下失败。
@@ -1165,11 +1218,25 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
                     resume_from,
                     "chunk retry"
                 );
-                // 退避等待期间也要监听取消信号，收到后立即（远小于 1 秒）退出。
-                tokio::select! {
-                    biased;
-                    _ = wait_cancelled(&mut cancel_rx) => return Ok(ChunkExit::Cancelled),
-                    _ = tokio::time::sleep(wait) => {}
+                // 退避等待期间监听取消信号与 10.5 的 end 变更：被接管到 acked
+                // 时立刻以 Completed 退出；否则继续等完原本的退避时长。
+                let mut end_rx = job.shared.subscribe_end();
+                let deadline = Instant::now() + wait;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = wait_cancelled(&mut cancel_rx) => return Ok(ChunkExit::Cancelled),
+                        exit = wake_on_shrink(&mut end_rx, &job.shared, &job.acked) => {
+                            if let Some(exit) = exit {
+                                return Ok(exit);
+                            }
+                        }
+                        _ = tokio::time::sleep(remaining) => break,
+                    }
                 }
                 consecutive_failures += 1;
                 retries += 1;
@@ -1210,7 +1277,9 @@ async fn attempt_chunk_once(
     // 解构 `&ChunkJob`（match ergonomics）得到的是各字段的引用；
     // Copy 字段在此解引用，供后续直接使用。
     let (chunk_id, idx, streaming, task_id) = (*chunk_id, *idx, *streaming, *task_id);
-    // 本次尝试的区间终点：可能已经被切分缩小（Phase 2）。
+    // 订阅 end 变更必须在读取 end 之前：若中间发生切分，通知仍会被观察到。
+    let mut end_rx = shared.subscribe_end();
+    // 本次尝试的区间终点：可能已经被切分缩小（Phase 2 / 10.5 接管）。
     let end = shared.end();
     // 本函数沿用原实现的变量名：start 即本次尝试的起点 cur。
     let start = cur;
@@ -1219,15 +1288,16 @@ async fn attempt_chunk_once(
     if rx_cancelled(cancel_rx) {
         return Ok(ChunkExit::Cancelled);
     }
+    // Phase 2.2 剩余长度为 0 的保护：当前位置已经到达（或被切分缩小到）end，
+    // 直接以完成结束。分块下载过程中绝不允许发出起点等于终点的 Range 请求。
+    if start >= end {
+        return Ok(ChunkExit::Completed);
+    }
 
     // 流式（总长未知）模式不发送 Range；分块模式发送精确区间。
     let mut req = client.get(url.clone());
     if !streaming {
-        let range_hdr = if expected == 0 {
-            "bytes=0-0".to_string()
-        } else {
-            format!("bytes={}-{}", start, end - 1)
-        };
+        let range_hdr = format!("bytes={}-{}", start, end - 1);
         req = req.header(RANGE, range_hdr);
         if let Some(ir) = &if_range {
             req = req.header(IF_RANGE, ir.clone());
@@ -1328,6 +1398,14 @@ async fn attempt_chunk_once(
         let bytes = tokio::select! {
             biased;
             _ = wait_cancelled(cancel_rx) => return Ok(ChunkExit::Cancelled),
+            // 10.5：等待网络数据时也要监听 end 缩小。被接管到 acked 时立即
+            // 丢弃响应（resp 随本函数返回而 drop，连接随之关闭），以完成结束。
+            exit = wake_on_shrink(&mut end_rx, shared, acked_counter) => {
+                if let Some(exit) = exit {
+                    return Ok(exit);
+                }
+                continue;
+            }
             r = resp.chunk() => match r {
                 Ok(Some(b)) => b,
                 Ok(None) => break,
@@ -1404,6 +1482,13 @@ async fn attempt_chunk_once(
             let mut p = progress.lock().await;
             p.set_chunk_current(idx, start + received);
             p.publish_if_due();
+            drop(p);
+            // 10.5：接管时 end 可能恰好缩到本次写盘的末尾，而唤醒发生在
+            // `pool.write` 尚未返回（acked 还落后于 reserved）的窗口里。
+            // 回执到达后再确认一次，避免继续等一个永远不来的网络数据块。
+            if !streaming && acked_counter.load(Ordering::Acquire) >= shared.end() {
+                return Ok(ChunkExit::Completed);
+            }
         }
     }
     received_counter.store(start + received, Ordering::Relaxed);
@@ -1520,5 +1605,48 @@ mod tests {
         cooperative_drain(&mut set).await;
         assert!(exited.load(Ordering::SeqCst), "任务必须有机会正常退出");
         assert!(set.is_empty(), "排空之后 JoinSet 必须为空");
+    }
+
+    /// Phase 2.2 第三部分第 2 项：分块正在等待网络数据时，end 被接管缩小到
+    /// acked，唤醒必须在 100 毫秒内让任务以 Completed 结束（丢弃连接）。
+    #[tokio::test]
+    async fn wake_on_shrink_returns_completed_within_100ms() {
+        let shared = Arc::new(ChunkShared::new(0, 4 * 1024 * 1024, 0));
+        let mut end_rx = shared.subscribe_end();
+        let acked = Arc::clone(&shared.acked);
+        let shrunk = Arc::clone(&shared);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // 接管：reserved == split == acked == 0，确认条件放宽为 <=。
+            assert!(shrunk.commit_split(0, 4 * 1024 * 1024, true));
+        });
+
+        let started = Instant::now();
+        // 与 attempt_chunk_once 中"等待 resp.chunk()"同样的 select! 结构，
+        // 只是把网络 future 换成永远 pending，模拟连接完全卡住。
+        let exit = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    woken = wake_on_shrink(&mut end_rx, &shared, &acked) => {
+                        if let Some(exit) = woken {
+                            return exit;
+                        }
+                    }
+                    _ = std::future::pending::<()>() => {}
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(exit, Ok(ChunkExit::Completed)),
+            "唤醒后必须返回 Completed"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "唤醒必须在 100ms 内完成，实际 {:?}",
+            started.elapsed()
+        );
     }
 }

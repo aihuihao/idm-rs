@@ -349,6 +349,8 @@ mod dl {
         );
         for c in snap.chunks.iter() {
             let source = match c.parent {
+                // Phase 2.2：汇总表的 source 列区分"接管"与"普通对半切"。
+                Some(parent) if c.takeover => format!("takeover_from_{parent}"),
                 Some(parent) => format!("split_from_{parent}"),
                 None => "initial".to_string(),
             };
@@ -690,11 +692,12 @@ mod dl {
             0.0
         };
         println!(
-            "RESULT status={outcome:?} path={} size={size} elapsed={:.2}s avg_speed={avg_speed:.0} B/s chunks={} splits={} strategy={actual_strategy}",
+            "RESULT status={outcome:?} path={} size={size} elapsed={:.2}s avg_speed={avg_speed:.0} B/s chunks={} splits={} takeovers={} strategy={actual_strategy}",
             final_path.display(),
             elapsed.as_secs_f64(),
             snap.chunks.len(),
-            snap.split_count
+            snap.split_count,
+            snap.takeover_count
         );
 
         match outcome {
@@ -839,12 +842,13 @@ mod dl {
             }
         };
         println!(
-            "RESULT status={outcome:?} task_id={id} total={:?} downloaded_this_run={} elapsed={:.2}s chunks={} splits={}",
+            "RESULT status={outcome:?} task_id={id} total={:?} downloaded_this_run={} elapsed={:.2}s chunks={} splits={} takeovers={}",
             rec.total_size,
             snap.downloaded,
             elapsed.as_secs_f64(),
             snap.chunks.len(),
-            snap.split_count
+            snap.split_count,
+            snap.takeover_count
         );
         match outcome {
             DownloadOutcome::Completed => 0,
@@ -979,6 +983,7 @@ mod dl {
                 chunks: vec![ChunkProgress {
                     db_index: 0,
                     parent: None,
+                    takeover: false,
                     start: 0,
                     current: 1024,
                     end: 1024,
@@ -997,6 +1002,41 @@ mod dl {
             assert!(text.contains("avg_speed=512 B/s"), "{text}");
             assert!(text.contains("state=Done"), "{text}");
             assert!(text.contains("retries=3"), "{text}");
+        }
+
+        /// Phase 2.2：汇总表必须区分"接管"与"普通对半切"。
+        #[test]
+        fn chunk_summary_distinguishes_takeover() {
+            let chunk = ChunkProgress {
+                db_index: 0,
+                parent: None,
+                takeover: false,
+                start: 0,
+                current: 1024,
+                end: 1024,
+                state: ChunkState::Done,
+                elapsed_secs: 1.0,
+                avg_speed: 1024.0,
+                retries: 0,
+            };
+            let half = ChunkProgress {
+                db_index: 1,
+                parent: Some(0),
+                ..chunk.clone()
+            };
+            let takeover = ChunkProgress {
+                db_index: 2,
+                parent: Some(0),
+                takeover: true,
+                ..chunk.clone()
+            };
+            let text = format_chunk_summary(&ProgressSnapshot {
+                chunks: vec![chunk, half, takeover],
+                ..ProgressSnapshot::default()
+            });
+            assert!(text.contains("source=initial"), "{text}");
+            assert!(text.contains("source=split_from_0"), "{text}");
+            assert!(text.contains("source=takeover_from_0"), "{text}");
         }
 
         #[test]
