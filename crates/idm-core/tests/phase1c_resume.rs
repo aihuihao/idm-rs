@@ -4,6 +4,9 @@
 
 mod support;
 
+#[path = "support/verify.rs"]
+mod verify;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -16,8 +19,9 @@ use idm_core::store::{ChunkRow, NewTask, PauseReasonDb, ProbeInfo, Store, TaskSt
 use idm_core::task::{
     CancelSignal, DownloadContext, DownloadOptions, DownloadOutcome, download_with_store, resume,
 };
-use support::{ServerConfig, TestServer, start, verify_file};
+use support::{ServerConfig, TestServer, start};
 use tempfile::{TempDir, tempdir};
+use verify::verify_file;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 

@@ -5,6 +5,9 @@
 
 mod support;
 
+#[path = "support/verify.rs"]
+mod verify;
+
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,9 +22,10 @@ use idm_core::task::{
     CancelSignal, DownloadContext, DownloadOptions, DownloadOutcome, PauseReason, ProgressSnapshot,
     download_with_store, resume,
 };
-use support::{ServerConfig, TestServer, start, verify_file};
+use support::{ServerConfig, TestServer, start};
 use tempfile::{TempDir, tempdir};
 use tokio::sync::watch;
+use verify::verify_file;
 
 const MIB: u64 = 1024 * 1024;
 const KIB: u64 = 1024;

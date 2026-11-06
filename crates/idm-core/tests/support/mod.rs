@@ -4,7 +4,6 @@
 //! 内容按偏移量确定性生成（不占内存，可模拟 GB 级文件）。通过 [`ServerConfig`]
 //! 可模拟 B6 列出的全部服务器行为。
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -131,21 +130,6 @@ fn fill_block(buf: &mut [u8], base: u64) {
     for (k, b) in buf.iter_mut().enumerate() {
         *b = byte_at(base + k as u64);
     }
-}
-
-/// 逐字节校验文件内容与服务器生成规则一致。
-pub fn verify_file(path: &Path, size: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let data = std::fs::read(path)?;
-    if data.len() as u64 != size {
-        return Err(format!("file length mismatch: expected {size}, got {}", data.len()).into());
-    }
-    for (i, &b) in data.iter().enumerate() {
-        let expected = byte_at(i as u64);
-        if b != expected {
-            return Err(format!("byte {i}: expected {expected}, got {b}").into());
-        }
-    }
-    Ok(())
 }
 
 /// 已启动的测试服务器。

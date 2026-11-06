@@ -4,6 +4,9 @@
 
 mod support;
 
+#[path = "support/verify.rs"]
+mod verify;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -17,8 +20,9 @@ use idm_core::store::{
 use idm_core::task::{
     CheckpointHooks, DownloadContext, DownloadOptions, DownloadOutcome, download_with_store,
 };
-use support::{ServerConfig, start, verify_file};
+use support::{ServerConfig, start};
 use tempfile::tempdir;
+use verify::verify_file;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 type Snapshots = Vec<Vec<(i64, u64)>>;

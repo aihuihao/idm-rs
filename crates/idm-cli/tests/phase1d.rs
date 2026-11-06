@@ -11,7 +11,6 @@
 
 #![cfg(windows)]
 
-#[allow(dead_code)]
 #[path = "../../idm-core/tests/support/mod.rs"]
 mod support;
 

@@ -5,6 +5,9 @@
 
 mod support;
 
+#[path = "support/verify.rs"]
+mod verify;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +16,9 @@ use idm_core::disk::{AllocationStrategy, DiskWriterPool};
 use idm_core::net::client::DownloadConfig;
 use idm_core::task::state::ChunkState;
 use idm_core::task::{CancelSignal, DownloadOptions, DownloadOutcome, download};
-use support::{ServerConfig, start, verify_file};
+use support::{ServerConfig, start};
 use tempfile::tempdir;
+use verify::verify_file;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 

@@ -2,7 +2,6 @@
 
 #![cfg(windows)]
 
-#[allow(dead_code)]
 mod support;
 
 use std::path::Path;
