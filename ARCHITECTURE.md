@@ -127,7 +127,9 @@
 - 触发条件：被选中的分块满足下列之一
   - 卡住：分块启动已超过一个速度窗口（4 秒），并且窗口内没有任何新数据
   - 明显慢：最近速度低于本任务所有正在下载、速度大于 0 的分块平均速度的 1/4
-- 切分点：split = reserved 向上对齐到 64 KiB（reserved 已经对齐时，split = reserved）。要求 end − split ≥ 256 KiB，否则放弃本次切分
+- 切分点：split = reserved（不对齐）。要求 end − split ≥ 256 KiB，否则放弃本次切分
+- 当 reserved == start（被接管分块尚未写入任何数据）时：end 缩为 start，不调用 shrink_end；新分块的写入器分配和网络请求，延迟到被接管分块的任务结束、释放写入器之后再执行
+- 唤醒点包括：等待响应头、等待网络数据、重试退避等待
 - 第 4 步的确认条件放宽为 reserved ≤ split（普通对半切分仍为 reserved < split）。不变式 committed ≤ acked ≤ reserved ≤ end 保持不变
 - 唤醒：end 被缩小后，必须能唤醒正在等待网络数据或正在退避等待的分块任务。被唤醒的分块如果发现 acked == end，立即丢弃连接，以"完成"结束
 - 第 5 到 7 步（数据库事务 → shrink_end → 新分块）不变

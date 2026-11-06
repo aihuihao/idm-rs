@@ -23,7 +23,8 @@ use crate::task::progress::ChunkInit;
 pub(super) const SPEED_WINDOW: Duration = Duration::from_secs(4);
 /// 切分点对齐粒度（ARCHITECTURE 10.3 第 2 步：向下对齐到 64 KiB）。
 pub(super) const SPLIT_ALIGN: u64 = 64 * 1024;
-/// 10.5：接管的切分点向上对齐到 64 KiB，且新分块至少要有 256 KiB。
+/// 10.5（Phase 2.2.1 修订）：接管的切分点就是 reserved，**不对齐**；
+/// 新分块至少要接管 256 KiB。
 pub(super) const TAKEOVER_MIN_REMAIN: u64 = 256 * 1024;
 
 /// 10.5：一次切分的方式。
@@ -247,15 +248,22 @@ pub(super) fn compute_split_point(reserved: u64, end: u64, min_split: u64) -> Op
     Some(split)
 }
 
-/// 接管模式的切分点（ARCHITECTURE 10.5）：
-/// `split = reserved` 向上对齐到 64 KiB（已对齐时就是 reserved），
-/// 并且新分块 `[split, end)` 至少要有 [`TAKEOVER_MIN_REMAIN`] 字节。
+/// 接管模式的切分点（ARCHITECTURE 10.5，Phase 2.2.1 修订）：
+/// `split = reserved`，**不做 64 KiB 对齐**——真实网络中 reserved 几乎不会
+/// 恰好对齐，向上对齐会留下不到 64 KiB 的尾巴，卡住的原分块要等 read_timeout
+/// 才能继续。新分块 `[split, end)` 至少要有 [`TAKEOVER_MIN_REMAIN`] 字节。
 pub(super) fn compute_takeover_point(reserved: u64, end: u64) -> Option<u64> {
-    let split = reserved.div_ceil(SPLIT_ALIGN).checked_mul(SPLIT_ALIGN)?;
+    let split = reserved;
     if split >= end || end - split < TAKEOVER_MIN_REMAIN {
         return None;
     }
     Some(split)
+}
+
+/// 10.5：`reserved == start` 的接管把原分块缩成空区间，写入器尚未释放，
+/// 因此第 7 步必须延迟到原分块任务结束之后。
+pub(super) fn needs_deferred_allocation(mode: SplitMode, split: u64, start: u64) -> bool {
+    mode == SplitMode::Takeover && split == start
 }
 
 /// 按方式计算切分点（10.3 第 2 步 / 10.5）。
@@ -293,6 +301,37 @@ impl ChunkSlot {
     pub(super) fn new(shared: Arc<ChunkShared>, pc: PoolChunk, idx: usize) -> Self {
         ChunkSlot { shared, pc, idx }
     }
+}
+
+/// 10.5 零进度接管：第 7 步延迟到被接管分块的任务结束、释放写入器之后再执行。
+pub(super) struct PendingChunk {
+    /// 被接管分块的数据库编号；主循环靠它的 `Completed` 结果判断何时启动。
+    pub(super) victim_db_index: i64,
+    pub(super) shared: Arc<ChunkShared>,
+    pub(super) init: ChunkInit,
+    /// 超过这个时刻仍未等到被接管分块结束 → 程序错误，任务失败。
+    pub(super) deadline: Instant,
+}
+
+/// 10.3 第 7 步（普通切分与延迟分配共用）：分配写器 → 注册进度 → 登记 acked
+/// → 记入 slots → 用新连接下载。
+pub(super) async fn launch_new_chunk(
+    spawner: &ChunkSpawner,
+    slots: &mut Vec<ChunkSlot>,
+    acked: &AckedList,
+    join_set: &mut JoinSet<Result<ChunkResult>>,
+    shared: Arc<ChunkShared>,
+    init: ChunkInit,
+) -> Result<()> {
+    let pc = spawner.open(&shared).await?;
+    let new_idx = spawner.progress.lock().await.add_chunk(init);
+    acked
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((init.db_index, Arc::clone(&shared.acked)));
+    slots.push(ChunkSlot::new(Arc::clone(&shared), pc.clone(), new_idx));
+    spawner.spawn(shared, pc, join_set, new_idx);
+    Ok(())
 }
 
 /// 10.3 第 1 步：在**能切分成功**的分块中，选预计剩余时间（剩余字节 / 最近速度）
@@ -353,13 +392,11 @@ fn select_victim(
             SplitMode::Half
         };
         // 2.1 第三部分第 1 条：先过滤再比较。只在该方式真的能切出合法切分点
-        // 时才参与比较；接管还要求 split > start（写器区间不能缩成空区间）。
-        let Some(split) = split_point(mode, *reserved, *end, min_split) else {
+        // 时才参与比较。Phase 2.2.1 起 `split == start` 也是合法的（零进度接管，
+        // 第 7 步走延迟分配），不再因为这个条件放弃候选。
+        let Some(_split) = split_point(mode, *reserved, *end, min_split) else {
             continue;
         };
-        if mode == SplitMode::Takeover && split <= shared[i].start {
-            continue;
-        }
         let effective_speed = if *speed > 0.0 {
             *speed
         } else if *fresh {
@@ -389,9 +426,10 @@ pub(super) async fn try_split(
     slots: &mut Vec<ChunkSlot>,
     acked: &AckedList,
     next_db_index: &mut i64,
-    min_split: u64,
     join_set: &mut JoinSet<Result<ChunkResult>>,
+    pending: &mut Vec<PendingChunk>,
 ) -> Result<bool> {
+    let min_split = spawner.min_split;
     // 第 1 步：选择被切分分块。只把共享状态交给选择器，写器句柄仍留在 slots 中
     // 供第 6 步 shrink_end 使用；这也让选择器可以直接用构造好的 ChunkShared 做单测。
     let shared: Vec<Arc<ChunkShared>> = slots.iter().map(|s| Arc::clone(&s.shared)).collect();
@@ -401,14 +439,11 @@ pub(super) async fn try_split(
 
     // 第 2、3 步：加锁读取 reserved 与 end，按 10.5 判定的方式计算切分点。
     // 对半切取剩余区间中点向下对齐 64 KiB，两段都不小于 min_split；
-    // 接管取 reserved 向上对齐 64 KiB，新分块至少 256 KiB。
+    // 接管取 reserved（不对齐），新分块至少 256 KiB。
     let (reserved, end) = slots[victim_i].shared.reserved_end();
     let Some(split) = split_point(mode, reserved, end, min_split) else {
         return Ok(false);
     };
-    if mode == SplitMode::Takeover && split <= slots[victim_i].shared.start {
-        return Ok(false);
-    }
 
     // 第 4 步：再次确认 reserved 与 split 的关系（10.5 接管放宽为 <=）；
     // 满足则把 end 改为 split，并通过 watch 唤醒等待中的分块任务。
@@ -436,6 +471,47 @@ pub(super) async fn try_split(
     }
     *next_db_index += 1;
 
+    // 切分事件计数与日志：事务提交后立刻记录，与第 7 步是否延迟无关。
+    {
+        let progress = spawner.progress.lock().await;
+        progress.add_split();
+        if mode == SplitMode::Takeover {
+            progress.add_takeover();
+        }
+    }
+    info!(
+        task_id = spawner.task_id,
+        victim = db_index,
+        split,
+        new_chunk = new_index,
+        mode = mode.as_str(),
+        deferred = needs_deferred_allocation(mode, split, slots[victim_i].shared.start),
+        speed_bps = speed as u64,
+        eta_secs = if eta.is_finite() { eta } else { -1.0 },
+        "chunk split"
+    );
+
+    let shared = Arc::new(ChunkShared::new(split, end, new_index));
+    let init = ChunkInit {
+        db_index: new_index,
+        start: split,
+        end,
+        parent: Some(db_index),
+        takeover: mode == SplitMode::Takeover,
+    };
+
+    // 10.5 零进度接管：split == start，原分块区间变为空，第 6 步不能 shrink_end
+    // （写器区间不能为空），第 7 步必须等原分块任务结束、release 写器之后再执行。
+    if needs_deferred_allocation(mode, split, slots[victim_i].shared.start) {
+        pending.push(PendingChunk {
+            victim_db_index: db_index,
+            shared,
+            init,
+            deadline: Instant::now() + Duration::from_secs(5),
+        });
+        return Ok(true);
+    }
+
     // 第 6 步：shrink_end。第 4 步已保证 reserved ≤ split，这一步必定成功；
     // 唯一可能的例外是被切分分块恰好在此之前已经读完并释放了写器——此时区间
     // [split, end) 从未被写过，跳过缩小是安全的。其他错误属于程序错误，任务失败。
@@ -451,39 +527,7 @@ pub(super) async fn try_split(
     }
 
     // 第 7 步：allocate_chunk(split, 原 end) → register → 用新连接下载。
-    let shared = Arc::new(ChunkShared::new(split, end, new_index));
-    let pc = spawner.open(&shared).await?;
-    let new_idx = spawner.progress.lock().await.add_chunk(ChunkInit {
-        db_index: new_index,
-        start: split,
-        end,
-        parent: Some(db_index),
-        takeover: mode == SplitMode::Takeover,
-    });
-    let progress = spawner.progress.lock().await;
-    progress.add_split();
-    if mode == SplitMode::Takeover {
-        progress.add_takeover();
-    }
-    drop(progress);
-    acked
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((new_index, Arc::clone(&shared.acked)));
-
-    info!(
-        task_id = spawner.task_id,
-        victim = db_index,
-        split,
-        new_chunk = new_index,
-        mode = mode.as_str(),
-        speed_bps = speed as u64,
-        eta_secs = if eta.is_finite() { eta } else { -1.0 },
-        "chunk split"
-    );
-
-    slots.push(ChunkSlot::new(Arc::clone(&shared), pc.clone(), new_idx));
-    spawner.spawn(shared, pc, join_set, new_idx);
+    launch_new_chunk(spawner, slots, acked, join_set, shared, init).await?;
     Ok(true)
 }
 
@@ -775,33 +819,97 @@ mod tests {
         Ok(())
     }
 
-    /// Phase 2.2 第三部分第 1 项：10.5 接管的切分点——向上对齐到 64 KiB、
-    /// 已对齐时等于 reserved、剩余不足 256 KiB 时放弃。
+    /// Phase 2.2.1 第四部分第 4 项：10.5 接管的切分点**等于** reserved，
+    /// 不对齐到 64 KiB；剩余不足 256 KiB 时放弃。
     #[test]
-    fn takeover_split_point_aligns_up_and_requires_minimum_remaining() -> T {
+    fn takeover_split_point_equals_reserved_and_requires_minimum_remaining() -> T {
         const REMAIN: u64 = TAKEOVER_MIN_REMAIN;
 
-        // 已对齐：split == reserved。
         assert_eq!(compute_takeover_point(0, 4 * MIB), Some(0));
         assert_eq!(compute_takeover_point(2 * MIB, 4 * MIB), Some(2 * MIB));
 
-        // 未对齐：向上对齐到 64 KiB。
-        assert_eq!(compute_takeover_point(1, 4 * MIB), Some(64 * KIB));
-        assert_eq!(compute_takeover_point(100 * KIB, 4 * MIB), Some(128 * KIB));
+        // 任意不对齐的 reserved（真实网络数据按任意大小到达）都原样返回。
+        assert_eq!(compute_takeover_point(1, 4 * MIB), Some(1));
+        assert_eq!(compute_takeover_point(100_000, 4 * MIB), Some(100_000));
         assert_eq!(
             compute_takeover_point(2 * MIB + 1, 4 * MIB),
-            Some(2 * MIB + 64 * KIB)
+            Some(2 * MIB + 1)
+        );
+        assert_eq!(
+            compute_takeover_point(63 * KIB, 4 * MIB),
+            Some(63 * KIB),
+            "64 KiB 以下也不得向上对齐"
         );
 
         // 剩余恰好 256 KiB 允许，少 1 字节放弃。
+        assert_eq!(
+            compute_takeover_point(100_000, 100_000 + REMAIN),
+            Some(100_000)
+        );
         assert_eq!(compute_takeover_point(0, REMAIN), Some(0));
         assert_eq!(compute_takeover_point(0, REMAIN - 1), None);
-        assert_eq!(
-            compute_takeover_point(64 * KIB, 64 * KIB + REMAIN - 1),
-            None
-        );
+        assert_eq!(compute_takeover_point(100_000, 100_000 + REMAIN - 1), None);
         // reserved 已经到达 end。
         assert_eq!(compute_takeover_point(4 * MIB, 4 * MIB), None);
+        Ok(())
+    }
+
+    /// Phase 2.2.1 第四部分第 4 项：`reserved == start` 的零进度分块能被
+    /// 选中接管，并且必须走延迟分配路径（split == start）。
+    #[test]
+    fn zero_progress_takeover_uses_deferred_allocation() -> T {
+        // 零进度、已卡住超过一个窗口：reserved == acked == start == 0。
+        let stuck = chunk(0, 8 * MIB, 0);
+        set_state(
+            &stuck,
+            0,
+            0,
+            Duration::from_secs(6),
+            false,
+            &stuck_samples(0),
+        );
+        let normal = chunk(8 * MIB, 16 * MIB, 1);
+        set_state(
+            &normal,
+            8 * MIB + MIB,
+            8 * MIB + MIB,
+            Duration::from_secs(1),
+            true,
+            &moving_samples(8 * MIB, MIB),
+        );
+
+        let (idx, _, _, mode) = select_victim(&[Arc::clone(&stuck), normal], MIB)
+            .ok_or("零进度、卡住的分块必须能被接管")?;
+        assert_eq!(idx, 0);
+        assert_eq!(mode, SplitMode::Takeover);
+        let (reserved, end) = stuck.reserved_end();
+        let split = split_point(mode, reserved, end, MIB).ok_or("应有合法切分点")?;
+        assert_eq!(split, 0);
+        assert!(
+            needs_deferred_allocation(mode, split, stuck.start),
+            "split == start 时必须延迟分配"
+        );
+        assert!(stuck.commit_split(split, end, true), "零进度接管应确认成功");
+        assert_eq!(stuck.end(), 0, "原分块区间应缩为空");
+
+        // 有进度的接管（不对齐）走立即分配。
+        let partial = chunk(0, 8 * MIB, 0);
+        set_state(
+            &partial,
+            100_000,
+            100_000,
+            Duration::from_secs(6),
+            true,
+            &stuck_samples(0),
+        );
+        let split = split_point(SplitMode::Takeover, 100_000, partial.end(), MIB)
+            .ok_or("应有合法切分点")?;
+        assert_eq!(split, 100_000);
+        assert!(!needs_deferred_allocation(
+            SplitMode::Takeover,
+            split,
+            partial.start
+        ));
         Ok(())
     }
 

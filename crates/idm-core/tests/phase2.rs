@@ -135,6 +135,9 @@ async fn run_download_ex(
 /// 切分出来的分块编号是递增分配的，空间上却夹在被切分分块的中间，因此这里
 /// 先按 `start` 排序，再校验相邻两段首尾相接（不变式只要求覆盖与不重叠，
 /// 不要求编号顺序等于空间顺序）。
+///
+/// Phase 2.2.1 起允许空区间 `[start, start)`：零进度接管把被接管分块的记录
+/// 缩成空区间。排序时按 `(start, end)`，空区间排在同起点的非空区间之前。
 async fn assert_chunks_partition(store: &Store, id: i64, total: u64) -> TestResult {
     let rec = store.get_task(id).await?;
     let mut ranges: Vec<(i64, u64, u64, u64)> = rec
@@ -142,15 +145,18 @@ async fn assert_chunks_partition(store: &Store, id: i64, total: u64) -> TestResu
         .iter()
         .map(|c| (c.chunk_index, c.start, c.end, c.committed))
         .collect();
-    ranges.sort_by_key(|r| r.1);
+    ranges.sort_by_key(|r| (r.1, r.2));
     let mut expected = 0u64;
     for (chunk_index, start, end, committed) in ranges {
         assert_eq!(
             start, expected,
             "分块 {chunk_index} 的 start 必须紧接上一段的 end"
         );
-        assert!(end > start, "分块 {chunk_index} 的区间为空");
-        assert!(committed <= end, "分块 {chunk_index} 的 committed 超过 end");
+        assert!(end >= start, "分块 {chunk_index} 的区间倒置");
+        assert!(
+            committed >= start && committed <= end,
+            "分块 {chunk_index} 的 committed 不在 [start, end] 内"
+        );
         expected = end;
     }
     assert_eq!(expected, total, "分块记录必须恰好覆盖 [0, total)");
@@ -268,7 +274,10 @@ async fn split_with_retries() -> TestResult {
     let run = run_download(
         ServerConfig {
             size,
-            speed: Some(speed::only_slow_at(0, 2 * MIB)),
+            // [0, 4 MiB) 前缀内的请求都慢：第 0 号分块重试后（起点变成 256 KiB）
+            // 仍然明显慢于第 1 号分块，保证"重试 + 切分"这个组合稳定复现，
+            // 不再依赖两个分块谁先完成的竞态。
+            speed: Some(speed::slow_in_prefix(4 * MIB, 2 * MIB)),
             // 前两个响应各写 256 KiB 就断开：触发重试。
             break_after_bytes: Some(256 * KIB),
             break_responses: Some(2),
@@ -284,8 +293,9 @@ async fn split_with_retries() -> TestResult {
     assert!(retries >= 1, "必须有分块发生重试，实际 {retries}");
     assert!(
         run.snap.split_count >= 1,
-        "重试之后仍然必须能切分，实际 {} 次",
-        run.snap.split_count
+        "重试之后仍然必须能切分，实际 {} 次: {:?}",
+        run.snap.split_count,
+        run.snap.chunks
     );
     Ok(())
 }
@@ -713,16 +723,24 @@ async fn resume_when_largest_split_chunk_already_completed() -> TestResult {
 // Phase 2.2 第三部分：卡住 / 极慢 / 退避期间被接管
 // ---------------------------------------------------------------------------
 
-/// 构造"第 0 号分块写出 256 KiB 后完全停住"的服务器：停住期间不发送任何数据，
-/// 也不主动关闭连接；只观察客户端是否提前关闭。返回服务器观察用的原子量。
-fn stall_cfg(size: u64, duration: Duration) -> (ServerConfig, Arc<AtomicBool>, Arc<AtomicU64>) {
+/// 构造"第 0 号分块写出 `after_bytes` 后完全停住"的服务器。
+/// `after_bytes == 0` 时连响应头都不发（零进度停顿）；`variable_blocks` 为真时
+/// 按 1~16 KiB 大小不一的块发送。停住期间不发送任何数据，也不主动关闭连接。
+fn stall_cfg(
+    size: u64,
+    duration: Duration,
+    after_bytes: u64,
+    variable_blocks: bool,
+) -> (ServerConfig, Arc<AtomicBool>, Arc<AtomicU64>) {
     let closed_early = Arc::new(AtomicBool::new(false));
     let close_after_ms = Arc::new(AtomicU64::new(u64::MAX));
     let cfg = ServerConfig {
         size,
         stall: Some(StallConfig {
-            after_bytes: 256 * KIB,
+            after_bytes,
             duration,
+            stall_used: Arc::new(AtomicBool::new(false)),
+            variable_blocks,
             closed_early: Arc::clone(&closed_early),
             close_after_ms: Arc::clone(&close_after_ms),
         }),
@@ -731,62 +749,121 @@ fn stall_cfg(size: u64, duration: Duration) -> (ServerConfig, Arc<AtomicBool>, A
     (cfg, closed_early, close_after_ms)
 }
 
-/// 停顿 20 秒（< 默认 30 秒 read_timeout，不会触发重试）。开启切分时，
-/// 卡住的分块在满一个速度窗口（4 秒）后被接管、被唤醒并以 Completed 退出，
-/// 客户端因此提前关闭那条连接；`--no-split` 必须等满 20 秒。
-#[tokio::test]
-async fn stalled_first_chunk_is_taken_over() -> TestResult {
-    let size = 8 * MIB;
-    let stall = Duration::from_secs(20);
-
-    let (cfg_split, closed_split, ms_split) = stall_cfg(size, stall);
-    let split = run_download(cfg_split, 2, true, "stall-takeover.bin").await?;
-    assert!(
-        split.snap.takeover_count >= 1,
-        "卡住的分块必须触发接管: {:?}",
-        split.snap.chunks
-    );
-    assert!(
-        split.elapsed < Duration::from_secs(5),
-        "开启切分时必须在 5 秒内完成，实际 {:?}",
-        split.elapsed
-    );
-    // 服务器端负责记录连接关闭；给它一点收尾调度时间。
+/// 等服务器把"客户端提前关闭连接"记录下来（收尾调度可能晚一个时间点）。
+async fn wait_for_close_record(closed: &Arc<AtomicBool>) -> bool {
     for _ in 0..50 {
-        if closed_split.load(Ordering::SeqCst) {
-            break;
+        if closed.load(Ordering::SeqCst) {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let closed_ms = ms_split.load(Ordering::SeqCst);
+    closed.load(Ordering::SeqCst)
+}
+
+/// 重新打开一次下载留下的数据库，校验 10.4 的分块不变式（允许空区间）。
+async fn assert_run_partition(run: &Run, size: u64) -> TestResult<(Arc<Store>, i64)> {
+    let store = Store::open(run._tmp.path().join("idm.db"))?;
+    let tasks = store.list_tasks().await?;
+    let id = tasks.first().ok_or("database has no task")?.id;
+    assert_chunks_partition(&store, id, size).await?;
+    Ok((store, id))
+}
+
+/// Phase 2.2.1 第四部分第 1 项：服务器按 1~16 KiB 大小不一的块先发 100000
+/// 字节（不是 64 KiB 的整数倍），然后停住 20 秒。接管切分点必须**等于**
+/// reserved（100000），原分块不留尾巴，5 秒内完成。
+#[tokio::test]
+async fn unaligned_stalled_first_chunk_is_taken_over() -> TestResult {
+    let size = 8 * MIB;
+    let stall = Duration::from_secs(20);
+    const SENT: u64 = 100_000;
+
+    let (cfg, closed, ms) = stall_cfg(size, stall, SENT, true);
+    let run = run_download(cfg, 2, true, "unaligned.bin").await?;
     assert!(
-        closed_split.load(Ordering::SeqCst),
-        "服务器必须观察到第 0 号分块的连接在 20 秒到期之前被客户端关闭"
+        run.snap.takeover_count >= 1,
+        "卡住的分块必须触发接管: {:?}",
+        run.snap.chunks
     );
+    assert!(
+        run.elapsed < Duration::from_secs(5),
+        "开启切分时必须在 5 秒内完成，实际 {:?}",
+        run.elapsed
+    );
+    let victim = run
+        .snap
+        .chunks
+        .iter()
+        .find(|c| c.db_index == 0)
+        .ok_or("missing chunk 0")?;
+    assert_eq!(
+        victim.end, SENT,
+        "接管切分点必须等于已接收字节数，不能向上对齐到 64 KiB"
+    );
+    assert!(
+        wait_for_close_record(&closed).await,
+        "服务器必须观察到连接被提前关闭"
+    );
+    let closed_ms = ms.load(Ordering::SeqCst);
+    assert!(
+        closed_ms < stall.as_millis() as u64,
+        "连接关闭时间 {closed_ms}ms 必须早于停住期满 {}ms",
+        stall.as_millis()
+    );
+    assert_run_partition(&run, size).await?;
+    println!(
+        "UNALIGNED split={:?} takeovers={} split_point={} client_close_after={}ms stall={:?}",
+        run.elapsed, run.snap.takeover_count, victim.end, closed_ms, stall
+    );
+    Ok(())
+}
+
+/// Phase 2.2.1 第四部分第 2 项：零进度停顿——服务器接受连接后 20 秒内不返回
+/// 任何响应头，也不关闭连接。接管把原分块缩成空区间，唤醒卡在 `req.send()`
+/// 的任务，延迟分配新分块的写入器；数据库允许存在空区间记录。
+#[tokio::test]
+async fn zero_progress_stalled_first_chunk_is_taken_over() -> TestResult {
+    let size = 8 * MIB;
+    let stall = Duration::from_secs(20);
+
+    let (cfg, closed, ms) = stall_cfg(size, stall, 0, false);
+    let run = run_download(cfg, 2, true, "zero-progress.bin").await?;
+    assert!(
+        run.snap.takeover_count >= 1,
+        "零进度分块必须触发接管: {:?}",
+        run.snap.chunks
+    );
+    assert!(
+        run.elapsed < Duration::from_secs(5),
+        "开启切分时必须在 5 秒内完成，实际 {:?}",
+        run.elapsed
+    );
+    assert!(
+        wait_for_close_record(&closed).await,
+        "服务器必须观察到连接被提前关闭"
+    );
+    let closed_ms = ms.load(Ordering::SeqCst);
     assert!(
         closed_ms < stall.as_millis() as u64,
         "连接关闭时间 {closed_ms}ms 必须早于停住期满 {}ms",
         stall.as_millis()
     );
 
-    let (cfg_no, closed_no, ms_no) = stall_cfg(size, stall);
-    let no_split = run_download(cfg_no, 2, false, "stall-nosplit.bin").await?;
-    assert_eq!(no_split.snap.split_count, 0, "--no-split 时不得切分");
+    let (store, id) = assert_run_partition(&run, size).await?;
+    let rec = store.get_task(id).await?;
     assert!(
-        no_split.elapsed >= stall,
-        "--no-split 必须等满 20 秒，实际 {:?}",
-        no_split.elapsed
+        rec.chunks.iter().any(|c| c.start == c.end),
+        "零进度接管必须留下空区间记录: {:?}",
+        rec.chunks
     );
     println!(
-        "STALL split={:?} takeovers={} no_split={:?} stall={:?} client_close_after={}ms no_split_closed_early={}",
-        split.elapsed,
-        split.snap.takeover_count,
-        no_split.elapsed,
-        stall,
+        "ZERO split={:?} takeovers={} chunks={} client_close_after={}ms stall={:?}",
+        run.elapsed,
+        run.snap.takeover_count,
+        rec.chunks.len(),
         closed_ms,
-        closed_no.load(Ordering::SeqCst)
+        stall
     );
-    let _ = ms_no;
     Ok(())
 }
 

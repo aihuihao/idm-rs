@@ -63,7 +63,16 @@ async fn completed_chunks_report_written_elapsed_speed_and_state() -> TestResult
     assert_eq!(outcome, DownloadOutcome::Completed);
 
     let snap = rx.borrow().clone();
-    assert_eq!(snap.chunks.len(), 8);
+    // Phase 2.2.1：动态切分（含对明显慢分块的接管）可能额外产生分块，
+    // 因此这里要求初始的 8 个分块都在，而不是恰好 8 个；其余断言
+    // （终态、耗时、速度、覆盖字节数、文件逐字节正确）保持不变。
+    assert!(
+        snap.chunks.len() >= 8,
+        "初始应有 8 个分块: split_count={} takeover_count={} chunks={:?}",
+        snap.split_count,
+        snap.takeover_count,
+        snap.chunks
+    );
     let mut written_total = 0u64;
     for c in &snap.chunks {
         assert_eq!(c.state, ChunkState::Done, "chunk ended in {:?}", c.state);

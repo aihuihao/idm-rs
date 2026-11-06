@@ -35,7 +35,7 @@ use crate::net::retry::{
 use crate::store::{ChunkRow, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
 use crate::task::cancel::{CancelSignal, wait_cancelled};
 use crate::task::progress::{ChunkInit, ProgressPublisher, ProgressSnapshot};
-use crate::task::split::{ChunkShared, ChunkSlot, try_split};
+use crate::task::split::{ChunkShared, ChunkSlot, PendingChunk, launch_new_chunk, try_split};
 use crate::task::state::{ChunkState, TaskState};
 
 /// 各分块的 `(chunk_index, acked 绝对位置)` 列表。
@@ -568,6 +568,7 @@ async fn run_download(
         max_retries: opts.config.max_retries,
         backoff_base: opts.config.retry_base_delay,
         backoff_cap: opts.config.retry_max_delay,
+        min_split: opts.config.min_split_size,
     };
 
     let mut join_set: JoinSet<Result<ChunkResult>> = JoinSet::new();
@@ -619,9 +620,13 @@ async fn run_download(
     split_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let max_concurrent = inits.len().max(1);
 
+    // 10.5 零进度接管：等待被接管分块释放写器之后才启动的新分块。
+    let mut pending: Vec<PendingChunk> = Vec::new();
+
     let mut outcome: Option<Result<DownloadOutcome>> = None;
     loop {
-        if join_set.is_empty() {
+        // pending 也占着一个连接名额，不能因为 join_set 暂时为空就收尾。
+        if join_set.is_empty() && pending.is_empty() {
             break;
         }
         tokio::select! {
@@ -631,20 +636,41 @@ async fn run_download(
                 break;
             }
             Some(joined) = join_set.join_next() => {
+                // 这个分块的写器在 run_chunk 返回之前已经 release。
+                let completed_db = match &joined {
+                    Ok(Ok(ChunkResult::Completed { db_index })) => Some(*db_index),
+                    _ => None,
+                };
                 match joined {
-                    Ok(Ok(ChunkResult::Completed)) => {
-                        // Phase 2：某个分块完成 → 这条连接空闲，尝试从"预计剩余时间最长"
-                        // 的分块那里把它的剩余区间后半段窃取过来。
+                    Ok(Ok(ChunkResult::Completed { .. })) => {
+                        // 先启动已就绪的延迟分块，再考虑新的切分；pending 也计入
+                        // 在途连接数，避免超过配置的连接上限。
+                        if let Err(e) = process_pending_chunks(
+                            &spawner,
+                            &mut slots,
+                            &acked,
+                            &mut join_set,
+                            &mut pending,
+                            completed_db,
+                            &tmp_path,
+                        )
+                        .await
+                        {
+                            internal.cancel();
+                            outcome = Some(Err(e));
+                            break;
+                        }
                         if opts.config.dynamic_split
                             && !streaming
+                            && join_set.len() + pending.len() < max_concurrent
                             && let Err(e) = try_split(
                                 ctx,
                                 &spawner,
                                 &mut slots,
                                 &acked,
                                 &mut next_db_index,
-                                opts.config.min_split_size,
                                 &mut join_set,
+                                &mut pending,
                             )
                             .await
                         {
@@ -677,19 +703,35 @@ async fn run_download(
                     }
                 }
             }
-            // 有空闲连接时定期重试切分（10.5：卡住/明显慢是随时间的判定）。
+            // 有空闲连接时定期重试切分（10.5：卡住/明显慢是随时间的判定），
+            // 同时检查延迟分配的 5 秒超时；两者都不阻塞主循环。
             _ = split_retry.tick() => {
+                if let Err(e) = process_pending_chunks(
+                    &spawner,
+                    &mut slots,
+                    &acked,
+                    &mut join_set,
+                    &mut pending,
+                    None,
+                    &tmp_path,
+                )
+                .await
+                {
+                    internal.cancel();
+                    outcome = Some(Err(e));
+                    break;
+                }
                 if opts.config.dynamic_split
                     && !streaming
-                    && join_set.len() < max_concurrent
+                    && join_set.len() + pending.len() < max_concurrent
                     && let Err(e) = try_split(
                         ctx,
                         &spawner,
                         &mut slots,
                         &acked,
                         &mut next_db_index,
-                        opts.config.min_split_size,
                         &mut join_set,
+                        &mut pending,
                     )
                     .await
                 {
@@ -920,6 +962,8 @@ pub(super) struct ChunkSpawner {
     max_retries: u32,
     backoff_base: Duration,
     backoff_cap: Duration,
+    /// 普通对半切的最小分块大小（放进启动器，避免 try_split 参数过多）。
+    pub(super) min_split: u64,
 }
 
 impl ChunkSpawner {
@@ -970,8 +1014,11 @@ impl ChunkSpawner {
 }
 
 /// 一个分块任务的最终结果。
+///
+/// `Completed` 带数据库编号：10.5 零进度接管的延迟分配需要知道"被接管分块"
+/// 的任务何时结束（它结束后才会 `release` 写器）。
 pub(super) enum ChunkResult {
-    Completed,
+    Completed { db_index: i64 },
     Cancelled,
 }
 
@@ -1079,7 +1126,9 @@ async fn run_chunk(job: ChunkJob, pc: PoolChunk) -> Result<ChunkResult> {
             cs = next_chunk_state(cs, ChunkState::Done);
             progress.lock().await.set_chunk_state(idx, cs);
             info!(task_id, chunk_id, start, end, received, "chunk finished");
-            Ok(ChunkResult::Completed)
+            Ok(ChunkResult::Completed {
+                db_index: chunk_id as i64,
+            })
         }
         Ok(ChunkExit::Cancelled) => {
             cs = next_chunk_state(cs, ChunkState::Cancelled);
@@ -1304,11 +1353,24 @@ async fn attempt_chunk_once(
         }
     }
 
-    // 等待响应头时同样监听取消。
-    let mut resp = tokio::select! {
-        biased;
-        _ = wait_cancelled(cancel_rx) => return Ok(ChunkExit::Cancelled),
-        r = req.send() => r.map_err(|e| Error::Http { url: url.to_string(), source: e })?,
+    // 10.5（Phase 2.2.1）：等待服务器返回响应头时同时监听取消与 end 缩小。
+    // 零进度接管的原分块正卡在这里；被唤醒且 acked == end 时丢弃本次请求
+    // （drop 掉 send future 即关闭连接），以 Completed 结束。
+    // send future 只创建一次，唤醒但尚未完成时可以继续等它，不会重发请求。
+    let mut send_fut = std::pin::pin!(req.send());
+    let mut resp = loop {
+        tokio::select! {
+            biased;
+            _ = wait_cancelled(cancel_rx) => return Ok(ChunkExit::Cancelled),
+            exit = wake_on_shrink(&mut end_rx, shared, acked_counter) => {
+                if let Some(exit) = exit {
+                    return Ok(exit);
+                }
+            }
+            r = &mut send_fut => {
+                break r.map_err(|e| Error::Http { url: url.to_string(), source: e })?;
+            }
+        }
     };
     // 429/503 的 Retry-After 必须在产生错误之前从响应头读取。
     let status = resp.status();
@@ -1560,6 +1622,39 @@ async fn cooperative_drain(set: &mut JoinSet<Result<ChunkResult>>) {
     }
 }
 
+/// 10.5 零进度接管的延迟第 7 步：被接管分块以 `Completed` 结束（写器已
+/// `release`）之后，立刻为新分块分配写器并启动连接。超过 5 秒仍未结束属于
+/// 程序错误。主循环在每次事件后调用本函数，**不等待、不阻塞**其它事件。
+async fn process_pending_chunks(
+    spawner: &ChunkSpawner,
+    slots: &mut Vec<ChunkSlot>,
+    acked: &AckedList,
+    join_set: &mut JoinSet<Result<ChunkResult>>,
+    pending: &mut Vec<PendingChunk>,
+    completed: Option<i64>,
+    tmp_path: &Path,
+) -> Result<()> {
+    let now = Instant::now();
+    let mut i = 0usize;
+    while i < pending.len() {
+        if completed == Some(pending[i].victim_db_index) {
+            let p = pending.remove(i);
+            launch_new_chunk(spawner, slots, acked, join_set, p.shared, p.init).await?;
+            continue;
+        }
+        if now >= pending[i].deadline {
+            return Err(Error::Io {
+                operation: "zero-progress takeover victim did not finish within 5s",
+                path: tmp_path.to_path_buf(),
+                offset: 0,
+                source: std::io::Error::other("takeover victim did not release its writer"),
+            });
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// 同步读取某个分块接收端的取消状态（`watch` 保存状态，不会漏掉）。
 fn rx_cancelled(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow()
@@ -1600,7 +1695,7 @@ mod tests {
         set.spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             flag.store(true, Ordering::SeqCst);
-            Ok(ChunkResult::Completed)
+            Ok(ChunkResult::Completed { db_index: 0 })
         });
         cooperative_drain(&mut set).await;
         assert!(exited.load(Ordering::SeqCst), "任务必须有机会正常退出");

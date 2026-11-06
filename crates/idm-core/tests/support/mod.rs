@@ -46,17 +46,23 @@ impl std::fmt::Debug for SpeedPolicy {
     }
 }
 
-/// Phase 2.2：让起点为 0 的响应"完全停住"（保持连接、不发送、不关闭）。
+/// Phase 2.2.1：让起点为 0 的第一个响应"完全停住"（保持连接、不发送、不关闭）。
 ///
-/// 真实服务器不会像 2.1 那样在新请求到达时放开连接：停住期间除了**读**对端是否
-/// 关闭，什么都不做；只有停满 `duration`（小于客户端 `read_timeout`）才继续发送
-/// 剩余数据。客户端若因接管而提前关闭连接，服务器把这次关闭记录下来。
+/// 真实服务器不会在新请求到达时放开连接：停住期间除了**读**对端是否关闭，
+/// 什么都不做；只有停满 `duration`（小于客户端 `read_timeout`）才继续发送。
+/// 客户端若因接管而提前关闭连接，服务器把这次关闭记录下来。
 #[derive(Debug, Clone)]
 pub struct StallConfig {
-    /// 相对响应起点发送这么多字节之后停住。
+    /// 相对响应起点发送这么多字节之后停住；`0` 表示连响应头都不发
+    /// （零进度停顿：客户端卡在 `req.send()`）。
     pub after_bytes: u64,
     /// 停住时长（必须小于客户端 `read_timeout`，例如 20s < 30s）。
     pub duration: Duration,
+    /// 只停住第一个起点为 0 的非 Probe 请求。零进度接管产生的新分块起点
+    /// 仍是 0，不能被再次停住；由服务器用这个标记保证。
+    pub stall_used: Arc<AtomicBool>,
+    /// 按 1~16 KiB 大小不一的块发送 `after_bytes`（使 reserved 不对齐 64 KiB）。
+    pub variable_blocks: bool,
     /// 服务器是否观察到客户端在停住期满之前就关闭了这条连接。
     pub closed_early: Arc<AtomicBool>,
     /// 从开始停住到检测到关闭的毫秒数；未提前关闭时保持 `u64::MAX`。
@@ -471,6 +477,25 @@ async fn handle_conn(
     }
     head.push_str("Content-Type: application/octet-stream\r\n");
     head.push_str("Connection: close\r\n\r\n");
+
+    // Phase 2.2.1：只对第一个起点为 0 的非 Probe 请求停住。零进度接管产生的
+    // 新分块起点仍是 0，不能被再次停住（否则会无限接管）。
+    let stall_this = if !is_probe && start == 0 {
+        cfg.stall
+            .as_ref()
+            .is_some_and(|s| !s.stall_used.swap(true, Ordering::SeqCst))
+    } else {
+        false
+    };
+
+    // 零进度停顿：连响应头都不发，客户端卡在 req.send()。
+    if stall_this
+        && let Some(st) = &cfg.stall
+        && st.after_bytes == 0
+        && wait_for_client_close(&mut sock, st).await?
+    {
+        return Ok(());
+    }
     sock.write_all(head.as_bytes()).await?;
 
     // Phase 2：统计服务器端同时在发送正文的响应数（最大并发请求数）。
@@ -486,38 +511,37 @@ async fn handle_conn(
     // 连接，让客户端观察到响应体被截断。
     let mut written = 0u64;
     let mut stalled = false;
-    let block = cfg.block.unwrap_or(BLOCK).max(1);
+    let fixed_block = cfg.block.unwrap_or(BLOCK).max(1);
+    let variable = cfg.stall.as_ref().is_some_and(|s| s.variable_blocks);
     while written < length {
-        // Phase 2.2：起点为 0 的响应写出 after_bytes 之后完全停住。停住期间绝不
-        // 发送任何数据，也不主动关闭连接；只读取对端，观察客户端是否提前关闭。
-        // 停满 duration（< read_timeout）后才继续发送剩余数据。
-        if let Some(st) = &cfg.stall
-            && !is_probe
-            && start == 0
+        // Phase 2.2.1：写出 after_bytes 之后完全停住。停住期间绝不发数据，
+        // 也不主动关闭连接；停满 duration（< read_timeout）才继续。
+        if stall_this
+            && let Some(st) = &cfg.stall
             && !stalled
+            && st.after_bytes > 0
             && written >= st.after_bytes
         {
             stalled = true;
-            let stall_started = Instant::now();
-            let mut probe = [0u8; 64];
-            let closed = tokio::time::timeout(st.duration, async {
-                loop {
-                    match sock.read(&mut probe).await {
-                        Ok(0) | Err(_) => return true,
-                        Ok(_) => continue, // 客户端不会在响应期间发数据
-                    }
-                }
-            })
-            .await;
-            if matches!(closed, Ok(true)) {
-                st.closed_early.store(true, Ordering::SeqCst);
-                st.close_after_ms
-                    .store(stall_started.elapsed().as_millis() as u64, Ordering::SeqCst);
-                // 对端已经关闭，本端也无需再发送；这不是"服务器主动关闭"。
+            if wait_for_client_close(&mut sock, st).await? {
                 return Ok(());
             }
         }
-        let n = ((length - written) as usize).min(block);
+        let mut block = fixed_block;
+        if variable {
+            // 确定性伪随机：1 KiB ~ 16 KiB 之间大小不一，保证 reserved 不对齐。
+            let h = (start ^ written).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33;
+            block = 1024 + (h % (16 * 1024 - 1024 + 1)) as usize;
+        }
+        let mut n = ((length - written) as usize).min(block);
+        // 恰好发送 after_bytes 字节之后才停住（不因块大小越过这个位置）。
+        if let Some(st) = &cfg.stall
+            && stall_this
+            && st.after_bytes > 0
+            && written < st.after_bytes
+        {
+            n = n.min((st.after_bytes - written) as usize);
+        }
         let mut buf = vec![0u8; n];
         fill_block(&mut buf, start + written);
         // 冻结模式：已写到 freeze_after 之后，静默停顿 freeze_duration 再关闭连接。
@@ -573,12 +597,47 @@ async fn handle_conn(
         }
         if let Some(bps) = speed_bps {
             // 按块限速：写完 n 字节后 sleep n/bps 秒。
+            // 限速等待期间若客户端已经关闭连接（例如 10.5 接管时主动 drop 响应），
+            // 立即结束本响应并注销并发计数——它已经不再是"正在下载"的分块，
+            // 否则服务器端峰值会短暂地把已断开的旧连接与新连接一起算进去。
             let secs = n as f64 / (bps.max(1) as f64);
-            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+            let mut probe = [0u8; 64];
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs_f64(secs)) => {}
+                // peek 不消费任何字节；只在读到 EOF/错误时判定客户端已断开。
+                r = sock.peek(&mut probe) => {
+                    if matches!(r, Ok(0) | Err(_)) {
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
     sock.flush().await?;
     Ok(())
+}
+
+/// 停住期间只读取对端：读到关闭（`Ok(0)` / 错误）就记录并让调用方结束；
+/// 停满 `duration` 则返回 `false`，由调用方继续发送响应。
+async fn wait_for_client_close(sock: &mut TcpStream, st: &StallConfig) -> std::io::Result<bool> {
+    let stall_started = Instant::now();
+    let mut probe = [0u8; 64];
+    let closed = tokio::time::timeout(st.duration, async {
+        loop {
+            match sock.read(&mut probe).await {
+                Ok(0) | Err(_) => return true,
+                Ok(_) => continue, // 客户端不会在响应期间发数据
+            }
+        }
+    })
+    .await;
+    if matches!(closed, Ok(true)) {
+        st.closed_early.store(true, Ordering::SeqCst);
+        st.close_after_ms
+            .store(stall_started.elapsed().as_millis() as u64, Ordering::SeqCst);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// 进入响应体发送阶段时登记并发，离开时（含提前返回）注销。
