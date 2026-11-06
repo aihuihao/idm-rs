@@ -120,8 +120,11 @@ untracked:  docs/prompts/phase2.md
 3. 第 11 项：扩展崩溃测试为「慢速分块 + 开启切分」场景（20 轮）。**进行中**
 4. **已完成**：`scripts/verify-workspace.ps1` 16 步全 PASS；自查表（每个测试单独 10 次、
    第 5/11 项各完整跑 1 次）写在 `docs/phase2-report.md`；提交 `phase2: dynamic splitting and work stealing`。
-5. 第五部分真实网络对比验收 → `docs/phase2-network-acceptance.md` → 提交 `phase2: real network acceptance`。
-   **待办**
+5. **已完成**：第五部分真实网络对比验收写在 `docs/phase2-network-acceptance.md`，
+   提交 `phase2: real network acceptance`。A（`--no-split`）349.66 s / 2267136 B/s；
+   B（开启切分）755.21 s / 1049680 B/s；两次 SHA256 都与官方一致、并发峰值 8、无残留。
+   B 未发生切分：分块数 = 连接数，链路公平分摊带宽，首个分块完成时其余剩余 ≈1.7 MB
+   < 2 × `min_split`，协议第 3 步正确放弃。下载文件已删除。
 
 ## 七、测试记录（本次对话实跑）
 
