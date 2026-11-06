@@ -559,6 +559,7 @@ async fn finalizing_resume_uses_conflict_name() -> TestResult {
                 start: 0,
                 end: size,
                 committed: size,
+                parent: None,
             }],
         )
         .await?;

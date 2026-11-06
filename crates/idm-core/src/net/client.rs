@@ -30,6 +30,10 @@ pub struct DownloadConfig {
     /// 退避封顶。默认 30 秒；叠加随机抖动后仍会被钳制到该上限，因此单次等待
     /// 永远不会超过该值。
     pub retry_max_delay: Duration,
+    /// 动态切分后两段各自的最小长度（Phase 2）。默认 1 MiB；小于该值时不得切分。
+    pub min_split_size: u64,
+    /// 是否启用动态切分与工作窃取（Phase 2）。默认开启；`--no-split` 关闭。
+    pub dynamic_split: bool,
 }
 
 impl Default for DownloadConfig {
@@ -44,6 +48,8 @@ impl Default for DownloadConfig {
             max_retries: 5,
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
+            min_split_size: 1024 * 1024,
+            dynamic_split: true,
         }
     }
 }

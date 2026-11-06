@@ -341,23 +341,28 @@ mod dl {
     }
 
     /// 生成每个分块的汇总表：编号、区间、已写入字节数、耗时、平均速度、最终状态、
-    /// 重试次数（Phase 1d）。下载成功、取消、失败都会输出（数据源是外部进度通道
-    /// 的最后一份快照）。
+    /// 重试次数（Phase 1d）、来源（Phase 2：初始分块 / 从第几号分块切出）。
+    /// 下载成功、取消、失败都会输出（数据源是外部进度通道的最后一份快照）。
     fn format_chunk_summary(snap: &ProgressSnapshot) -> String {
         let mut text = String::from(
-            "CHUNK SUMMARY: id | range | written | elapsed | avg_speed | state | retries",
+            "CHUNK SUMMARY: id | range | written | elapsed | avg_speed | state | retries | source",
         );
-        for (id, c) in snap.chunks.iter().enumerate() {
+        for c in snap.chunks.iter() {
+            let source = match c.parent {
+                Some(parent) => format!("split_from_{parent}"),
+                None => "initial".to_string(),
+            };
             text.push_str(&format!(
-                "\nCHUNK id={} range=[{}-{}] written={} elapsed={:.2}s avg_speed={:.0} B/s state={:?} retries={}",
-                id,
+                "\nCHUNK id={} range=[{}-{}] written={} elapsed={:.2}s avg_speed={:.0} B/s state={:?} retries={} source={}",
+                c.db_index,
                 c.start,
                 c.end.saturating_sub(1),
                 c.current.saturating_sub(c.start),
                 c.elapsed_secs,
                 c.avg_speed,
                 c.state,
-                c.retries
+                c.retries,
+                source
             ));
         }
         text
@@ -376,6 +381,8 @@ mod dl {
         let mut max_speed: Option<u64> = None;
         let mut max_retries: Option<u32> = None;
         let mut checkpoint_ms: Option<u64> = None;
+        // Phase 2：动态切分与工作窃取默认开启，`--no-split` 关闭。
+        let mut dynamic_split = true;
         // B5：`--strategy` 默认 Auto（卷支持稀疏文件则 Sparse，否则 SetLen）。
         let mut strategy = AllocationStrategy::Auto;
 
@@ -488,6 +495,10 @@ mod dl {
                         }
                     }
                 }
+                "--no-split" => {
+                    // Phase 2：关闭动态切分与工作窃取。
+                    dynamic_split = false;
+                }
                 "--log-file" | "--db" => {
                     i += 1;
                     if i >= args.len() {
@@ -558,6 +569,7 @@ mod dl {
         let config = DownloadConfig {
             connections,
             max_retries: max_retries.unwrap_or(5),
+            dynamic_split,
             ..DownloadConfig::default()
         };
         let client = match config.build_client() {
@@ -678,10 +690,11 @@ mod dl {
             0.0
         };
         println!(
-            "RESULT status={outcome:?} path={} size={size} elapsed={:.2}s avg_speed={avg_speed:.0} B/s chunks={} strategy={actual_strategy}",
+            "RESULT status={outcome:?} path={} size={size} elapsed={:.2}s avg_speed={avg_speed:.0} B/s chunks={} splits={} strategy={actual_strategy}",
             final_path.display(),
             elapsed.as_secs_f64(),
-            snap.chunks.len()
+            snap.chunks.len(),
+            snap.split_count
         );
 
         match outcome {
@@ -702,6 +715,8 @@ mod dl {
         let mut id: Option<i64> = None;
         let mut max_speed: Option<u64> = None;
         let mut max_retries: Option<u32> = None;
+        // Phase 2：续传默认允许动态切分，`--no-split` 关闭。
+        let mut dynamic_split = true;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -733,6 +748,9 @@ mod dl {
                         }
                     }
                 }
+                "--no-split" => {
+                    dynamic_split = false;
+                }
                 "--db" | "--log-file" => {
                     i += 1;
                     if i >= args.len() {
@@ -758,7 +776,7 @@ mod dl {
             Some(v) => v,
             None => {
                 eprintln!(
-                    "usage: idm-cli resume <id> [--max-speed 3M] [--db PATH] [--log-file PATH]"
+                    "usage: idm-cli resume <id> [--max-speed 3M] [--no-split] [--db PATH] [--log-file PATH]"
                 );
                 return 2;
             }
@@ -783,6 +801,7 @@ mod dl {
             config: DownloadConfig {
                 connections: (rec.connections as usize).clamp(1, 32),
                 max_retries: max_retries.unwrap_or(5),
+                dynamic_split,
                 ..DownloadConfig::default()
             },
             strategy,
@@ -820,11 +839,12 @@ mod dl {
             }
         };
         println!(
-            "RESULT status={outcome:?} task_id={id} total={:?} downloaded_this_run={} elapsed={:.2}s chunks={}",
+            "RESULT status={outcome:?} task_id={id} total={:?} downloaded_this_run={} elapsed={:.2}s chunks={} splits={}",
             rec.total_size,
             snap.downloaded,
             elapsed.as_secs_f64(),
-            snap.chunks.len()
+            snap.chunks.len(),
+            snap.split_count
         );
         match outcome {
             DownloadOutcome::Completed => 0,
@@ -957,6 +977,8 @@ mod dl {
         fn chunk_summary_contains_all_columns() {
             let snap = ProgressSnapshot {
                 chunks: vec![ChunkProgress {
+                    db_index: 0,
+                    parent: None,
                     start: 0,
                     current: 1024,
                     end: 1024,

@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -33,8 +34,15 @@ use crate::net::retry::{
 };
 use crate::store::{ChunkRow, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
 use crate::task::cancel::{CancelSignal, wait_cancelled};
-use crate::task::progress::{ProgressPublisher, ProgressSnapshot};
+use crate::task::progress::{ChunkInit, ProgressPublisher, ProgressSnapshot};
+use crate::task::split::{ChunkShared, ChunkSlot, try_split};
 use crate::task::state::{ChunkState, TaskState};
+
+/// 各分块的 `(chunk_index, acked 绝对位置)` 列表。
+///
+/// Phase 2 起分块会在运行中动态增加（切分），因此用 `Arc<Mutex<Vec<_>>>` 共享给
+/// 检查点任务与切分流程；锁内只做列表复制，锁外再做快照与 IO。
+pub(super) type AckedList = Arc<StdMutex<Vec<(i64, Arc<AtomicU64>)>>>;
 
 /// 检查点快照观察回调：参数是 (chunk_index, acked 绝对位置) 的快照 S。
 pub type SnapshotObserver = Arc<dyn Fn(&[(i64, u64)]) + Send + Sync>;
@@ -76,8 +84,20 @@ pub struct ResumePlan {
     pub total_size: u64,
     pub etag: Option<(String, bool)>,
     pub last_modified: Option<String>,
-    /// 每个数据库分块的 (原始 start, end, committed)。
-    pub chunks: Vec<(u64, u64, u64)>,
+    /// 数据库中的全部分块记录（Phase 2：含编号与来源；续传时可继续切分）。
+    pub chunks: Vec<ResumeChunk>,
+}
+
+/// 一条续传分块记录。
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeChunk {
+    /// 数据库中的 `chunk_index`。
+    pub index: i64,
+    pub start: u64,
+    pub end: u64,
+    pub committed: u64,
+    /// 来源：`None` = 初始分块，`Some(i)` = 从第 i 号分块切出。
+    pub parent: Option<i64>,
 }
 
 /// 持久化上下文。传 `None` 时 `download()` 的行为与 Phase 1b 完全一致。
@@ -210,7 +230,10 @@ struct DownloadRuntime {
     /// 外部取消 → 内部取消的转发任务。
     forward_task: Option<tokio::task::JoinHandle<()>>,
     /// 各分块的 acked 计数器（最终检查点的快照来源）。
-    acked: Vec<(i64, Arc<AtomicU64>)>,
+    ///
+    /// Phase 2 起分块会在运行中增加（动态切分），因此这里用 `Arc<Mutex<Vec<_>>>`
+    /// 共享给检查点任务：每次检查点只在锁内复制一份列表，锁外再做快照与 IO。
+    acked: AckedList,
     /// 进度发布器（收尾时发布最终快照）。
     progress: Option<Arc<Mutex<ProgressPublisher>>>,
     /// 返回给调用者的进度接收端。
@@ -276,125 +299,133 @@ async fn run_download(
 
     let cancelled_now = || cancel.is_some_and(|c| c.is_cancelled());
 
-    // 元组：(client, probe_result, final_path, tmp_path, target, ranges,
-    //       total_for_progress, streaming, db_indices)
+    // 元组：(client, probe_result, final_path, tmp_path, target, inits,
+    //       total_for_progress, streaming)
     // 续传时 Probe 比较已由 resume() 完成，直接复用既有 .idm-part；
     // 新建下载走原来的 Probe → 创建文件 → 静态分块流程。
-    let (
-        client,
-        probe_result,
-        final_path,
-        tmp_path,
-        target,
-        ranges,
-        total_for_progress,
-        streaming,
-        db_indices,
-    ) = if let Some(plan) = ctx.and_then(|c| c.resume.clone()) {
-        let client = opts.config.build_client()?;
-        let pr = ProbeResult {
-            final_url: plan.final_url,
-            total_size: Some(plan.total_size),
-            supports_range: true,
-            etag: plan.etag,
-            last_modified: plan.last_modified,
-            filename: plan.file_name.clone(),
-            content_type: None,
-        };
-        // 9.4 / D.4：打开已有 .idm-part 并校验长度。
-        let tf = match TargetFile::open_existing(&plan.tmp_path, plan.total_size) {
-            Ok(t) => t,
-            // 9.5：另一个进程持有可写句柄 → TaskInUse（数据库状态不变）。
-            Err(Error::Io { source, .. }) if crate::error::is_sharing_violation(&source) => {
-                return Err(Error::TaskInUse {
-                    id: ctx.map_or(0, |c| c.task_id),
-                });
-            }
-            Err(e) => return Err(e),
-        };
-        let mut rs = Vec::new();
-        let mut ids = Vec::new();
-        for (db_index, &(_, end, committed)) in plan.chunks.iter().enumerate() {
-            if committed < end {
-                // 本次起点就是 committed：Range 与 ChunkWriter 都从这里开始。
-                rs.push((committed, end));
-                ids.push(db_index as i64);
-            }
-        }
-        (
-            client,
-            pr,
-            plan.final_path,
-            plan.tmp_path,
-            tf,
-            rs,
-            Some(plan.total_size),
-            false,
-            ids,
-        )
-    } else {
-        // 文件名在 Probe 之前先由 --out / URL 推断；Probe 之后若拿到 Content-Disposition 再重算。
-        let pre_name = match &opts.out_name {
-            Some(n) => sanitize_windows_filename(n),
-            None => infer_filename(&url, None),
-        };
-        let mut fp = resolve_conflict(&opts.dir, &pre_name);
-        let mut tp = part_path(&fp);
-
-        // 路径 1：Probe 开始之前取消（此时还没有任何文件）。
-        if cancelled_now() {
-            return Ok(ExitKind::CancelledBeforeCreate);
-        }
-
-        let client = opts.config.build_client()?;
-        let probe = Probe::new(&client, &opts.config);
-        let pr = probe.probe(&url).await?;
-
-        // Probe 得到 Content-Disposition 后重算最终文件名（未显式指定 --out 时）。
-        if opts.out_name.is_none() {
-            fp = resolve_conflict(&opts.dir, &pr.filename);
-            tp = part_path(&fp);
-        }
-
-        // 测试钩子：Probe 成功之后、第一处取消检查之前触发外部取消（路径 2）。
-        if let Some(hook) = ctx.and_then(|c| c.hooks.after_probe.as_ref()) {
-            hook();
-        }
-
-        // 路径 2（两处）：Probe 完成、创建目标文件之前取消。
-        if cancelled_now() {
-            return Ok(ExitKind::CancelledBeforeCreate);
-        }
-        // 让出一次，使外部取消有机会在"建文件之前"被观察到（协作式，不创建空文件）。
-        tokio::task::yield_now().await;
-        if cancelled_now() {
-            return Ok(ExitKind::CancelledBeforeCreate);
-        }
-
-        // 选择模式：总长已知且支持 Range → 静态分块；否则单连接顺序（不预分配）。
-        let (tf, rs, total, stream) = if let (Some(total), true) =
-            (pr.total_size, pr.supports_range)
-            && total > 0
-        {
-            let tf = match TargetFile::create(&tp, total, opts.strategy, SpaceCheck::Enforce) {
+    let (client, probe_result, final_path, tmp_path, target, inits, total_for_progress, streaming) =
+        if let Some(plan) = ctx.and_then(|c| c.resume.clone()) {
+            let client = opts.config.build_client()?;
+            let pr = ProbeResult {
+                final_url: plan.final_url,
+                total_size: Some(plan.total_size),
+                supports_range: true,
+                etag: plan.etag,
+                last_modified: plan.last_modified,
+                filename: plan.file_name.clone(),
+                content_type: None,
+            };
+            // 9.4 / D.4：打开已有 .idm-part 并校验长度。
+            let tf = match TargetFile::open_existing(&plan.tmp_path, plan.total_size) {
                 Ok(t) => t,
-                // 路径 3：创建时磁盘满，文件尚未落盘，不留下任何文件。
-                Err(e) if e.is_disk_full() => {
-                    return Ok(ExitKind::DiskFullBeforeCreate);
+                // 9.5：另一个进程持有可写句柄 → TaskInUse（数据库状态不变）。
+                Err(Error::Io { source, .. }) if crate::error::is_sharing_violation(&source) => {
+                    return Err(Error::TaskInUse {
+                        id: ctx.map_or(0, |c| c.task_id),
+                    });
                 }
-                // 路径 4：创建出错 → 收尾统一写 Failed 并记录错误。
                 Err(e) => return Err(e),
             };
-            let rs = chunk_ranges(total, opts.config.connections, opts.config.min_chunk_size);
-            (tf, rs, Some(total), false)
+            // 续传读取**全部**分块记录：`committed < end` 的继续下载，并且仍可再切分。
+            let init: Vec<ChunkInit> = plan
+                .chunks
+                .iter()
+                .filter(|c| c.committed < c.end)
+                .map(|c| ChunkInit {
+                    db_index: c.index,
+                    start: c.committed,
+                    end: c.end,
+                    parent: c.parent,
+                })
+                .collect();
+            (
+                client,
+                pr,
+                plan.final_path,
+                plan.tmp_path,
+                tf,
+                init,
+                Some(plan.total_size),
+                false,
+            )
         } else {
-            // 顺序下载路径的 create 出错同样由收尾统一写 Failed。
-            let tf = TargetFile::create(&tp, 0, opts.strategy, SpaceCheck::Skip)?;
-            (tf, vec![(0, u64::MAX)], None, true)
+            // 文件名在 Probe 之前先由 --out / URL 推断；Probe 之后若拿到 Content-Disposition 再重算。
+            let pre_name = match &opts.out_name {
+                Some(n) => sanitize_windows_filename(n),
+                None => infer_filename(&url, None),
+            };
+            let mut fp = resolve_conflict(&opts.dir, &pre_name);
+            let mut tp = part_path(&fp);
+
+            // 路径 1：Probe 开始之前取消（此时还没有任何文件）。
+            if cancelled_now() {
+                return Ok(ExitKind::CancelledBeforeCreate);
+            }
+
+            let client = opts.config.build_client()?;
+            let probe = Probe::new(&client, &opts.config);
+            let pr = probe.probe(&url).await?;
+
+            // Probe 得到 Content-Disposition 后重算最终文件名（未显式指定 --out 时）。
+            if opts.out_name.is_none() {
+                fp = resolve_conflict(&opts.dir, &pr.filename);
+                tp = part_path(&fp);
+            }
+
+            // 测试钩子：Probe 成功之后、第一处取消检查之前触发外部取消（路径 2）。
+            if let Some(hook) = ctx.and_then(|c| c.hooks.after_probe.as_ref()) {
+                hook();
+            }
+
+            // 路径 2（两处）：Probe 完成、创建目标文件之前取消。
+            if cancelled_now() {
+                return Ok(ExitKind::CancelledBeforeCreate);
+            }
+            // 让出一次，使外部取消有机会在"建文件之前"被观察到（协作式，不创建空文件）。
+            tokio::task::yield_now().await;
+            if cancelled_now() {
+                return Ok(ExitKind::CancelledBeforeCreate);
+            }
+
+            // 选择模式：总长已知且支持 Range → 静态分块；否则单连接顺序（不预分配）。
+            let (tf, init, total, stream) = if let (Some(total), true) =
+                (pr.total_size, pr.supports_range)
+                && total > 0
+            {
+                let tf = match TargetFile::create(&tp, total, opts.strategy, SpaceCheck::Enforce) {
+                    Ok(t) => t,
+                    // 路径 3：创建时磁盘满，文件尚未落盘，不留下任何文件。
+                    Err(e) if e.is_disk_full() => {
+                        return Ok(ExitKind::DiskFullBeforeCreate);
+                    }
+                    // 路径 4：创建出错 → 收尾统一写 Failed 并记录错误。
+                    Err(e) => return Err(e),
+                };
+                let init: Vec<ChunkInit> =
+                    chunk_ranges(total, opts.config.connections, opts.config.min_chunk_size)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (start, end))| ChunkInit {
+                            db_index: i as i64,
+                            start,
+                            end,
+                            parent: None,
+                        })
+                        .collect();
+                (tf, init, Some(total), false)
+            } else {
+                // 顺序下载路径的 create 出错同样由收尾统一写 Failed。
+                let tf = TargetFile::create(&tp, 0, opts.strategy, SpaceCheck::Skip)?;
+                let init = vec![ChunkInit {
+                    db_index: 0,
+                    start: 0,
+                    end: u64::MAX,
+                    parent: None,
+                }];
+                (tf, init, None, true)
+            };
+            (client, pr, fp, tp, tf, init, total, stream)
         };
-        let ids: Vec<i64> = (0..rs.len() as i64).collect();
-        (client, pr, fp, tp, tf, rs, total, stream, ids)
-    };
 
     let target = Arc::new(target);
     rt.target = Some(Arc::clone(&target));
@@ -421,14 +452,14 @@ async fn run_download(
         };
         c.store.update_probe(c.task_id, info).await?;
         if c.resume.is_none() {
-            let rows: Vec<ChunkRow> = ranges
+            let rows: Vec<ChunkRow> = inits
                 .iter()
-                .enumerate()
-                .map(|(i, &(s, e))| ChunkRow {
-                    chunk_index: i as i64,
-                    start: s,
-                    end: e,
-                    committed: s,
+                .map(|c| ChunkRow {
+                    chunk_index: c.db_index,
+                    start: c.start,
+                    end: c.end,
+                    committed: c.start,
+                    parent: c.parent,
                 })
                 .collect();
             c.store.save_chunks(c.task_id, rows).await?;
@@ -452,7 +483,7 @@ async fn run_download(
     // 单连接顺序下载没有分块边界，明确标记为"不可续传"供 1c 使用。
     let (progress_pub, progress_rx) = ProgressPublisher::new(
         total_for_progress,
-        &ranges,
+        &inits,
         opts.progress_tx.clone(),
         !streaming,
     );
@@ -477,12 +508,8 @@ async fn run_download(
     }
 
     // acked：每个分块的绝对写入位置，只在 pool.write 成功返回后推进。
-    let acked: Vec<(i64, Arc<AtomicU64>)> = ranges
-        .iter()
-        .zip(db_indices.iter())
-        .map(|(&(start, _), &db_index)| (db_index, Arc::new(AtomicU64::new(start))))
-        .collect();
-    rt.acked = acked.clone();
+    let acked: AckedList = Arc::new(StdMutex::new(Vec::with_capacity(inits.len())));
+    rt.acked = Arc::clone(&acked);
 
     // 每个任务独立运行一个检查点循环（9.2：定时触发，默认每 2 秒）。
     // 用 oneshot 作为停止信号，收尾时先发信号再 await 任务真正结束。
@@ -499,7 +526,9 @@ async fn run_download(
                     biased;
                     _ = &mut stop_rx => break,
                     _ = ticker.tick() => {
-                        if let Err(e) = run_checkpoint(&c, &p, &t, &a).await {
+                        // 只在锁内复制列表（动态切分可能刚刚追加了分块），锁外做快照与 IO。
+                        let list = a.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        if let Err(e) = run_checkpoint(&c, &p, &t, &list).await {
                             warn!(error = %e, "checkpoint failed; database not updated");
                         }
                     }
@@ -514,37 +543,42 @@ async fn run_download(
         hook();
     }
 
+    let spawner = ChunkSpawner {
+        client: client.clone(),
+        url: download_url.clone(),
+        pool: Arc::clone(pool),
+        target: Arc::clone(&target),
+        progress: Arc::clone(&progress),
+        if_range: if_range.clone(),
+        verify_etag: verify_etag.clone(),
+        limiter: limiter.clone(),
+        cancel_rx: internal.subscribe(),
+        task_id,
+        streaming,
+        max_retries: opts.config.max_retries,
+        backoff_base: opts.config.retry_base_delay,
+        backoff_cap: opts.config.retry_max_delay,
+    };
+
     let mut join_set: JoinSet<Result<ChunkResult>> = JoinSet::new();
+    let mut slots: Vec<ChunkSlot> = Vec::with_capacity(inits.len());
+    let mut next_db_index: i64 = inits.iter().map(|c| c.db_index).max().map_or(0, |m| m + 1);
     let mut aborted_before_all_spawned = false;
-    for (idx, &(start, end)) in ranges.iter().enumerate() {
+    for (idx, init) in inits.iter().enumerate() {
         // 取消检查点 3：分块任务全部启动之前。
         if cancelled_now() {
             aborted_before_all_spawned = true;
             break;
         }
-        let job = ChunkJob {
-            client: client.clone(),
-            url: download_url.clone(),
-            pool: Arc::clone(pool),
-            target: Arc::clone(&target),
-            chunk_id: idx as u64,
-            start,
-            end,
-            if_range: if_range.clone(),
-            verify_etag: verify_etag.clone(),
-            progress: Arc::clone(&progress),
-            idx,
-            streaming,
-            cancel_rx: internal.subscribe(),
-            limiter: limiter.clone(),
-            task_id,
-            received: Arc::new(AtomicU64::new(0)),
-            acked: acked[idx].1.clone(),
-            max_retries: opts.config.max_retries,
-            backoff_base: opts.config.retry_base_delay,
-            backoff_cap: opts.config.retry_max_delay,
-        };
-        join_set.spawn(run_chunk(job));
+        let shared = Arc::new(ChunkShared::new(init.start, init.end, init.db_index));
+        // 写器在主流程分配并注册，主流程借此保留句柄做切分（10.3 第 6 步）。
+        let pc = spawner.open(&shared).await?;
+        acked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((init.db_index, Arc::clone(&shared.acked)));
+        slots.push(ChunkSlot::new(Arc::clone(&shared), pc.clone(), idx));
+        spawner.spawn(shared, pc, &mut join_set, idx);
         // 给外部取消一个插入点，使"分块全部启动之前取消"可被真实触发。
         tokio::task::yield_now().await;
     }
@@ -569,7 +603,27 @@ async fn run_download(
             }
             Some(joined) = join_set.join_next() => {
                 match joined {
-                    Ok(Ok(ChunkResult::Completed)) => {}
+                    Ok(Ok(ChunkResult::Completed)) => {
+                        // Phase 2：某个分块完成 → 这条连接空闲，尝试从"预计剩余时间最长"
+                        // 的分块那里把它的剩余区间后半段窃取过来。
+                        if opts.config.dynamic_split
+                            && !streaming
+                            && let Err(e) = try_split(
+                                ctx,
+                                &spawner,
+                                &mut slots,
+                                &acked,
+                                &mut next_db_index,
+                                opts.config.min_split_size,
+                                &mut join_set,
+                            )
+                            .await
+                        {
+                            internal.cancel();
+                            outcome = Some(Err(e));
+                            break;
+                        }
+                    }
                     Ok(Ok(ChunkResult::Cancelled)) => {}
                     Ok(Err(e)) => {
                         internal.cancel();
@@ -657,7 +711,8 @@ async fn finalize_download(
     //    第二部分：完成路径上必须成功，否则不得进入 Finalizing。
     if let Some(target) = rt.target.as_deref() {
         if let Some(c) = ctx {
-            if let Err(e) = run_checkpoint(c, pool, target, &rt.acked).await {
+            let list = rt.acked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Err(e) = run_checkpoint(c, pool, target, &list).await {
                 warn!(error = %e, "final checkpoint abandoned; committed not advanced");
                 if matches!(kind, ExitKind::ReadyToFinalize) {
                     kind = if e.is_disk_full() {
@@ -807,8 +862,77 @@ async fn purge_if_needed(pool: &DiskWriterPool, target: &TargetFile, task_id: u6
     }
 }
 
+/// 分块任务的可克隆启动器（Phase 2：分块可以在运行中动态增加）。
+///
+/// `task::split` 在切分新分块时需要使用 `pool` / `progress` / `task_id` 以及
+/// [`ChunkSpawner::open`] / [`ChunkSpawner::spawn`]，因此这些成员对 `task` 可见。
+#[derive(Clone)]
+pub(super) struct ChunkSpawner {
+    client: Client,
+    url: Url,
+    pub(super) pool: Arc<DiskWriterPool>,
+    target: Arc<TargetFile>,
+    pub(super) progress: Arc<Mutex<ProgressPublisher>>,
+    if_range: Option<String>,
+    verify_etag: Option<(String, bool)>,
+    limiter: Option<Arc<RateLimiter>>,
+    cancel_rx: watch::Receiver<bool>,
+    pub(super) task_id: u64,
+    streaming: bool,
+    max_retries: u32,
+    backoff_base: Duration,
+    backoff_cap: Duration,
+}
+
+impl ChunkSpawner {
+    /// 分配写器并注册到线程池。切分时必须**先** shrink 旧的、**再**分配新的，
+    /// 否则两个写器的区间会重叠。
+    pub(super) async fn open(&self, shared: &ChunkShared) -> Result<PoolChunk> {
+        let chunk_id = shared.db_index as u64;
+        let writer = if self.streaming {
+            self.target
+                .allocate_unbounded_chunk(chunk_id, shared.start)?
+        } else {
+            self.target
+                .allocate_chunk(chunk_id, shared.start, shared.end())?
+        };
+        self.pool.register(writer).await
+    }
+
+    /// 把分块任务投入 JoinSet。
+    pub(super) fn spawn(
+        &self,
+        shared: Arc<ChunkShared>,
+        pc: PoolChunk,
+        join_set: &mut JoinSet<Result<ChunkResult>>,
+        idx: usize,
+    ) {
+        let job = ChunkJob {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            pool: Arc::clone(&self.pool),
+            chunk_id: shared.db_index as u64,
+            shared: Arc::clone(&shared),
+            if_range: self.if_range.clone(),
+            verify_etag: self.verify_etag.clone(),
+            progress: Arc::clone(&self.progress),
+            idx,
+            streaming: self.streaming,
+            cancel_rx: self.cancel_rx.clone(),
+            limiter: self.limiter.clone(),
+            task_id: self.task_id,
+            received: Arc::new(AtomicU64::new(0)),
+            acked: Arc::clone(&shared.acked),
+            max_retries: self.max_retries,
+            backoff_base: self.backoff_base,
+            backoff_cap: self.backoff_cap,
+        };
+        join_set.spawn(run_chunk(job, pc));
+    }
+}
+
 /// 一个分块任务的最终结果。
-enum ChunkResult {
+pub(super) enum ChunkResult {
     Completed,
     Cancelled,
 }
@@ -824,10 +948,9 @@ struct ChunkJob {
     client: Client,
     url: Url,
     pool: Arc<DiskWriterPool>,
-    target: Arc<TargetFile>,
     chunk_id: u64,
-    start: u64,
-    end: u64,
+    /// 共享状态：起点不变，终点可能被切分缩小（Phase 2）。
+    shared: Arc<ChunkShared>,
     if_range: Option<String>,
     verify_etag: Option<(String, bool)>,
     progress: Arc<Mutex<ProgressPublisher>>,
@@ -845,12 +968,14 @@ struct ChunkJob {
     backoff_cap: Duration,
 }
 
-/// 单个分块的下载任务：注册写器 → 请求 → 读取 → 经池写入 → 统一 release。
-async fn run_chunk(job: ChunkJob) -> Result<ChunkResult> {
+/// 单个分块的下载任务：请求 → 读取 → 经池写入 → 统一 release。
+///
+/// 写器由 [`ChunkSpawner::open`] 提前分配并注册（主流程需要保留句柄做切分），
+/// 这里直接接收。
+async fn run_chunk(job: ChunkJob, pc: PoolChunk) -> Result<ChunkResult> {
     let task_id = job.task_id;
     let chunk_id = job.chunk_id;
-    let start = job.start;
-    let end = job.end;
+    let start = job.shared.start;
     let idx = job.idx;
     let streaming = job.streaming;
     let received_counter = job.received.clone();
@@ -861,23 +986,19 @@ async fn run_chunk(job: ChunkJob) -> Result<ChunkResult> {
         task_id,
         chunk_id,
         start,
-        end,
+        end = job.shared.end(),
         received = 0u64,
         "chunk started"
     );
 
-    // 总长未知的顺序下载使用无界区间；静态分块使用有界区间。
-    let writer = if streaming {
-        job.target.allocate_unbounded_chunk(chunk_id, start)?
-    } else {
-        job.target.allocate_chunk(chunk_id, start, end)?
-    };
-    let pc = pool.register(writer).await?;
     let mut cs = next_chunk_state(ChunkState::Pending, ChunkState::Downloading);
     progress.lock().await.set_chunk_state(idx, cs);
 
     let chunk_started = Instant::now();
+    let shared = Arc::clone(&job.shared);
     let inner = run_chunk_inner(job, &pc).await;
+    // 被切分时 end 已经缩小，收尾校验必须用最新的 end。
+    let end = shared.end();
     let elapsed_secs = chunk_started.elapsed().as_secs_f64();
     // 无论成功、失败还是取消，都统一 release，避免文件句柄在 worker 线程中残留。
     let released = pool.release(pc).await;
@@ -1067,7 +1188,7 @@ async fn attempt_chunk_once(
         url,
         pool,
         chunk_id,
-        end,
+        shared,
         if_range,
         verify_etag,
         progress,
@@ -1081,7 +1202,9 @@ async fn attempt_chunk_once(
     } = job;
     // 解构 `&ChunkJob`（match ergonomics）得到的是各字段的引用；
     // Copy 字段在此解引用，供后续直接使用。
-    let (chunk_id, end, idx, streaming, task_id) = (*chunk_id, *end, *idx, *streaming, *task_id);
+    let (chunk_id, idx, streaming, task_id) = (*chunk_id, *idx, *streaming, *task_id);
+    // 本次尝试的区间终点：可能已经被切分缩小（Phase 2）。
+    let end = shared.end();
     // 本函数沿用原实现的变量名：start 即本次尝试的起点 cur。
     let start = cur;
     let expected = end.saturating_sub(start);
@@ -1240,14 +1363,36 @@ async fn attempt_chunk_once(
             if rx_cancelled(cancel_rx) {
                 return Ok(ChunkExit::Cancelled);
             }
-            trace!(task_id, chunk_id, len, "chunk data");
-            pool.write(pc, bytes).await?;
+            // 10.2 第 1 步：锁内读取 end、预留可写长度，锁外写入。
+            let writable = shared.reserve(len);
+            if writable == 0 {
+                // 10.2 第 2 步：区间已被缩小到当前位置 → 丢弃剩余数据，主动关闭连接，
+                // 分块以"完成"结束（不再校验 received 是否等于 expected）。
+                trace!(
+                    task_id,
+                    chunk_id, "chunk range shrunk to current position; closing connection"
+                );
+                return Ok(ChunkExit::Completed);
+            }
+            // 10.2 第 3 步：只写入可写长度部分，超出 end 的数据截掉丢弃。
+            let data = if writable == len {
+                bytes
+            } else {
+                bytes.slice(..writable as usize)
+            };
+            trace!(task_id, chunk_id, len = writable, "chunk data");
+            if let Err(e) = pool.write(pc, data).await {
+                // 10.2 第 4 步：写入失败时把 reserved 退回到 acked，再按 1d 规则重试。
+                shared.rollback_reserved();
+                return Err(e.into());
+            }
             // 只有落盘线程池返回成功回执之后才推进 acked。
             // Release 与检查点快照的 Acquire 配对：保证检查点读到这个位置时，
             // pool.write 的成功回执（以及写入本身）已经完成，绝不把尚未落盘
             // 的数据记成 committed。
-            acked_counter.fetch_add(len, Ordering::Release);
-            received += len;
+            acked_counter.fetch_add(writable, Ordering::Release);
+            shared.record(start + received + writable);
+            received += writable;
             received_counter.store(start + received, Ordering::Relaxed);
             let mut p = progress.lock().await;
             p.set_chunk_current(idx, start + received);

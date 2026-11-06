@@ -31,6 +31,21 @@ pub enum RangeMode {
     BadContentRange,
 }
 
+/// 速度策略：(区间起点, 请求序号) → 字节/秒；返回 `None` 表示不限速。
+///
+/// Phase 2 用它构造"第 0 号分块很慢、其余很快"以及"每个请求速度随机"的服务器。
+pub type SpeedFn = Arc<dyn Fn(u64, u64) -> Option<u64> + Send + Sync>;
+
+/// 速度策略的 Debug 包装（函数指针无法 Debug）。
+#[derive(Clone)]
+pub struct SpeedPolicy(pub SpeedFn);
+
+impl std::fmt::Debug for SpeedPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<speed-policy>")
+    }
+}
+
 /// 服务器配置；所有字段都在请求处理中被读取。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -96,6 +111,12 @@ pub struct ServerConfig {
     pub last_modified: Option<String>,
     /// Probe 请求（Range: bytes=0-0）响应前的延迟。
     pub probe_delay: Option<Duration>,
+    /// 非 Probe 响应的速度策略（Phase 2）。
+    pub speed: Option<SpeedPolicy>,
+    /// 服务器端"当前正在发送正文的响应数"（Phase 2：验证最大并发连接数）。
+    pub active: Option<Arc<AtomicU64>>,
+    /// 服务器端并发峰值。
+    pub max_active: Option<Arc<AtomicU64>>,
 }
 
 impl Default for ServerConfig {
@@ -127,6 +148,9 @@ impl Default for ServerConfig {
             freeze_duration: None,
             last_modified: None,
             probe_delay: None,
+            speed: None,
+            active: None,
+            max_active: None,
         }
     }
 }
@@ -412,6 +436,15 @@ async fn handle_conn(
     head.push_str("Connection: close\r\n\r\n");
     sock.write_all(head.as_bytes()).await?;
 
+    // Phase 2：统计服务器端同时在发送正文的响应数（最大并发请求数）。
+    let _concurrency = ActiveGuard::enter(&cfg, !is_probe);
+    // Phase 2：本次响应的限速（字节/秒）。
+    let speed_bps = if is_probe {
+        None
+    } else {
+        cfg.speed.as_ref().and_then(|p| (p.0)(start, request_no))
+    };
+
     // 提前断开模式：Content-Length 仍声明完整长度，但写到 break_at 后直接关闭
     // 连接，让客户端观察到响应体被截断。
     let mut written = 0u64;
@@ -465,7 +498,41 @@ async fn handle_conn(
         if let Some(d) = cfg.chunk_delay {
             tokio::time::sleep(d).await;
         }
+        if let Some(bps) = speed_bps {
+            // 按块限速：写完 n 字节后 sleep n/bps 秒。
+            let secs = n as f64 / (bps.max(1) as f64);
+            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+        }
     }
     sock.flush().await?;
     Ok(())
+}
+
+/// 进入响应体发送阶段时登记并发，离开时（含提前返回）注销。
+struct ActiveGuard {
+    active: Option<Arc<AtomicU64>>,
+}
+
+impl ActiveGuard {
+    fn enter(cfg: &ServerConfig, counting: bool) -> Self {
+        if !counting {
+            return ActiveGuard { active: None };
+        }
+        let active = cfg.active.clone();
+        if let Some(a) = &active {
+            let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(m) = &cfg.max_active {
+                m.fetch_max(now, Ordering::SeqCst);
+            }
+        }
+        ActiveGuard { active }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if let Some(a) = &self.active {
+            a.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }

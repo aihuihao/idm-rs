@@ -301,6 +301,7 @@ async fn non_resumable_task_restarts_from_scratch() -> TestResult {
                 start: 0,
                 end: size,
                 committed: 0,
+                parent: None,
             }],
         )
         .await?;
@@ -464,6 +465,7 @@ async fn finalizing_fixture(
                 start: 0,
                 end: size,
                 committed,
+                parent: None,
             }],
         )
         .await?;

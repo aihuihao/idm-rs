@@ -9,9 +9,24 @@ use tokio::sync::watch;
 
 use crate::task::state::ChunkState;
 
+/// 一个分块的初始信息（Phase 2：新增数据库编号与来源）。
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkInit {
+    /// 数据库中的 `chunk_index`（汇总表里显示的编号）。
+    pub db_index: i64,
+    pub start: u64,
+    pub end: u64,
+    /// 来源：`None` 表示初始分块，`Some(i)` 表示从第 i 号分块切出。
+    pub parent: Option<i64>,
+}
+
 /// 单个分块的进度。
 #[derive(Debug, Clone, Default)]
 pub struct ChunkProgress {
+    /// 数据库中的 `chunk_index`；未关联数据库时为 0。
+    pub db_index: i64,
+    /// 来源：`None` = 初始分块，`Some(i)` = 从第 i 号分块切出。
+    pub parent: Option<i64>,
     pub start: u64,
     pub current: u64,
     pub end: u64,
@@ -36,6 +51,8 @@ pub struct ProgressSnapshot {
     /// 是否可断点续传：仅静态分块（总长已知且支持 Range）为 `true`；
     /// 总长未知/不支持 Range 的单连接顺序下载为 `false`（供 Phase 1c 使用）。
     pub resumable: bool,
+    /// 本次运行发生的动态切分次数（Phase 2）。
+    pub split_count: u64,
 }
 
 /// 进度发布器：内部持有共享快照与 `watch::Sender`，按 200ms 节流发布。
@@ -48,22 +65,24 @@ pub struct ProgressPublisher {
 }
 
 impl ProgressPublisher {
-    /// 创建发布器与接收端。`ranges` 为各分块的 (start, end)。
+    /// 创建发布器与接收端。`chunks` 为各分块的初始信息（含数据库编号与来源）。
     ///
     /// 传入 `tx` 时复用外部通道（调用方可在下载开始前就订阅进度，用于实时刷新）；
     /// 传 `None` 则内部创建通道。无论哪种，发布都按 200ms 节流，且没有读者也不阻塞。
     pub fn new(
         total_size: Option<u64>,
-        ranges: &[(u64, u64)],
+        chunks: &[ChunkInit],
         tx: Option<watch::Sender<ProgressSnapshot>>,
         resumable: bool,
     ) -> (Self, watch::Receiver<ProgressSnapshot>) {
-        let chunks = ranges
+        let chunks = chunks
             .iter()
-            .map(|&(start, end)| ChunkProgress {
-                start,
-                current: start,
-                end,
+            .map(|c| ChunkProgress {
+                db_index: c.db_index,
+                parent: c.parent,
+                start: c.start,
+                current: c.start,
+                end: c.end,
                 state: ChunkState::Pending,
                 elapsed_secs: 0.0,
                 avg_speed: 0.0,
@@ -76,6 +95,7 @@ impl ProgressPublisher {
             chunks,
             speed: 0.0,
             resumable,
+            split_count: 0,
         };
         let current = Arc::new(Mutex::new(snap.clone()));
         let (tx, rx) = match tx {
@@ -155,6 +175,44 @@ impl ProgressPublisher {
         {
             c.retries = retries;
         }
+    }
+
+    /// 追加一个切分出来的分块，返回它在快照中的下标（Phase 2）。
+    pub fn add_chunk(&self, init: ChunkInit) -> usize {
+        let mut snap = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        snap.chunks.push(ChunkProgress {
+            db_index: init.db_index,
+            parent: init.parent,
+            start: init.start,
+            current: init.start,
+            end: init.end,
+            state: ChunkState::Pending,
+            elapsed_secs: 0.0,
+            avg_speed: 0.0,
+            retries: 0,
+        });
+        snap.chunks.len() - 1
+    }
+
+    /// 更新某分块的区间终点（被切分后缩小，Phase 2）。
+    pub fn set_chunk_end(&self, idx: usize, end: u64) {
+        if let Some(c) = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chunks
+            .get_mut(idx)
+        {
+            c.end = end;
+        }
+    }
+
+    /// 切分次数加一（Phase 2）。
+    pub fn add_split(&self) {
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .split_count += 1;
     }
 
     /// 若距上次发布已超过 200ms 则发布一次。即使无人读取也不阻塞。

@@ -23,8 +23,8 @@ use crate::error::{Error, Result, is_sharing_violation};
 // 迁移：数组下标 i 对应 user_version = i + 1
 // ---------------------------------------------------------------------------
 
-/// 迁移脚本数组；本阶段为版本 1。
-pub const MIGRATIONS: &[&str] = &[MIGRATION_V1];
+/// 迁移脚本数组；当前为版本 2。
+pub const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
 
 /// 当前 schema 版本。
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -64,6 +64,14 @@ CREATE TABLE chunks (
     state        TEXT    NOT NULL DEFAULT 'Pending',
     PRIMARY KEY (task_id, chunk_index)
 );
+"#;
+
+/// 版本 2（Phase 2 动态切分）：分块记录增加来源列。
+///
+/// `parent_index` 为 `NULL` 表示初始划分出的分块；非 `NULL` 表示该分块是从
+/// 第 `parent_index` 号分块切出来的（工作窃取的产物）。
+const MIGRATION_V2: &str = r#"
+ALTER TABLE chunks ADD COLUMN parent_index INTEGER;
 "#;
 
 fn db_err(e: rusqlite::Error) -> Error {
@@ -214,6 +222,8 @@ pub struct ChunkRow {
     pub start: u64,
     pub end: u64,
     pub committed: u64,
+    /// 来源：`None` = 初始分块，`Some(i)` = 从第 i 号分块切出。
+    pub parent: Option<i64>,
 }
 
 /// 分块记录。
@@ -224,6 +234,7 @@ pub struct ChunkRecord {
     pub end: u64,
     pub committed: u64,
     pub state: String,
+    pub parent: Option<i64>,
 }
 
 /// 完整任务记录（含分块）。
@@ -308,6 +319,14 @@ enum Command {
     Checkpoint {
         id: i64,
         positions: Vec<(i64, u64)>,
+        reply: Reply<()>,
+    },
+    /// Phase 2 切分事务：同一事务内缩小被切分分块的 end 并插入新分块。
+    SplitChunk {
+        id: i64,
+        victim: i64,
+        split: u64,
+        new_index: i64,
         reply: Reply<()>,
     },
     UpdateState {
@@ -425,6 +444,26 @@ impl Store {
         self.call(|reply| Command::Checkpoint {
             id,
             positions,
+            reply,
+        })
+        .await
+    }
+
+    /// Phase 2 切分事务（ARCHITECTURE 10.3 第 5 步）：一个事务内把 `victim`
+    /// 分块的 end 改为 `split`，并插入 `[split, 原 end)` 的新分块，`committed = split`。
+    /// 事务提交成功后才允许为新区间发起网络请求。
+    pub async fn split_chunk(
+        &self,
+        id: i64,
+        victim: i64,
+        split: u64,
+        new_index: i64,
+    ) -> Result<()> {
+        self.call(|reply| Command::SplitChunk {
+            id,
+            victim,
+            split,
+            new_index,
             reply,
         })
         .await
@@ -551,6 +590,15 @@ fn handle_command(conn: &mut Connection, cmd: Command, fail: &AtomicBool) {
             };
             let _ = reply.send(res);
         }
+        Command::SplitChunk {
+            id,
+            victim,
+            split,
+            new_index,
+            reply,
+        } => {
+            let _ = reply.send(split_chunk(conn, id, victim, split, new_index));
+        }
         Command::UpdateState {
             id,
             state,
@@ -638,8 +686,8 @@ fn save_chunks(conn: &mut Connection, id: i64, chunks: Vec<ChunkRow>) -> Result<
     {
         let mut stmt = tx
             .prepare(
-                "INSERT INTO chunks (task_id, chunk_index, start, end, committed, state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'Pending')",
+                "INSERT INTO chunks (task_id, chunk_index, start, end, committed, state, parent_index) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'Pending', ?6)",
             )
             .map_err(db_err)?;
         for c in &chunks {
@@ -648,7 +696,8 @@ fn save_chunks(conn: &mut Connection, id: i64, chunks: Vec<ChunkRow>) -> Result<
                 c.chunk_index,
                 c.start as i64,
                 c.end as i64,
-                c.committed as i64
+                c.committed as i64,
+                c.parent
             ])
             .map_err(db_err)?;
         }
@@ -672,6 +721,62 @@ fn checkpoint(conn: &mut Connection, id: i64, positions: &[(i64, u64)]) -> Resul
                 .map_err(db_err)?;
         }
     }
+    tx.execute(
+        "UPDATE tasks SET updated_at=?2 WHERE id=?1",
+        params![id, now_text()],
+    )
+    .map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Phase 2 切分事务（10.3 第 5 步）：同一事务内缩小被切分分块并插入新分块。
+///
+/// 事务提交成功之前不得发起任何网络请求。被切分分块的 `committed` 必须 ≤ `split`，
+/// 否则说明调用方违反了 `committed ≤ end` 不变式，直接拒绝整个事务。
+fn split_chunk(
+    conn: &mut Connection,
+    id: i64,
+    victim: i64,
+    split: u64,
+    new_index: i64,
+) -> Result<()> {
+    let tx = conn.transaction().map_err(db_err)?;
+    let (start, old_end, committed): (i64, i64, i64) = tx
+        .query_row(
+            "SELECT start, end, committed FROM chunks WHERE task_id=?1 AND chunk_index=?2",
+            params![id, victim],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(db_err)?
+        .ok_or(Error::TaskNotFound { id })?;
+    let (start, old_end, committed) = (start as u64, old_end as u64, committed as u64);
+    if committed > split || split >= old_end || split < start {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "invalid split for chunk {victim}: split={split}, range=[{start}, {old_end}), committed={committed}"
+            ),
+        });
+    }
+    tx.execute(
+        "UPDATE chunks SET end=?3 WHERE task_id=?1 AND chunk_index=?2",
+        params![id, victim, split as i64],
+    )
+    .map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO chunks (task_id, chunk_index, start, end, committed, state, parent_index) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'Pending', ?6)",
+        params![
+            id,
+            new_index,
+            split as i64,
+            old_end as i64,
+            split as i64,
+            victim
+        ],
+    )
+    .map_err(db_err)?;
     tx.execute(
         "UPDATE tasks SET updated_at=?2 WHERE id=?1",
         params![id, now_text()],
@@ -723,7 +828,7 @@ fn set_final_name(conn: &Connection, id: i64, name: &str) -> Result<()> {
 fn query_chunks(conn: &Connection, id: i64) -> Result<Vec<ChunkRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT chunk_index, start, end, committed, state FROM chunks \
+            "SELECT chunk_index, start, end, committed, state, parent_index FROM chunks \
              WHERE task_id=?1 ORDER BY chunk_index",
         )
         .map_err(db_err)?;
@@ -735,6 +840,7 @@ fn query_chunks(conn: &Connection, id: i64) -> Result<Vec<ChunkRecord>> {
                 end: row.get::<_, i64>(2)? as u64,
                 committed: row.get::<_, i64>(3)? as u64,
                 state: row.get(4)?,
+                parent: row.get(5)?,
             })
         })
         .map_err(db_err)?

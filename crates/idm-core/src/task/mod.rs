@@ -4,6 +4,7 @@ pub mod cancel;
 pub mod download;
 pub mod progress;
 pub mod resume;
+mod split;
 pub mod state;
 
 pub use cancel::CancelSignal;

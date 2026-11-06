@@ -16,7 +16,9 @@ use crate::net::probe::Probe;
 use crate::store::{Store, TaskRecord, TaskStateDb};
 use crate::task::cancel::CancelSignal;
 use crate::task::download::download_with_store;
-use crate::task::download::{DownloadContext, DownloadOptions, DownloadOutcome, ResumePlan};
+use crate::task::download::{
+    DownloadContext, DownloadOptions, DownloadOutcome, ResumeChunk, ResumePlan,
+};
 use crate::task::progress::ProgressSnapshot;
 
 fn resume_err(message: impl Into<String>) -> Error {
@@ -139,10 +141,18 @@ pub async fn resume(
         total_size: total,
         etag: probe.etag.clone(),
         last_modified: probe.last_modified.clone(),
+        // 读取**全部**分块记录（含 Phase 2 切分出来的分块与来源），
+        // `committed < end` 的由下载流程继续下载，并且仍可再切分。
         chunks: rec
             .chunks
             .iter()
-            .map(|c| (c.start, c.end, c.committed))
+            .map(|c| ResumeChunk {
+                index: c.chunk_index,
+                start: c.start,
+                end: c.end,
+                committed: c.committed,
+                parent: c.parent,
+            })
             .collect(),
     };
     let mut ctx = DownloadContext::new(store, task_id);

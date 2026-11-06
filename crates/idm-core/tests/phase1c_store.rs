@@ -119,12 +119,14 @@ async fn checkpoint_committed_never_decreases() -> TestResult {
                 start: 0,
                 end: 1000,
                 committed: 0,
+                parent: None,
             },
             ChunkRow {
                 chunk_index: 1,
                 start: 1000,
                 end: 2000,
                 committed: 1000,
+                parent: None,
             },
         ],
     )
@@ -160,12 +162,14 @@ async fn checkpoint_transaction_failure_leaves_every_chunk_unchanged() -> TestRe
                 start: 0,
                 end: 1000,
                 committed: 0,
+                parent: None,
             },
             ChunkRow {
                 chunk_index: 1,
                 start: 1000,
                 end: 2000,
                 committed: 1000,
+                parent: None,
             },
         ],
     )
@@ -342,6 +346,7 @@ async fn make_finalizing_task(
                 start: 0,
                 end: size,
                 committed: size,
+                parent: None,
             }],
         )
         .await?;
