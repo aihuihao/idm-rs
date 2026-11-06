@@ -36,6 +36,9 @@ fn options(dir: &Path, out: &str) -> DownloadOptions {
     DownloadOptions {
         config: DownloadConfig {
             connections: 4,
+            // phase1c 的续传测试验证"失败后 resume"，需要失败确定地发生，
+            // 因此禁用重试（phase1d 测试覆盖默认重试行为）。
+            max_retries: 0,
             ..DownloadConfig::default()
         },
         strategy: AllocationStrategy::Sparse,

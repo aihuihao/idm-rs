@@ -279,25 +279,47 @@ mod dl {
     use tokio::sync::watch;
 
     /// 解析限速值：纯字节数，或带 `K`/`k`（1024）、`M`/`m`（1024*1024）后缀。
+    /// 支持小数写法（如 `1.5M`、`0.5K`），使用整数定点运算（不经 f64）：
+    /// 拆成整数部分与小数部分，用 `checked_mul`/`checked_add` 计算，溢出即报错。
+    /// 小数部分换算成字节后若不能整除，按**向下取整**处理（截断）。
     /// 格式非法、溢出或值为 0 时返回 `None`（调用方以退出码 2 报错）。
     fn parse_max_speed(raw: &str) -> Option<u64> {
         let s = raw.trim();
         if s.is_empty() {
             return None;
         }
-        let (digits, mult) = match s.as_bytes().last().copied()? {
+        let (body, mult) = match s.as_bytes().last().copied()? {
             b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
             b'M' | b'm' => (&s[..s.len() - 1], 1024 * 1024),
             _ => (s, 1u64),
         };
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        // 拆成整数部分与可选的小数部分（只允许一个小数点）。
+        let (int_part, frac_part) = match body.split_once('.') {
+            Some((i, f)) => (i, Some(f)),
+            None => (body, None),
+        };
+        if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        let n = digits.parse::<u64>().ok()?;
-        if n == 0 {
+        let int_val = int_part.parse::<u64>().ok()?;
+        let mut total = int_val.checked_mul(mult)?;
+        if let Some(frac) = frac_part {
+            // 小数部分必须全部是数字（允许为空，如 `1.`）。
+            if !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            if !frac.is_empty() {
+                let frac_val = frac.parse::<u64>().ok()?;
+                let scale = 10u64.checked_pow(frac.len() as u32)?;
+                // 小数 → 字节；不能整除时向下取整（checked_div 截断）。
+                let frac_bytes = frac_val.checked_mul(mult)?.checked_div(scale)?;
+                total = total.checked_add(frac_bytes)?;
+            }
+        }
+        if total == 0 {
             return None;
         }
-        n.checked_mul(mult)
+        Some(total)
     }
 
     fn print_progress(snap: &ProgressSnapshot) {
@@ -318,21 +340,24 @@ mod dl {
         );
     }
 
-    /// 生成每个分块的汇总表：编号、区间、已写入字节数、耗时、平均速度、最终状态。
-    /// 下载成功、取消、失败都会输出（数据源是外部进度通道的最后一份快照）。
+    /// 生成每个分块的汇总表：编号、区间、已写入字节数、耗时、平均速度、最终状态、
+    /// 重试次数（Phase 1d）。下载成功、取消、失败都会输出（数据源是外部进度通道
+    /// 的最后一份快照）。
     fn format_chunk_summary(snap: &ProgressSnapshot) -> String {
-        let mut text =
-            String::from("CHUNK SUMMARY: id | range | written | elapsed | avg_speed | state");
+        let mut text = String::from(
+            "CHUNK SUMMARY: id | range | written | elapsed | avg_speed | state | retries",
+        );
         for (id, c) in snap.chunks.iter().enumerate() {
             text.push_str(&format!(
-                "\nCHUNK id={} range=[{}-{}] written={} elapsed={:.2}s avg_speed={:.0} B/s state={:?}",
+                "\nCHUNK id={} range=[{}-{}] written={} elapsed={:.2}s avg_speed={:.0} B/s state={:?} retries={}",
                 id,
                 c.start,
                 c.end.saturating_sub(1),
                 c.current.saturating_sub(c.start),
                 c.elapsed_secs,
                 c.avg_speed,
-                c.state
+                c.state,
+                c.retries
             ));
         }
         text
@@ -349,6 +374,7 @@ mod dl {
         let mut out_name: Option<String> = None;
         let mut cancel_after: Option<u64> = None;
         let mut max_speed: Option<u64> = None;
+        let mut max_retries: Option<u32> = None;
         let mut checkpoint_ms: Option<u64> = None;
         // B5：`--strategy` 默认 Auto（卷支持稀疏文件则 Sparse，否则 SetLen）。
         let mut strategy = AllocationStrategy::Auto;
@@ -448,6 +474,20 @@ mod dl {
                         }
                     }
                 }
+                "--max-retries" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-retries");
+                        return 2;
+                    }
+                    match args[i].parse::<u32>() {
+                        Ok(v) => max_retries = Some(v),
+                        Err(_) => {
+                            eprintln!("--max-retries must be a non-negative integer");
+                            return 2;
+                        }
+                    }
+                }
                 "--log-file" | "--db" => {
                     i += 1;
                     if i >= args.len() {
@@ -517,6 +557,7 @@ mod dl {
 
         let config = DownloadConfig {
             connections,
+            max_retries: max_retries.unwrap_or(5),
             ..DownloadConfig::default()
         };
         let client = match config.build_client() {
@@ -660,6 +701,7 @@ mod dl {
     pub async fn run_resume(args: &[String], store: Arc<Store>) -> i32 {
         let mut id: Option<i64> = None;
         let mut max_speed: Option<u64> = None;
+        let mut max_retries: Option<u32> = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -673,6 +715,20 @@ mod dl {
                         Some(v) => max_speed = Some(v),
                         None => {
                             eprintln!("invalid --max-speed: {}", args[i]);
+                            return 2;
+                        }
+                    }
+                }
+                "--max-retries" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-retries");
+                        return 2;
+                    }
+                    match args[i].parse::<u32>() {
+                        Ok(v) => max_retries = Some(v),
+                        Err(_) => {
+                            eprintln!("--max-retries must be a non-negative integer");
                             return 2;
                         }
                     }
@@ -720,15 +776,19 @@ mod dl {
             "Sparse" => AllocationStrategy::Sparse,
             _ => AllocationStrategy::Auto,
         };
+        // 外部进度通道：参照 download 命令，在续传开始前就建好并传入，
+        // 以便成功或失败时都能读取最后一次快照并打印分块汇总表。
+        let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
         let opts = DownloadOptions {
             config: DownloadConfig {
                 connections: (rec.connections as usize).clamp(1, 32),
+                max_retries: max_retries.unwrap_or(5),
                 ..DownloadConfig::default()
             },
             strategy,
             dir: PathBuf::from(&rec.dir),
             out_name: None,
-            progress_tx: None,
+            progress_tx: Some(progress_tx.clone()),
             max_speed,
         };
         let pool = match DiskWriterPool::new(4, 16) {
@@ -748,16 +808,17 @@ mod dl {
         let started = Instant::now();
         let result = resume(id, Arc::clone(&store), pool, &opts, Some(signal.as_ref())).await;
         let elapsed = started.elapsed();
-        let (outcome, rx) = match result {
+        // 无论成功还是失败，都先读取最后一次进度快照并打印分块汇总表
+        // （参照 download 命令：续传期间网络失败时也必须看到 summary）。
+        let snap = progress_tx.subscribe().borrow().clone();
+        print_chunk_summary(&snap);
+        let (outcome, _rx) = match result {
             Ok(v) => v,
             Err(e) => {
                 crate::print_error("resume failed", &e);
                 return 1;
             }
         };
-        let snap = rx.borrow().clone();
-        // G.5：续传完成时同样打印分块汇总表。
-        print_chunk_summary(&snap);
         println!(
             "RESULT status={outcome:?} task_id={id} total={:?} downloaded_this_run={} elapsed={:.2}s chunks={}",
             rec.total_size,
@@ -902,6 +963,7 @@ mod dl {
                     state: ChunkState::Done,
                     elapsed_secs: 2.0,
                     avg_speed: 512.0,
+                    retries: 3,
                 }],
                 ..ProgressSnapshot::default()
             };
@@ -912,6 +974,7 @@ mod dl {
             assert!(text.contains("elapsed=2.00s"), "{text}");
             assert!(text.contains("avg_speed=512 B/s"), "{text}");
             assert!(text.contains("state=Done"), "{text}");
+            assert!(text.contains("retries=3"), "{text}");
         }
 
         #[test]
@@ -921,6 +984,10 @@ mod dl {
             assert_eq!(parse_max_speed("1m"), Some(1024 * 1024));
             assert_eq!(parse_max_speed("1048576"), Some(1048576));
             assert_eq!(parse_max_speed("1572864"), Some(1572864));
+            // 小数 K/M 字面量：整数定点解析。
+            assert_eq!(parse_max_speed("1.5M"), Some(1572864));
+            assert_eq!(parse_max_speed("0.5K"), Some(512));
+            assert_eq!(parse_max_speed("3.5M"), Some(3670016));
         }
 
         #[test]
@@ -930,10 +997,11 @@ mod dl {
                 "0",
                 "3G",
                 "-1",
-                "3.5M",
                 "M",
                 "1MB",
                 "abc",
+                ".5K",
+                "1.2.3M",
                 "999999999999999999999M",
             ] {
                 assert_eq!(parse_max_speed(bad), None, "should reject {bad:?}");

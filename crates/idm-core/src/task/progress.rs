@@ -21,6 +21,8 @@ pub struct ChunkProgress {
     pub elapsed_secs: f64,
     /// 分块平均写入速度（字节/秒）= 已写入字节数 / 耗时。
     pub avg_speed: f64,
+    /// 该分块已发生的重试次数（Phase 1d）。
+    pub retries: u64,
 }
 
 /// 全局进度快照。
@@ -65,6 +67,7 @@ impl ProgressPublisher {
                 state: ChunkState::Pending,
                 elapsed_secs: 0.0,
                 avg_speed: 0.0,
+                retries: 0,
             })
             .collect();
         let snap = ProgressSnapshot {
@@ -138,6 +141,19 @@ impl ProgressPublisher {
         {
             c.elapsed_secs = elapsed_secs;
             c.avg_speed = avg_speed;
+        }
+    }
+
+    /// 记录某分块的重试次数（Phase 1d，供分块汇总表使用）。
+    pub fn set_chunk_retries(&self, idx: usize, retries: u64) {
+        if let Some(c) = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chunks
+            .get_mut(idx)
+        {
+            c.retries = retries;
         }
     }
 

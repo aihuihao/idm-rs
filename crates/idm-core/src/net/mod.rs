@@ -5,6 +5,7 @@ pub mod filename;
 pub mod headers;
 pub mod probe;
 pub mod ratelimit;
+pub mod retry;
 
 pub use client::DownloadConfig;
 pub use filename::{infer_filename, resolve_conflict, sanitize_windows_filename};
@@ -13,3 +14,7 @@ pub use probe::{Probe, ProbeResult};
 pub use ratelimit::RateLimiter;
 /// 重导出 `reqwest::Url`，便于上层构造/校验 URL 而无需直接依赖 reqwest。
 pub use reqwest::Url;
+pub use retry::{
+    MAX_TOTAL_ATTEMPTS, PROGRESS_RESET_BYTES, XorShift64, backoff_delay, is_retryable,
+    is_retryable_status, parse_retry_after,
+};

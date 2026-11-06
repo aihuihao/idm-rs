@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use reqwest::header::{CONTENT_ENCODING, CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
+use reqwest::header::{CONTENT_ENCODING, CONTENT_RANGE, ETAG, IF_RANGE, RANGE, RETRY_AFTER};
 use reqwest::{Client, StatusCode, Url};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
@@ -27,6 +27,10 @@ use crate::net::client::DownloadConfig;
 use crate::net::filename::{infer_filename, resolve_conflict, sanitize_windows_filename};
 use crate::net::headers::parse_content_range;
 use crate::net::probe::{Probe, ProbeResult};
+use crate::net::retry::{
+    MAX_TOTAL_ATTEMPTS, PROGRESS_RESET_BYTES, XorShift64, backoff_delay, is_retryable,
+    parse_retry_after,
+};
 use crate::store::{ChunkRow, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
 use crate::task::cancel::{CancelSignal, wait_cancelled};
 use crate::task::progress::{ProgressPublisher, ProgressSnapshot};
@@ -523,6 +527,9 @@ async fn run_download(
             task_id,
             received: Arc::new(AtomicU64::new(0)),
             acked: acked[idx].1.clone(),
+            max_retries: opts.config.max_retries,
+            backoff_base: opts.config.retry_backoff_base,
+            backoff_cap: opts.config.retry_backoff_cap,
         };
         join_set.spawn(run_chunk(job));
         // 给外部取消一个插入点，使"分块全部启动之前取消"可被真实触发。
@@ -819,6 +826,10 @@ struct ChunkJob {
     received: Arc<AtomicU64>,
     /// 只在 pool.write 成功返回后推进的绝对写入位置（检查点快照来源）。
     acked: Arc<AtomicU64>,
+    /// 重试参数（Phase 1d）：连续失败上限与退避基准/封顶。
+    max_retries: u32,
+    backoff_base: Duration,
+    backoff_cap: Duration,
 }
 
 /// 单个分块的下载任务：注册写器 → 请求 → 读取 → 经池写入 → 统一 release。
@@ -913,34 +924,158 @@ async fn run_chunk(job: ChunkJob) -> Result<ChunkResult> {
     }
 }
 
-/// 分块主体：每一步网络读取与磁盘写入之前都检查取消。分块请求**不**设总时长超时
-/// （依赖 Client 级别的 `connect_timeout` 与 `read_timeout`），避免大分块在慢速网络下失败。
+/// 单次尝试的错误：携带 429/503 响应指定的 `Retry-After`（若有）。
+struct AttemptError {
+    error: Error,
+    retry_after: Option<Duration>,
+}
+
+impl From<Error> for AttemptError {
+    fn from(error: Error) -> Self {
+        AttemptError {
+            error,
+            retry_after: None,
+        }
+    }
+}
+
+/// 分块主体（Phase 1d 重试循环）：每一步网络读取与磁盘写入之前都检查取消。
+/// 分块请求**不**设总时长超时（依赖 Client 级别的 `connect_timeout` 与
+/// `read_timeout`），避免大分块在慢速网络下失败。
+///
+/// 出错后按 [`crate::net::retry::is_retryable`] 分类：可重试的错误从当前写入位置
+/// （acked，等于 ChunkWriter 的当前位置）重新发送 Range 请求直到区间终点；
+/// ChunkWriter 保持注册，不注销也不重新申请，绝不从分块起点重新下载。
+/// 退避为指数加 ±20% 抖动（默认 1s 起翻倍、封顶 30s）；429/503 优先采用
+/// `Retry-After`（上限 60s）。连续失败达 `max_retries`（单次写入 ≥1 MiB 清零）
+/// 或总尝试次数达 [`MAX_TOTAL_ATTEMPTS`] 后，以 [`Error::RetryExhausted`] 失败。
+/// 退避等待期间持续监听取消信号。限速器在重试间保持不变。
+/// 流式（总长未知）模式无法安全续传（服务器不支持 Range，重试只能从头下载），
+/// 这类任务本就标记为不可续传，因此禁用重试。
 async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
+    let mut cancel_rx = job.cancel_rx.clone();
+    // 流式模式：见上，禁用重试。
+    let max_retries = if job.streaming { 0 } else { job.max_retries };
+
+    let mut rng = XorShift64::from_now();
+    let mut consecutive_failures: u32 = 0;
+    let mut retries: u64 = 0;
+    let mut total_attempts: u32 = 0;
+
+    loop {
+        total_attempts += 1;
+        // 本次尝试起点：上次成功写入的位置（首次调用时等于分块 start；
+        // 续传/resume 场景由调用方保证 acked 初始值即起点）。
+        let cur = job.acked.load(Ordering::Acquire);
+        match attempt_chunk_once(&job, pc, cur, &mut cancel_rx).await {
+            Ok(ChunkExit::Completed) => return Ok(ChunkExit::Completed),
+            Ok(ChunkExit::Cancelled) => return Ok(ChunkExit::Cancelled),
+            Err(attempt) => {
+                // 错误发生时若外部已取消，按取消收尾（保留已写入的数据）。
+                if rx_cancelled(&cancel_rx) {
+                    return Ok(ChunkExit::Cancelled);
+                }
+                // 不可重试的错误（磁盘错误、RemoteChanged 等）原样返回。
+                if !is_retryable(&attempt.error) {
+                    return Err(attempt.error);
+                }
+                // 禁用重试（max_retries = 0，含 streaming 模式强制置 0）时，
+                // 首次错误原样返回，不包装成 RetryExhausted。
+                if max_retries == 0 {
+                    return Err(attempt.error);
+                }
+                // 单次尝试写入 ≥1 MiB → 清零连续失败计数（有实质进展）。
+                let wrote = job.acked.load(Ordering::Acquire).saturating_sub(cur);
+                if wrote >= PROGRESS_RESET_BYTES {
+                    consecutive_failures = 0;
+                }
+                if consecutive_failures >= max_retries || total_attempts >= MAX_TOTAL_ATTEMPTS {
+                    warn!(
+                        task_id = job.task_id,
+                        chunk_id = job.chunk_id,
+                        attempts = total_attempts,
+                        error = %attempt.error,
+                        "chunk retries exhausted"
+                    );
+                    return Err(Error::RetryExhausted {
+                        chunk_id: job.chunk_id,
+                        attempts: total_attempts,
+                        last_error: Box::new(attempt.error),
+                    });
+                }
+                // 429/503 且带 Retry-After → 按该值等待（解析时已封顶 60s）；
+                // 否则指数退避 + 抖动。
+                let wait = match attempt.retry_after {
+                    Some(d) => d,
+                    None => backoff_delay(
+                        consecutive_failures,
+                        job.backoff_base,
+                        job.backoff_cap,
+                        &mut rng,
+                    ),
+                };
+                let resume_from = job.acked.load(Ordering::Acquire);
+                warn!(
+                    task_id = job.task_id,
+                    chunk_id = job.chunk_id,
+                    attempt = total_attempts + 1,
+                    error = %attempt.error,
+                    wait_ms = wait.as_millis() as u64,
+                    resume_from,
+                    "chunk retry"
+                );
+                // 退避等待期间也要监听取消信号，收到后立即（远小于 1 秒）退出。
+                tokio::select! {
+                    biased;
+                    _ = wait_cancelled(&mut cancel_rx) => return Ok(ChunkExit::Cancelled),
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                consecutive_failures += 1;
+                retries += 1;
+                job.progress
+                    .lock()
+                    .await
+                    .set_chunk_retries(job.idx, retries);
+            }
+        }
+    }
+}
+
+/// 单次尝试：从 `cur` 到 `end` 发送一次 Range 请求并写盘。
+/// 每次尝试都带上与首次相同的 If-Range 与 ETag 校验规则。
+async fn attempt_chunk_once(
+    job: &ChunkJob,
+    pc: &PoolChunk,
+    cur: u64,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> std::result::Result<ChunkExit, AttemptError> {
     let ChunkJob {
         client,
         url,
         pool,
         chunk_id,
-        start,
         end,
         if_range,
         verify_etag,
         progress,
         idx,
         streaming,
-        mut cancel_rx,
         limiter,
         task_id,
         received: received_counter,
         acked: acked_counter,
-        target: _,
+        ..
     } = job;
+    // 解构 `&ChunkJob`（match ergonomics）得到的是各字段的引用；
+    // Copy 字段在此解引用，供后续直接使用。
+    let (chunk_id, end, idx, streaming, task_id) = (*chunk_id, *end, *idx, *streaming, *task_id);
+    // 本函数沿用原实现的变量名：start 即本次尝试的起点 cur。
+    let start = cur;
+    let expected = end.saturating_sub(start);
 
-    if rx_cancelled(&cancel_rx) {
+    if rx_cancelled(cancel_rx) {
         return Ok(ChunkExit::Cancelled);
     }
-
-    let expected = end.saturating_sub(start);
 
     // 流式（总长未知）模式不发送 Range；分块模式发送精确区间。
     let mut req = client.get(url.clone());
@@ -952,27 +1087,39 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
         };
         req = req.header(RANGE, range_hdr);
         if let Some(ir) = &if_range {
-            req = req.header(IF_RANGE, ir);
+            req = req.header(IF_RANGE, ir.clone());
         }
     }
 
     // 等待响应头时同样监听取消。
     let mut resp = tokio::select! {
         biased;
-        _ = wait_cancelled(&mut cancel_rx) => return Ok(ChunkExit::Cancelled),
+        _ = wait_cancelled(cancel_rx) => return Ok(ChunkExit::Cancelled),
         r = req.send() => r.map_err(|e| Error::Http { url: url.to_string(), source: e })?,
     };
-    resp.error_for_status_ref().map_err(|e| Error::Http {
-        url: url.to_string(),
-        source: e,
-    })?;
+    // 429/503 的 Retry-After 必须在产生错误之前从响应头读取。
     let status = resp.status();
+    let retry_after: Option<Duration> = if matches!(status.as_u16(), 429 | 503) {
+        resp.headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after)
+    } else {
+        None
+    };
+    resp.error_for_status_ref().map_err(|e| AttemptError {
+        error: Error::Http {
+            url: url.to_string(),
+            source: e,
+        },
+        retry_after,
+    })?;
 
     // 非 identity 的 Content-Encoding → 绝不把压缩字节当文件内容。
     if let Some(ce) = resp.headers().get(CONTENT_ENCODING) {
         let ce = ce.to_str().unwrap_or("").trim().to_ascii_lowercase();
         if ce != "identity" {
-            return Err(Error::UnsupportedContentEncoding { encoding: ce });
+            return Err(Error::UnsupportedContentEncoding { encoding: ce }.into());
         }
     }
 
@@ -994,7 +1141,8 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
                 return Err(Error::InvalidContentRange {
                     requested: (start, end),
                     actual: cr_val.to_string(),
-                });
+                }
+                .into());
             }
             // 弱 ETag 场景：未发 If-Range，需校验响应 ETag 与 Probe 时一致。
             if verify_etag.as_ref().map(|(_, w)| *w).unwrap_or(false)
@@ -1007,22 +1155,23 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
                     .map(str::trim);
                 match r_etag {
                     Some(r) if r == p_etag.0.trim() => {}
-                    _ => return Err(Error::RemoteChanged),
+                    _ => return Err(Error::RemoteChanged.into()),
                 }
             }
         }
         StatusCode::OK if streaming => {}
         StatusCode::OK if !streaming => {
             if if_range.is_some() {
-                return Err(Error::RemoteChanged);
+                return Err(Error::RemoteChanged.into());
             }
-            return Err(Error::RangeNotHonored);
+            return Err(Error::RangeNotHonored.into());
         }
         _ => {
             return Err(Error::InvalidContentRange {
                 requested: (start, end),
                 actual: status.to_string(),
-            });
+            }
+            .into());
         }
     }
 
@@ -1030,12 +1179,12 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
     let mut received: u64 = 0;
     loop {
         // 读网络之前检查取消。
-        if rx_cancelled(&cancel_rx) {
+        if rx_cancelled(cancel_rx) {
             return Ok(ChunkExit::Cancelled);
         }
         let bytes = tokio::select! {
             biased;
-            _ = wait_cancelled(&mut cancel_rx) => return Ok(ChunkExit::Cancelled),
+            _ = wait_cancelled(cancel_rx) => return Ok(ChunkExit::Cancelled),
             r = resp.chunk() => match r {
                 Ok(Some(b)) => b,
                 Ok(None) => break,
@@ -1043,14 +1192,14 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
                     // 读取空闲超时（read_timeout）属于超时相关错误，必须如实返回，
                     // 不能误判为"响应体被截断"。
                     if e.is_timeout() {
-                        return Err(Error::Http { url: url.to_string(), source: e });
+                        return Err(Error::Http { url: url.to_string(), source: e }.into());
                     }
                     // 响应体被中途截断时按"提前结束"处理，而不是笼统的 HTTP 错误。
                     if !streaming && received < expected {
-                        received_counter.store(received, Ordering::Relaxed);
-                        return Err(Error::UnexpectedEof { chunk_id, expected, received });
+                        received_counter.store(start + received, Ordering::Relaxed);
+                        return Err(Error::UnexpectedEof { chunk_id, expected, received }.into());
                     }
-                    return Err(Error::Http { url: url.to_string(), source: e });
+                    return Err(Error::Http { url: url.to_string(), source: e }.into());
                 }
             },
         };
@@ -1059,21 +1208,23 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
             return Err(Error::InvalidContentRange {
                 requested: (start, end),
                 actual: format!("received more than {expected} bytes"),
-            });
+            }
+            .into());
         }
         if len > 0 {
             // 限速：读到一块数据之后、交给写入线程池之前领取配额。等待被延后后，
             // TCP 接收窗口填满，服务器端随之放慢发送，从而真正限制网络流量。
             // acquire 与取消信号并列，等待令牌时也能立刻响应取消。
+            // 重试后继续使用同一个限速器。
             if let Some(rl) = &limiter {
                 tokio::select! {
                     biased;
-                    _ = wait_cancelled(&mut cancel_rx) => return Ok(ChunkExit::Cancelled),
+                    _ = wait_cancelled(cancel_rx) => return Ok(ChunkExit::Cancelled),
                     _ = rl.acquire(len) => {}
                 }
             }
             // 写磁盘之前检查取消。
-            if rx_cancelled(&cancel_rx) {
+            if rx_cancelled(cancel_rx) {
                 return Ok(ChunkExit::Cancelled);
             }
             trace!(task_id, chunk_id, len, "chunk data");
@@ -1084,15 +1235,15 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
             // 的数据记成 committed。
             acked_counter.fetch_add(len, Ordering::Release);
             received += len;
-            received_counter.store(received, Ordering::Relaxed);
+            received_counter.store(start + received, Ordering::Relaxed);
             let mut p = progress.lock().await;
             p.set_chunk_current(idx, start + received);
             p.publish_if_due();
         }
     }
-    received_counter.store(received, Ordering::Relaxed);
+    received_counter.store(start + received, Ordering::Relaxed);
 
-    if rx_cancelled(&cancel_rx) {
+    if rx_cancelled(cancel_rx) {
         return Ok(ChunkExit::Cancelled);
     }
     if !streaming && received != expected {
@@ -1100,7 +1251,8 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
             chunk_id,
             expected,
             received,
-        });
+        }
+        .into());
     }
     Ok(ChunkExit::Completed)
 }

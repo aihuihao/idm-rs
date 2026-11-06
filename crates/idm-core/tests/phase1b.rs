@@ -37,6 +37,9 @@ fn options(dir: &Path, connections: usize, min_chunk: u64, out: &str) -> Downloa
         config: DownloadConfig {
             connections,
             min_chunk_size: min_chunk,
+            // Phase 1b 测试固定禁用重试：它们验证的是单次尝试的错误语义与
+            // 错误类型的精确断言；默认开启的重试行为由 phase1d 测试覆盖。
+            max_retries: 0,
             ..DownloadConfig::default()
         },
         strategy: AllocationStrategy::Sparse,
@@ -51,10 +54,13 @@ fn part_path(dir: &Path, out: &str) -> PathBuf {
     dir.join(format!("{out}.idm-part"))
 }
 
-/// 用给定的 `DownloadConfig`（可定制超时）构造下载选项。
+/// 用给定的 `DownloadConfig`（可定制超时）构造下载选项。同样禁用重试。
 fn options_with(dir: &Path, cfg: DownloadConfig, out: &str) -> DownloadOptions {
     DownloadOptions {
-        config: cfg,
+        config: DownloadConfig {
+            max_retries: 0,
+            ..cfg
+        },
         strategy: AllocationStrategy::Sparse,
         dir: dir.to_path_buf(),
         out_name: Some(out.to_string()),

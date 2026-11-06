@@ -5,8 +5,8 @@
 //! 可模拟 B6 列出的全部服务器行为。
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,9 +53,32 @@ pub struct ServerConfig {
     pub redirect: bool,
     /// 写到该绝对字节位置后断开连接。
     pub break_at: Option<u64>,
-    /// 只对前 N 个非 Probe 响应生效（配合 `break_at`）；`None` 表示所有响应。
-    /// 用于"真实中途断开 → resume"测试：第一次下载断开，之后的续传不再断开。
+    /// 只对前 N 个非 Probe 响应生效（配合 `break_at` / `break_after_bytes`）；`None`
+    /// 表示所有响应。用于"真实中途断开 → resume"测试：第一次下载断开，之后的
+    /// 续传不再断开。
     pub break_responses: Option<u64>,
+    /// **相对**当前响应起点发送 N 字节后断开（Phase 1d 重试测试）：每次重试
+    /// 从新的起点开始，都会再收到 N 字节后断开，直到服务器停止断开。
+    pub break_after_bytes: Option<u64>,
+    /// **相对**当前响应起点发送 N 字节后静默停顿 `freeze_duration` 再关闭
+    /// （触发读取空闲超时）。受 `freeze_responses` 限制。
+    pub freeze_after_bytes: Option<u64>,
+    /// `freeze_after_bytes` / `freeze_after` 只对前 N 个非 Probe 响应生效；
+    /// `None` 表示所有响应（与旧 `freeze_after` 行为兼容）。
+    pub freeze_responses: Option<u64>,
+    /// 非 Probe 响应返回该状态码（Phase 1d：503+Retry-After、持续 500、404 等）。
+    pub error_status: Option<u16>,
+    /// 配合 `error_status` 的 `Retry-After` 头（秒）。
+    pub retry_after: Option<u64>,
+    /// 只对前 N 个非 Probe 响应返回 `error_status`；`None` 表示由
+    /// `error_switch` 运行期开关控制（未提供开关时对所有响应生效）。
+    pub error_responses: Option<u64>,
+    /// 运行期错误开关：置位时（且 `error_responses` 为 None）非 Probe 响应返回
+    /// `error_status`。测试可用它在"坏服务器 → 修复服务器"之间切换。
+    pub error_switch: Option<Arc<AtomicBool>>,
+    /// 收到的每个请求的 `Range` 头都会被 push 到这里（Phase 1d 测试 2：
+    /// 验证重试请求的起点等于断开前已写入的位置）。
+    pub range_sink: Option<Arc<Mutex<Vec<String>>>>,
     /// 每发送一块数据后的延迟（慢速但持续发送，用于验证空闲超时不会误杀）。
     pub chunk_delay: Option<Duration>,
     /// 写到该绝对字节位置后，静默停顿 `freeze_duration` 再关闭连接（用于触发读取空闲超时）。
@@ -81,6 +104,14 @@ impl Default for ServerConfig {
             redirect: false,
             break_at: None,
             break_responses: None,
+            break_after_bytes: None,
+            freeze_after_bytes: None,
+            freeze_responses: None,
+            error_status: None,
+            retry_after: None,
+            error_responses: None,
+            error_switch: None,
+            range_sink: None,
             chunk_delay: None,
             freeze_after: None,
             freeze_duration: None,
@@ -244,6 +275,22 @@ async fn handle_conn(
     } else {
         counter.fetch_add(1, Ordering::Relaxed) + 1
     };
+    // Phase 1d 测试 2：记录收到的 Range 头，供验证重试请求的起点。
+    if let Some(sink) = &cfg.range_sink {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(range_header.clone().unwrap_or_default());
+    }
+    // Phase 1d 错误状态模式：只作用于非 Probe 响应。
+    let should_error = if is_probe {
+        false
+    } else if let Some(n) = cfg.error_responses {
+        request_no <= n
+    } else {
+        cfg.error_switch
+            .as_ref()
+            .is_none_or(|s| s.load(Ordering::SeqCst))
+    };
     // 运行期开关（真实事件）或基于请求数的阈值，都会让 ETag / Last-Modified 变化。
     let changed = etag_switch.load(Ordering::SeqCst)
         || cfg
@@ -273,6 +320,17 @@ async fn handle_conn(
         && is_probe
     {
         tokio::time::sleep(d).await;
+    }
+
+    // Phase 1d 错误状态模式：返回配置的状态码（可带 Retry-After），不发送正文。
+    if should_error && let Some(code) = cfg.error_status {
+        let mut head = format!("HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n");
+        if let Some(ra) = cfg.retry_after {
+            head.push_str(&format!("Retry-After: {ra}\r\n"));
+        }
+        head.push_str("\r\n");
+        sock.write_all(head.as_bytes()).await?;
+        return Ok(());
     }
 
     let size = cfg.size;
@@ -353,7 +411,13 @@ async fn handle_conn(
         fill_block(&mut buf, start + written);
         // 冻结模式：已写到 freeze_after 之后，静默停顿 freeze_duration 再关闭连接。
         // 停顿期间客户端收不到任何字节，其 read_timeout 会先于本函数返回而触发超时错误。
-        if let Some(fa) = cfg.freeze_after {
+        let freeze_active =
+            !is_probe && cfg.freeze_responses.is_none_or(|limit| request_no <= limit);
+        let freeze_point = cfg
+            .freeze_after_bytes
+            .map(|n| start.saturating_add(n))
+            .or(cfg.freeze_after);
+        if let Some(fa) = freeze_point.filter(|_| freeze_active) {
             let abs = start + written;
             if abs >= fa {
                 if let Some(d) = cfg.freeze_duration {
@@ -370,7 +434,12 @@ async fn handle_conn(
         };
         // 提前断开：只写到 break_at 为止就关闭连接，保证 Content-Length 声明的
         // 长度无法被满足，客户端必须观察到响应体被截断。
-        if let Some(b) = cfg.break_at.filter(|_| break_active) {
+        let break_point = cfg
+            .break_after_bytes
+            .filter(|n| *n < length)
+            .map(|n| start.saturating_add(n))
+            .or(cfg.break_at);
+        if let Some(b) = break_point.filter(|_| break_active && !is_probe) {
             let abs = start + written;
             if abs >= b {
                 return Ok(());

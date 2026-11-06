@@ -120,6 +120,15 @@ pub enum Error {
     /// 任务不存在。
     #[error("task {id} not found")]
     TaskNotFound { id: i64 },
+    /// 分块重试耗尽：连续失败达到 `max_retries` 或总尝试次数达到硬上限。
+    /// `last_error` 为最后一次尝试的错误。
+    #[error("chunk {chunk_id} failed after {attempts} attempts; last error: {last_error}")]
+    RetryExhausted {
+        chunk_id: u64,
+        attempts: u32,
+        #[source]
+        last_error: Box<Error>,
+    },
     /// 任务的 `.idm-part` 正被另一个进程以可写方式占用（Windows 错误码 32
     /// ERROR_SHARING_VIOLATION），此时不得续传，也不得改动数据库状态。
     #[error("task {id} is in use by another process")]

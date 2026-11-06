@@ -46,6 +46,10 @@ impl Drop for Server {
 }
 
 fn handle_conn(mut sock: TcpStream, stop: &AtomicBool) -> std::io::Result<()> {
+    // Winsock 的 accept 会继承监听 socket 的非阻塞属性，若不显式改回阻塞，
+    // 请求头还没到达时 read_line 会立即 WouldBlock 并关闭连接，客户端只能看到
+    // "error sending request for url"（多轮连跑时的偶发失败即由此产生）。
+    sock.set_nonblocking(false)?;
     let mut reader = BufReader::new(sock.try_clone()?);
     let mut first = String::new();
     reader.read_line(&mut first)?;
@@ -219,26 +223,64 @@ fn one_round_attempt(bin: &str, seed: u64) -> TestResult<Option<u64>> {
     // 10% ~ 59% 的随机强杀目标；不同 seed 得到不同时机。
     let target = SIZE * (10 + (seed * 7 + 3) % 50) / 100;
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut deadline_hit = false;
     loop {
-        if committed_sum(&db) >= target || Instant::now() > deadline {
+        if committed_sum(&db) >= target {
+            break;
+        }
+        if Instant::now() > deadline {
+            deadline_hit = true;
             break;
         }
         thread::sleep(Duration::from_millis(20));
     }
+
+    // 在强杀之前先记录子进程是否已自然退出：高负载下轮询可能滞后，下载可能
+    // 已在我们动手前跑完。只有"自然且成功"的退出才是时序无效样本；自然退出但
+    // 非零说明是真实的下载失败，必须让测试失败。
+    match child.try_wait()? {
+        Some(status) if status.success() => {
+            println!("CRASH_RETRY seed={seed} reason=download_finished_before_kill");
+            return Ok(None);
+        }
+        Some(status) => {
+            return Err(format!(
+                "seed={seed}: download exited with {status} before kill (real failure, not a crash sample)"
+            )
+            .into());
+        }
+        None => {}
+    }
+
     // 强杀：不会执行任何收尾代码，也不发送取消信号。
     let _ = child.kill();
     let _ = child.wait();
 
+    // deadline 到点仍未达到 target：下载太慢或卡死，明确失败而不是静默跳过。
+    if deadline_hit {
+        let got = committed_sum(&db);
+        return Err(format!(
+            "seed={seed}: deadline reached before target progress (committed={got}, target={target}); download too slow to produce a crash sample"
+        )
+        .into());
+    }
+
     let part = dir.join("file.bin.idm-part");
     if !part.exists() {
-        // 高负载下轮询可能滞后，下载在强杀前已完成：不是有效的崩溃样本。
-        println!("CRASH_RETRY seed={seed} reason=download_finished_before_kill");
-        return Ok(None);
+        // 进程是被强杀的却没有留下 .idm-part：说明失败发生在建文件之前
+        // （连接失败 / Probe 失败等），这是真实错误，不能当作"下载已完成"。
+        return Err(format!(
+            "seed={seed}: process killed but no .idm-part exists; failure occurred before file creation"
+        )
+        .into());
     }
     let checked = verify_committed(&db, &part)?;
+    // 有效崩溃门禁：必须有部分进度，且远未完成。
     if checked == 0 || checked >= SIZE {
-        println!("CRASH_RETRY seed={seed} reason=no_partial_progress checked={checked}");
-        return Ok(None);
+        return Err(format!(
+            "seed={seed}: invalid committed range checked={checked} (expected 0 < checked < {SIZE})"
+        )
+        .into());
     }
 
     // 启动恢复由 CLI 在 resume 时自动执行；Downloading → Paused(Interrupted)。
@@ -246,17 +288,21 @@ fn one_round_attempt(bin: &str, seed: u64) -> TestResult<Option<u64>> {
         .args(["resume", "1", "--db", &db_str, "--max-speed", "3M"])
         .output()?;
     if !out.status.success() {
-        println!(
-            "CRASH_RETRY seed={seed} reason=resume_failed stderr={}",
+        return Err(format!(
+            "seed={seed}: resume failed; status={}; stdout={}; stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
-        );
-        return Ok(None);
+        )
+        .into());
     }
+    // 确认下载成功且最终文件逐字节正确，才算本轮有效。
     verify_final(&dir.join("file.bin"))?;
     Ok(Some(checked))
 }
 
-/// 取到一个有效的强杀样本；时序抖动导致的无效样本最多重试 6 次。
+/// 取到一个有效的强杀样本；仅当确认是"下载在强杀前自然完成"的时序无效样本时才
+/// 重试（最多 6 次）。真实错误（resume 失败、校验失败等）经 `?` 直接让测试失败。
 fn one_round(bin: &str, seed: u64) -> TestResult<u64> {
     for _ in 0..6 {
         if let Some(checked) = one_round_attempt(bin, seed)? {

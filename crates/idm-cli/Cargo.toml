@@ -14,6 +14,9 @@ tracing-subscriber = { workspace = true, features = ["registry"] }
 [dev-dependencies]
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
+# 复用 idm-core/tests/support 的测试服务器（`#[path]` 引入），需要 tokio 的
+# net / io-util 特性；这些特性只影响测试构建。
+tokio = { workspace = true, features = ["net", "io-util"] }
 
 [lints]
 workspace = true
