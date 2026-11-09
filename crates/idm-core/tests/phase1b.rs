@@ -38,6 +38,8 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn options(dir: &Path, connections: usize, min_chunk: u64, out: &str) -> DownloadOptions {
     DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         config: DownloadConfig {
             connections,
             min_chunk_size: min_chunk,
@@ -61,6 +63,8 @@ fn part_path(dir: &Path, out: &str) -> PathBuf {
 /// 用给定的 `DownloadConfig`（可定制超时）构造下载选项。同样禁用重试。
 fn options_with(dir: &Path, cfg: DownloadConfig, out: &str) -> DownloadOptions {
     DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         config: DownloadConfig {
             max_retries: 0,
             ..cfg
@@ -82,6 +86,8 @@ fn options_limited(
     max_speed: u64,
 ) -> DownloadOptions {
     DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         max_speed: Some(max_speed),
         ..options(dir, connections, min_chunk, out)
     }
@@ -767,6 +773,8 @@ async fn cancel_during_download() -> TestResult {
     let pool = Arc::new(DiskWriterPool::new(4, 16)?);
     let (progress_tx, mut progress_rx) = watch::channel(ProgressSnapshot::default());
     let opts = DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         progress_tx: Some(progress_tx),
         ..options(tmp.path(), 8, 64 * KIB, "cancel_mid.bin")
     };

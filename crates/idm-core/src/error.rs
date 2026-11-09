@@ -86,6 +86,12 @@ pub enum Error {
     /// 参数非法（如连接数超出 1..=32、URL scheme 不支持）。
     #[error("invalid argument: {message}")]
     InvalidArgument { message: String },
+    /// 代理 URL 格式非法或 scheme 不受支持（Phase 3a）。
+    #[error("invalid proxy URL {url:?}: {reason}")]
+    InvalidProxy { url: String, reason: String },
+    /// 等待共享资源许可时被取消信号打断（Phase 3a 按 Host 连接限制）。
+    #[error("operation cancelled while waiting for a shared permit")]
+    Cancelled,
     /// 响应携带非 `identity` 的 Content-Encoding，绝不能把压缩字节当作文件内容写盘。
     #[error("unsupported Content-Encoding: {encoding}")]
     UnsupportedContentEncoding { encoding: String },

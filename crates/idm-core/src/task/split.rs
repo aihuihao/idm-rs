@@ -260,10 +260,11 @@ pub(super) fn compute_takeover_point(reserved: u64, end: u64) -> Option<u64> {
     Some(split)
 }
 
-/// 10.5：`reserved == start` 的接管把原分块缩成空区间，写入器尚未释放，
-/// 因此第 7 步必须延迟到原分块任务结束之后。
-pub(super) fn needs_deferred_allocation(mode: SplitMode, split: u64, start: u64) -> bool {
-    mode == SplitMode::Takeover && split == start
+/// 10.5（Phase 3a 修订）：**所有**接管模式一律延迟第 7 步，等被接管分块以
+/// `Completed` 退出、关闭旧连接并释放写入器之后再启动新连接，确保任何时刻
+/// 活动连接数严格不超过上限（消除接管时瞬间的 `connections + 1` 重叠）。
+pub(super) fn needs_deferred_allocation(mode: SplitMode) -> bool {
+    mode == SplitMode::Takeover
 }
 
 /// 按方式计算切分点（10.3 第 2 步 / 10.5）。
@@ -485,7 +486,7 @@ pub(super) async fn try_split(
         split,
         new_chunk = new_index,
         mode = mode.as_str(),
-        deferred = needs_deferred_allocation(mode, split, slots[victim_i].shared.start),
+        deferred = needs_deferred_allocation(mode),
         speed_bps = speed as u64,
         eta_secs = if eta.is_finite() { eta } else { -1.0 },
         "chunk split"
@@ -500,22 +501,14 @@ pub(super) async fn try_split(
         takeover: mode == SplitMode::Takeover,
     };
 
-    // 10.5 零进度接管：split == start，原分块区间变为空，第 6 步不能 shrink_end
-    // （写器区间不能为空），第 7 步必须等原分块任务结束、release 写器之后再执行。
-    if needs_deferred_allocation(mode, split, slots[victim_i].shared.start) {
-        pending.push(PendingChunk {
-            victim_db_index: db_index,
-            shared,
-            init,
-            deadline: Instant::now() + Duration::from_secs(5),
-        });
-        return Ok(true);
-    }
-
     // 第 6 步：shrink_end。第 4 步已保证 reserved ≤ split，这一步必定成功；
     // 唯一可能的例外是被切分分块恰好在此之前已经读完并释放了写器——此时区间
     // [split, end) 从未被写过，跳过缩小是安全的。其他错误属于程序错误，任务失败。
-    if let Err(e) = spawner.pool.shrink_end(&slots[victim_i].pc, split).await {
+    // 零进度接管时 split == start（写器区间不能缩成空），必须跳过这一步，
+    // 原分块任务会在 watch 唤醒后自行 release 整个写入器。
+    if split > slots[victim_i].shared.start
+        && let Err(e) = spawner.pool.shrink_end(&slots[victim_i].pc, split).await
+    {
         if !matches!(e, Error::ChunkNotRegistered { .. }) {
             return Err(e);
         }
@@ -526,7 +519,20 @@ pub(super) async fn try_split(
         );
     }
 
-    // 第 7 步：allocate_chunk(split, 原 end) → register → 用新连接下载。
+    // 第 7 步：Phase 3a 起所有接管一律延迟——只登记 PendingChunk，等被接管分块
+    // 以 Completed 退出（旧连接已丢弃关闭、写器已 release）后由主循环启动。
+    // 对半切没有"旧连接需要关闭"的问题，仍然立即启动。
+    if needs_deferred_allocation(mode) {
+        pending.push(PendingChunk {
+            victim_db_index: db_index,
+            shared,
+            init,
+            deadline: Instant::now() + Duration::from_secs(5),
+        });
+        return Ok(true);
+    }
+
+    // 第 7 步（对半切）：allocate_chunk(split, 原 end) → register → 用新连接下载。
     launch_new_chunk(spawner, slots, acked, join_set, shared, init).await?;
     Ok(true)
 }
@@ -856,8 +862,9 @@ mod tests {
 
     /// Phase 2.2.1 第四部分第 4 项：`reserved == start` 的零进度分块能被
     /// 选中接管，并且必须走延迟分配路径（split == start）。
+    /// Phase 3a：所有接管（含 reserved > start）一律走延迟分配；对半切不延迟。
     #[test]
-    fn zero_progress_takeover_uses_deferred_allocation() -> T {
+    fn all_takeovers_use_deferred_allocation() -> T {
         // 零进度、已卡住超过一个窗口：reserved == acked == start == 0。
         let stuck = chunk(0, 8 * MIB, 0);
         set_state(
@@ -886,13 +893,13 @@ mod tests {
         let split = split_point(mode, reserved, end, MIB).ok_or("应有合法切分点")?;
         assert_eq!(split, 0);
         assert!(
-            needs_deferred_allocation(mode, split, stuck.start),
+            needs_deferred_allocation(mode),
             "split == start 时必须延迟分配"
         );
         assert!(stuck.commit_split(split, end, true), "零进度接管应确认成功");
         assert_eq!(stuck.end(), 0, "原分块区间应缩为空");
 
-        // 有进度的接管（不对齐）走立即分配。
+        // Phase 3a：有进度的接管（不对齐）也必须延迟分配，消除 +1 连接重叠。
         let partial = chunk(0, 8 * MIB, 0);
         set_state(
             &partial,
@@ -905,11 +912,8 @@ mod tests {
         let split = split_point(SplitMode::Takeover, 100_000, partial.end(), MIB)
             .ok_or("应有合法切分点")?;
         assert_eq!(split, 100_000);
-        assert!(!needs_deferred_allocation(
-            SplitMode::Takeover,
-            split,
-            partial.start
-        ));
+        assert!(needs_deferred_allocation(SplitMode::Takeover));
+        assert!(!needs_deferred_allocation(SplitMode::Half));
         Ok(())
     }
 

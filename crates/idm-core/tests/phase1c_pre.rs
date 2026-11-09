@@ -24,6 +24,8 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn options(dir: &Path, out: &str) -> DownloadOptions {
     DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         config: DownloadConfig {
             connections: 8,
             ..DownloadConfig::default()

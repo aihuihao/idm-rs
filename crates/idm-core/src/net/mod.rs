@@ -3,15 +3,20 @@
 pub mod client;
 pub mod filename;
 pub mod headers;
+pub mod host_limit;
 pub mod probe;
 pub mod ratelimit;
 pub mod retry;
 
-pub use client::DownloadConfig;
+pub use client::{DownloadConfig, ProxyConfig};
 pub use filename::{infer_filename, resolve_conflict, sanitize_windows_filename};
 pub use headers::{ContentRange, HeaderParseError, parse_content_disposition, parse_content_range};
+pub use host_limit::{
+    DEFAULT_MAX_PER_HOST, HostConnectionLimiter, HostKey, HostPermit, MAX_PER_HOST_CEILING,
+    host_key,
+};
 pub use probe::{Probe, ProbeResult};
-pub use ratelimit::RateLimiter;
+pub use ratelimit::{BandwidthLimiter, RateLimiter};
 /// 重导出 `reqwest::Url`，便于上层构造/校验 URL 而无需直接依赖 reqwest。
 pub use reqwest::Url;
 pub use retry::{

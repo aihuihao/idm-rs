@@ -52,6 +52,8 @@ fn options(
     max_speed: Option<u64>,
 ) -> DownloadOptions {
     DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         config,
         strategy: AllocationStrategy::Sparse,
         dir: dir.to_path_buf(),

@@ -32,6 +32,8 @@ const MIB: u64 = 1024 * 1024;
 
 fn options(dir: &Path, cfg: DownloadConfig, out: &str) -> DownloadOptions {
     DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         config: cfg,
         strategy: AllocationStrategy::Sparse,
         dir: dir.to_path_buf(),

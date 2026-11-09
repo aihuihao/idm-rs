@@ -23,7 +23,6 @@ use tracing::{info, trace, warn};
 use crate::disk::win32;
 use crate::disk::{AllocationStrategy, DiskWriterPool, PoolChunk, SpaceCheck, TargetFile};
 use crate::error::{Error, Result};
-use crate::net::RateLimiter;
 use crate::net::client::DownloadConfig;
 use crate::net::filename::{infer_filename, resolve_conflict, sanitize_windows_filename};
 use crate::net::headers::parse_content_range;
@@ -32,6 +31,7 @@ use crate::net::retry::{
     MAX_TOTAL_ATTEMPTS, PROGRESS_RESET_BYTES, XorShift64, backoff_delay, is_retryable,
     parse_retry_after,
 };
+use crate::net::{BandwidthLimiter, HostConnectionLimiter, RateLimiter};
 use crate::store::{ChunkRow, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
 use crate::task::cancel::{CancelSignal, wait_cancelled};
 use crate::task::progress::{ChunkInit, ProgressPublisher, ProgressSnapshot};
@@ -201,6 +201,12 @@ pub struct DownloadOptions {
     /// 整次下载的总限速（字节/秒）。`None` 表示不限速，行为与本字段加入前一致。
     /// `Some(rate)` 时所有分块共用同一个 `RateLimiter`，限制的是这次下载的总速度。
     pub max_speed: Option<u64>,
+    /// Phase 3a：可选的**全局**限速器，多个并发 `download` / `resume` 调用传入同一个
+    /// `Arc<RateLimiter>` 即可共享总带宽。与 `max_speed` 同时存在时两层配额都要满足。
+    pub global_limiter: Option<Arc<RateLimiter>>,
+    /// Phase 3a：可选的共享按 Host 连接限制器。未传入时按
+    /// [`DownloadConfig::max_connections_per_host`] 在任务内部创建一个。
+    pub host_limiter: Option<Arc<HostConnectionLimiter>>,
 }
 
 /// 执行一次下载。返回结果，以及进度快照的 `watch` 接收端（可不读）。
@@ -502,9 +508,19 @@ async fn run_download(
     rt.progress = Some(Arc::clone(&progress));
     let download_url = probe_result.final_url.clone();
 
-    // 整次下载唯一的限速器：所有分块通过 Arc 共享，限制的是总速度。
-    let limiter: Option<Arc<RateLimiter>> =
-        opts.max_speed.map(|rate| Arc::new(RateLimiter::new(rate)));
+    // Phase 3a 双层限速：单任务 `max_speed` + 可跨任务共享的 `global_limiter`。
+    // 两块数据都要依次通过两者配额；`set_rate` 可在运行中修改任一层。
+    let task_limiter: Option<Arc<RateLimiter>> = opts
+        .max_speed
+        .map(|rate| Arc::new(RateLimiter::new(Some(rate))));
+    let bandwidth = BandwidthLimiter::new(task_limiter, opts.global_limiter.clone());
+    // 按 Host 的连接名额池；未显式注入时按 DownloadConfig 的默认上限创建。
+    let host_limiter: Arc<HostConnectionLimiter> = opts.host_limiter.clone().unwrap_or_else(|| {
+        let limit = opts.config.max_connections_per_host;
+        Arc::new(
+            HostConnectionLimiter::new(limit).unwrap_or_else(|_| HostConnectionLimiter::default()),
+        )
+    });
 
     // 内部取消信号：所有分块任务订阅它；外部取消/出错/panic 都会先触发它。
     let internal = CancelSignal::new();
@@ -561,7 +577,9 @@ async fn run_download(
         progress: Arc::clone(&progress),
         if_range: if_range.clone(),
         verify_etag: verify_etag.clone(),
-        limiter: limiter.clone(),
+        bandwidth: bandwidth.clone(),
+        host_limiter: Arc::clone(&host_limiter),
+        cancel: internal.clone(),
         cancel_rx: internal.subscribe(),
         task_id,
         streaming,
@@ -955,7 +973,9 @@ pub(super) struct ChunkSpawner {
     pub(super) progress: Arc<Mutex<ProgressPublisher>>,
     if_range: Option<String>,
     verify_etag: Option<(String, bool)>,
-    limiter: Option<Arc<RateLimiter>>,
+    bandwidth: BandwidthLimiter,
+    host_limiter: Arc<HostConnectionLimiter>,
+    cancel: CancelSignal,
     cancel_rx: watch::Receiver<bool>,
     pub(super) task_id: u64,
     streaming: bool,
@@ -1000,8 +1020,10 @@ impl ChunkSpawner {
             progress: Arc::clone(&self.progress),
             idx,
             streaming: self.streaming,
+            cancel: self.cancel.clone(),
             cancel_rx: self.cancel_rx.clone(),
-            limiter: self.limiter.clone(),
+            bandwidth: self.bandwidth.clone(),
+            host_limiter: Arc::clone(&self.host_limiter),
             task_id: self.task_id,
             received: Arc::new(AtomicU64::new(0)),
             acked: Arc::clone(&shared.acked),
@@ -1041,8 +1063,10 @@ struct ChunkJob {
     progress: Arc<Mutex<ProgressPublisher>>,
     idx: usize,
     streaming: bool,
+    cancel: CancelSignal,
     cancel_rx: watch::Receiver<bool>,
-    limiter: Option<Arc<RateLimiter>>,
+    bandwidth: BandwidthLimiter,
+    host_limiter: Arc<HostConnectionLimiter>,
     task_id: u64,
     received: Arc<AtomicU64>,
     /// 只在 pool.write 成功返回后推进的绝对写入位置（检查点快照来源）。
@@ -1218,6 +1242,11 @@ async fn run_chunk_inner(job: ChunkJob, pc: &PoolChunk) -> Result<ChunkExit> {
                 if rx_cancelled(&cancel_rx) {
                     return Ok(ChunkExit::Cancelled);
                 }
+                // Phase 3a 边界保护：最后一次在途写盘完成后 end 被接管缩到 acked，
+                // 此时网络侧恰好断开也不得进入重试退避或报错路径。
+                if !job.streaming && job.acked.load(Ordering::Acquire) >= job.shared.end() {
+                    return Ok(ChunkExit::Completed);
+                }
                 // 不可重试的错误（磁盘错误、RemoteChanged 等）原样返回。
                 if !is_retryable(&attempt.error) {
                     return Err(attempt.error);
@@ -1317,7 +1346,9 @@ async fn attempt_chunk_once(
         progress,
         idx,
         streaming,
-        limiter,
+        bandwidth,
+        host_limiter,
+        cancel,
         task_id,
         received: received_counter,
         acked: acked_counter,
@@ -1342,6 +1373,15 @@ async fn attempt_chunk_once(
     if start >= end {
         return Ok(ChunkExit::Completed);
     }
+
+    // Phase 3a：每次请求前申请按 Host 的连接名额，等待期间响应取消。
+    // 变量在本函数返回（完成 / 出错 / 被唤醒提前关闭）时立即 drop 释放名额；
+    // 重试退避发生在 run_chunk_inner 中，此时本函数已返回，名额不会死占。
+    let _host_permit = match host_limiter.acquire(url, cancel).await {
+        Ok(permit) => permit,
+        Err(Error::Cancelled) => return Ok(ChunkExit::Cancelled),
+        Err(e) => return Err(e.into()),
+    };
 
     // 流式（总长未知）模式不发送 Range；分块模式发送精确区间。
     let mut req = client.get(url.clone());
@@ -1472,6 +1512,13 @@ async fn attempt_chunk_once(
                 Ok(Some(b)) => b,
                 Ok(None) => break,
                 Err(e) => {
+                    // Phase 3a 边界保护：接管已经把 end 缩到 acked 时，网络侧
+                    // 刚好断开也不能误走重试 / 报错，必须直接以完成结束。
+                    if !streaming
+                        && acked_counter.load(Ordering::Acquire) >= shared.end()
+                    {
+                        return Ok(ChunkExit::Completed);
+                    }
                     // 读取空闲超时（read_timeout）属于超时相关错误，必须如实返回，
                     // 不能误判为"响应体被截断"。
                     if e.is_timeout() {
@@ -1499,11 +1546,11 @@ async fn attempt_chunk_once(
             // TCP 接收窗口填满，服务器端随之放慢发送，从而真正限制网络流量。
             // acquire 与取消信号并列，等待令牌时也能立刻响应取消。
             // 重试后继续使用同一个限速器。
-            if let Some(rl) = &limiter {
+            if !bandwidth.is_unlimited() {
                 tokio::select! {
                     biased;
                     _ = wait_cancelled(cancel_rx) => return Ok(ChunkExit::Cancelled),
-                    _ = rl.acquire(len) => {}
+                    _ = bandwidth.acquire(len) => {}
                 }
             }
             // 写磁盘之前检查取消。
@@ -1557,6 +1604,11 @@ async fn attempt_chunk_once(
 
     if rx_cancelled(cancel_rx) {
         return Ok(ChunkExit::Cancelled);
+    }
+    // Phase 3a 边界保护：响应体提前结束时，若接管已把 end 缩到 acked，
+    // 数据其实已经完整，必须直接以完成结束而不是 UnexpectedEof。
+    if !streaming && acked_counter.load(Ordering::Acquire) >= shared.end() {
+        return Ok(ChunkExit::Completed);
     }
     if !streaming && received != expected {
         return Err(Error::UnexpectedEof {

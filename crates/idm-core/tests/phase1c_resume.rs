@@ -38,6 +38,8 @@ fn new_task(url: &str, dir: &Path) -> NewTask {
 
 fn options(dir: &Path, out: &str) -> DownloadOptions {
     DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         config: DownloadConfig {
             connections: 4,
             // phase1c 的续传测试验证"失败后 resume"，需要失败确定地发生，

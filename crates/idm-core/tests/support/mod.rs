@@ -150,6 +150,8 @@ pub struct ServerConfig {
     pub active: Option<Arc<AtomicU64>>,
     /// 服务器端并发峰值。
     pub max_active: Option<Arc<AtomicU64>>,
+    /// 服务器实际写出的响应正文字节数（Phase 3a：动态降速测试统计真实传输量）。
+    pub bytes_sent: Option<Arc<AtomicU64>>,
 }
 
 impl Default for ServerConfig {
@@ -188,6 +190,7 @@ impl Default for ServerConfig {
             stall: None,
             active: None,
             max_active: None,
+            bytes_sent: None,
         }
     }
 }
@@ -587,10 +590,16 @@ async fn handle_conn(
             if abs + n as u64 >= b {
                 let partial = (b - abs) as usize;
                 sock.write_all(&buf[..partial]).await?;
+                if let Some(c) = &cfg.bytes_sent {
+                    c.fetch_add(partial as u64, Ordering::SeqCst);
+                }
                 return Ok(());
             }
         }
         sock.write_all(&buf).await?;
+        if let Some(c) = &cfg.bytes_sent {
+            c.fetch_add(n as u64, Ordering::SeqCst);
+        }
         written += n as u64;
         if let Some(d) = cfg.chunk_delay {
             tokio::time::sleep(d).await;

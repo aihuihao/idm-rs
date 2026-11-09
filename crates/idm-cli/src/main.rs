@@ -268,8 +268,9 @@ mod dl {
 
     use idm_core::disk::{AllocationStrategy, DiskWriterPool, volume_supports_sparse};
     use idm_core::net::Url;
-    use idm_core::net::client::DownloadConfig;
+    use idm_core::net::client::{DownloadConfig, ProxyConfig};
     use idm_core::net::filename::{resolve_conflict, sanitize_windows_filename};
+    use idm_core::net::host_limit::{DEFAULT_MAX_PER_HOST, MAX_PER_HOST_CEILING};
     use idm_core::net::probe::Probe;
     use idm_core::store::{NewTask, Store};
     use idm_core::task::{
@@ -385,6 +386,10 @@ mod dl {
         let mut checkpoint_ms: Option<u64> = None;
         // Phase 2：动态切分与工作窃取默认开启，`--no-split` 关闭。
         let mut dynamic_split = true;
+        // Phase 3a：按 Host 连接上限 / 代理配置。
+        let mut max_host_connections: usize = DEFAULT_MAX_PER_HOST;
+        let mut proxy_url: Option<String> = None;
+        let mut no_proxy = false;
         // B5：`--strategy` 默认 Auto（卷支持稀疏文件则 Sparse，否则 SetLen）。
         let mut strategy = AllocationStrategy::Auto;
 
@@ -501,6 +506,35 @@ mod dl {
                     // Phase 2：关闭动态切分与工作窃取。
                     dynamic_split = false;
                 }
+                "--max-host-connections" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-host-connections");
+                        return 2;
+                    }
+                    match args[i].parse::<usize>() {
+                        Ok(v) if (1..=MAX_PER_HOST_CEILING).contains(&v) => {
+                            max_host_connections = v;
+                        }
+                        _ => {
+                            eprintln!(
+                                "--max-host-connections must be in 1..={MAX_PER_HOST_CEILING}"
+                            );
+                            return 2;
+                        }
+                    }
+                }
+                "--proxy" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --proxy");
+                        return 2;
+                    }
+                    proxy_url = Some(args[i].clone());
+                }
+                "--no-proxy" => {
+                    no_proxy = true;
+                }
                 "--log-file" | "--db" => {
                     i += 1;
                     if i >= args.len() {
@@ -518,11 +552,15 @@ mod dl {
             i += 1;
         }
 
+        if proxy_url.is_some() && no_proxy {
+            eprintln!("usage error: --proxy and --no-proxy are mutually exclusive");
+            return 2;
+        }
         let url = match url {
             Some(u) => u,
             None => {
                 eprintln!(
-                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto] [--cancel-after SECONDS] [--max-speed 500K|3M] [--log-file PATH]"
+                    "usage: idm-cli download <URL> [--dir DIR] [--connections N] [--max-host-connections N] [--out NAME] [--strategy sparse|reserve|setlen|auto] [--cancel-after SECONDS] [--max-speed 500K|3M] [--proxy URL] [--no-proxy] [--log-file PATH]"
                 );
                 return 2;
             }
@@ -568,10 +606,17 @@ mod dl {
             return 2;
         }
 
+        let proxy = if no_proxy {
+            ProxyConfig::Disabled
+        } else {
+            proxy_url.map_or(ProxyConfig::System, ProxyConfig::Custom)
+        };
         let config = DownloadConfig {
             connections,
             max_retries: max_retries.unwrap_or(5),
             dynamic_split,
+            max_connections_per_host: max_host_connections,
+            proxy,
             ..DownloadConfig::default()
         };
         let client = match config.build_client() {
@@ -623,6 +668,8 @@ mod dl {
         };
         let final_path = resolve_conflict(&dir, &raw_name);
         let opts = DownloadOptions {
+            global_limiter: None,
+            host_limiter: None,
             config,
             strategy,
             dir: dir.clone(),
@@ -720,6 +767,10 @@ mod dl {
         let mut max_retries: Option<u32> = None;
         // Phase 2：续传默认允许动态切分，`--no-split` 关闭。
         let mut dynamic_split = true;
+        // Phase 3a：按 Host 连接上限 / 代理配置。
+        let mut max_host_connections: usize = DEFAULT_MAX_PER_HOST;
+        let mut proxy_url: Option<String> = None;
+        let mut no_proxy = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -754,6 +805,35 @@ mod dl {
                 "--no-split" => {
                     dynamic_split = false;
                 }
+                "--max-host-connections" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-host-connections");
+                        return 2;
+                    }
+                    match args[i].parse::<usize>() {
+                        Ok(v) if (1..=MAX_PER_HOST_CEILING).contains(&v) => {
+                            max_host_connections = v;
+                        }
+                        _ => {
+                            eprintln!(
+                                "--max-host-connections must be in 1..={MAX_PER_HOST_CEILING}"
+                            );
+                            return 2;
+                        }
+                    }
+                }
+                "--proxy" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --proxy");
+                        return 2;
+                    }
+                    proxy_url = Some(args[i].clone());
+                }
+                "--no-proxy" => {
+                    no_proxy = true;
+                }
                 "--db" | "--log-file" => {
                     i += 1;
                     if i >= args.len() {
@@ -775,11 +855,15 @@ mod dl {
             }
             i += 1;
         }
+        if proxy_url.is_some() && no_proxy {
+            eprintln!("usage error: --proxy and --no-proxy are mutually exclusive");
+            return 2;
+        }
         let id = match id {
             Some(v) => v,
             None => {
                 eprintln!(
-                    "usage: idm-cli resume <id> [--max-speed 3M] [--no-split] [--db PATH] [--log-file PATH]"
+                    "usage: idm-cli resume <id> [--max-speed 3M] [--max-host-connections N] [--no-split] [--proxy URL] [--no-proxy] [--db PATH] [--log-file PATH]"
                 );
                 return 2;
             }
@@ -800,11 +884,20 @@ mod dl {
         // 外部进度通道：参照 download 命令，在续传开始前就建好并传入，
         // 以便成功或失败时都能读取最后一次快照并打印分块汇总表。
         let (progress_tx, _) = watch::channel(ProgressSnapshot::default());
+        let proxy = if no_proxy {
+            ProxyConfig::Disabled
+        } else {
+            proxy_url.map_or(ProxyConfig::System, ProxyConfig::Custom)
+        };
         let opts = DownloadOptions {
+            global_limiter: None,
+            host_limiter: None,
             config: DownloadConfig {
                 connections: (rec.connections as usize).clamp(1, 32),
                 max_retries: max_retries.unwrap_or(5),
                 dynamic_split,
+                max_connections_per_host: max_host_connections,
+                proxy,
                 ..DownloadConfig::default()
             },
             strategy,
@@ -973,9 +1066,34 @@ mod dl {
 
     #[cfg(test)]
     mod tests {
+        use idm_core::store::Store;
         use idm_core::task::progress::ChunkProgress;
 
         use super::{ChunkState, ProgressSnapshot, format_chunk_summary, parse_max_speed};
+
+        /// Phase 3a：`--proxy` 与 `--no-proxy` 同时传入必须以退出码 2 拒绝。
+        #[tokio::test]
+        async fn proxy_and_no_proxy_are_mutually_exclusive() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let store = Store::open(tmp.path().join("idm.db")).expect("store");
+            for args in [
+                vec![
+                    "http://127.0.0.1/f".to_string(),
+                    "--proxy".to_string(),
+                    "http://127.0.0.1:3128".to_string(),
+                    "--no-proxy".to_string(),
+                ],
+                vec![
+                    "1".to_string(),
+                    "--proxy".to_string(),
+                    "socks5://127.0.0.1:1080".to_string(),
+                    "--no-proxy".to_string(),
+                ],
+            ] {
+                assert_eq!(super::run(&args, store.clone()).await, 2);
+                assert_eq!(super::run_resume(&args[1..], store.clone()).await, 2);
+            }
+        }
 
         #[test]
         fn chunk_summary_contains_all_columns() {

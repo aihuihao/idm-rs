@@ -6,6 +6,45 @@ use reqwest::Url;
 use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue};
 
 use crate::error::{Error, Result};
+use crate::net::host_limit::MAX_PER_HOST_CEILING;
+
+/// 代理配置（Phase 3a）。默认 `System`：使用系统 / 环境变量代理。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProxyConfig {
+    /// 使用系统 / 环境变量（`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 等）。
+    #[default]
+    System,
+    /// 显式禁用代理（`ClientBuilder::no_proxy()`）。
+    Disabled,
+    /// 自定义代理 URL，支持 `http://`、`https://`、`socks5://`、`socks5h://`，
+    /// 并可内嵌 `user:pass@host:port` 认证信息。
+    Custom(String),
+}
+
+/// 校验自定义代理 URL，返回解析后的 `Url`。
+fn validate_proxy_url(raw: &str) -> Result<Url> {
+    let parsed = Url::parse(raw).map_err(|e| Error::InvalidProxy {
+        url: raw.to_string(),
+        reason: format!("cannot parse proxy URL: {e}"),
+    })?;
+    let supported = matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h");
+    if !supported {
+        return Err(Error::InvalidProxy {
+            url: raw.to_string(),
+            reason: format!(
+                "unsupported proxy scheme {:?} (allowed: http, https, socks5, socks5h)",
+                parsed.scheme()
+            ),
+        });
+    }
+    if parsed.host_str().unwrap_or("").is_empty() {
+        return Err(Error::InvalidProxy {
+            url: raw.to_string(),
+            reason: "proxy URL has no host".to_string(),
+        });
+    }
+    Ok(parsed)
+}
 
 /// 下载配置。连接数默认 8（范围 1..=32），最小分块大小默认 1 MiB。
 ///
@@ -34,6 +73,11 @@ pub struct DownloadConfig {
     pub min_split_size: u64,
     /// 是否启用动态切分与工作窃取（Phase 2）。默认开启；`--no-split` 关闭。
     pub dynamic_split: bool,
+    /// 每个 Host 的并发连接上限（Phase 3a）。默认 8，合法范围 1..=64。
+    /// 使用共享 [`crate::net::HostConnectionLimiter`] 时以其构造参数为准。
+    pub max_connections_per_host: usize,
+    /// 代理配置（Phase 3a）。默认使用系统 / 环境变量代理。
+    pub proxy: ProxyConfig,
 }
 
 impl Default for DownloadConfig {
@@ -50,6 +94,8 @@ impl Default for DownloadConfig {
             retry_max_delay: Duration::from_secs(30),
             min_split_size: 1024 * 1024,
             dynamic_split: true,
+            max_connections_per_host: 8,
+            proxy: ProxyConfig::System,
         }
     }
 }
@@ -59,11 +105,19 @@ impl DownloadConfig {
         Self::default()
     }
 
-    /// 校验参数：连接数必须在 1..=32。
+    /// 校验参数：连接数必须在 1..=32，每 Host 连接上限必须在 1..=64。
     pub fn validate(&self) -> Result<()> {
         if self.connections < 1 || self.connections > 32 {
             return Err(Error::InvalidArgument {
                 message: format!("connections must be in 1..=32, got {}", self.connections),
+            });
+        }
+        if !(1..=MAX_PER_HOST_CEILING).contains(&self.max_connections_per_host) {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "max_connections_per_host must be in 1..={MAX_PER_HOST_CEILING}, got {}",
+                    self.max_connections_per_host
+                ),
             });
         }
         Ok(())
@@ -87,8 +141,8 @@ impl DownloadConfig {
         self.connect_timeout + self.read_timeout
     }
 
-    /// 构建 reqwest 客户端：强制 `Accept-Encoding: identity`、限制重定向次数。
-    /// 代理设置留到 Phase 3，本阶段不做。
+    /// 构建 reqwest 客户端：强制 `Accept-Encoding: identity`、限制重定向次数，
+    /// 并按 [`ProxyConfig`] 应用代理（Phase 3a）。
     ///
     /// 三层超时（见 `ARCHITECTURE.md`）：
     /// - `connect_timeout`：建立 TCP/TLS 连接的最长耗时；
@@ -97,21 +151,101 @@ impl DownloadConfig {
     /// - Probe 单独用 [`Self::request_timeout`] 设一个总时长上限（它不读取正文）。
     ///
     /// 不调用任何 `danger_*` 方法，证书校验保持默认开启；Cargo 依赖也只启用默认
-    /// TLS 后端 + `stream`，未开启 gzip/brotli/zstd/deflate 等压缩特性。
+    /// TLS 后端 + `stream` / `socks`，未开启 gzip/brotli/zstd/deflate 等压缩特性。
     pub fn build_client(&self) -> Result<reqwest::Client> {
         self.validate()?;
+        // 先校验代理 URL，让非法配置在发任何请求之前以强类型错误返回。
+        let proxy_url = match &self.proxy {
+            ProxyConfig::Custom(raw) => Some(validate_proxy_url(raw)?),
+            _ => None,
+        };
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-        reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .user_agent(&self.user_agent)
             .default_headers(headers)
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
-            .redirect(reqwest::redirect::Policy::limited(self.max_redirects))
-            .build()
-            .map_err(|e| Error::Http {
-                url: String::new(),
-                source: e,
-            })
+            .redirect(reqwest::redirect::Policy::limited(self.max_redirects));
+        match &self.proxy {
+            ProxyConfig::System => {
+                // reqwest 默认读取系统 / 环境变量代理，不做额外设置。
+            }
+            ProxyConfig::Disabled => {
+                builder = builder.no_proxy();
+            }
+            ProxyConfig::Custom(raw) => {
+                let url = proxy_url.as_ref().ok_or_else(|| Error::InvalidProxy {
+                    url: raw.clone(),
+                    reason: "proxy URL unexpectedly missing".to_string(),
+                })?;
+                // 先关掉系统/环境变量代理，保证 Custom 是唯一生效的代理；
+                // reqwest 会从 URL 内嵌的 user:pass 解析代理认证信息。
+                let proxy = reqwest::Proxy::all(url.clone()).map_err(|e| Error::InvalidProxy {
+                    url: raw.clone(),
+                    reason: e.to_string(),
+                })?;
+                builder = builder.no_proxy().proxy(proxy);
+            }
+        }
+        builder.build().map_err(|e| Error::Http {
+            url: String::new(),
+            source: e,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_config_default_is_system() {
+        assert_eq!(ProxyConfig::default(), ProxyConfig::System);
+        assert_eq!(DownloadConfig::default().max_connections_per_host, 8);
+    }
+
+    /// Phase 3a：非法代理 URL 与不支持的 scheme 返回强类型错误。
+    #[test]
+    fn invalid_proxy_urls_are_rejected() {
+        for bad in [
+            "ftp://127.0.0.1:1080",
+            "socks4://127.0.0.1:1080",
+            "not a url",
+            "http://",
+        ] {
+            let cfg = DownloadConfig {
+                proxy: ProxyConfig::Custom(bad.to_string()),
+                ..DownloadConfig::default()
+            };
+            assert!(
+                matches!(cfg.build_client(), Err(Error::InvalidProxy { .. })),
+                "expected InvalidProxy for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_proxy_urls_build_a_client() {
+        for good in [
+            "http://127.0.0.1:3128",
+            "https://user:pass@127.0.0.1:3128",
+            "socks5://127.0.0.1:1080",
+            "socks5h://user:pass@127.0.0.1:1080",
+        ] {
+            let cfg = DownloadConfig {
+                proxy: ProxyConfig::Custom(good.to_string()),
+                ..DownloadConfig::default()
+            };
+            assert!(cfg.build_client().is_ok(), "expected client for {good:?}");
+        }
+        assert!(
+            DownloadConfig {
+                proxy: ProxyConfig::Disabled,
+                ..DownloadConfig::default()
+            }
+            .build_client()
+            .is_ok()
+        );
     }
 }

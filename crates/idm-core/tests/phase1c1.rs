@@ -44,6 +44,8 @@ fn new_task(url: &str, dir: &Path) -> NewTask {
 
 fn options(dir: &Path, out: &str) -> DownloadOptions {
     DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
         config: DownloadConfig {
             connections: 4,
             ..DownloadConfig::default()
