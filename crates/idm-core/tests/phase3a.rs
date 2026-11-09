@@ -21,10 +21,11 @@ use idm_core::disk::{AllocationStrategy, DiskWriterPool};
 use idm_core::error::Error;
 use idm_core::net::client::{DownloadConfig, ProxyConfig};
 use idm_core::net::{HostConnectionLimiter, RateLimiter, Url};
-use idm_core::task::{DownloadOptions, DownloadOutcome, download};
+use idm_core::task::{DownloadOptions, DownloadOutcome, ProgressSnapshot, download};
 use proxy::{start_http_proxy, start_socks5_proxy};
 use support::{ServerConfig, SpeedPolicy, start};
 use tempfile::tempdir;
+use tokio::sync::watch;
 use verify::verify_file;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -96,13 +97,13 @@ async fn dynamic_rate_increase_and_unlimited() -> TestResult {
     Ok(())
 }
 
-/// 初始 50 MiB/s 运行 500ms 后降到 1 MiB/s；随后 2 秒内实际传输不得超过
-/// 2.5 MiB（旧桶容量必须被截断，防止突发泄漏）。
+/// 初始 50 MiB/s 运行 500ms 后降到 1 MiB/s；随后 2 秒内客户端**落盘进度增长量**
+/// 不得超过 2.4 MiB（旧桶令牌必须清零，4 个连接也不能群聚突发）。
+///
+/// Phase 3b A2：4 个连接、取消 300ms 稳定等待；同时记录服务器发送量作为对照。
 #[tokio::test]
 async fn dynamic_rate_decrease_clamps_burst() -> TestResult {
     let size = 64 * MIB;
-    // 服务器实际写出的正文字节数：TCP 背压使它与客户端真正读到的字节数吻合，
-    // 比进度快照（落盘字节，会包含降速前已在内核缓冲区里的数据）更准确。
     let sent = Arc::new(AtomicU64::new(0));
     let srv = start(ServerConfig {
         size,
@@ -112,9 +113,9 @@ async fn dynamic_rate_decrease_clamps_burst() -> TestResult {
     .await?;
     let tmp = tempdir()?;
     let rl = Arc::new(RateLimiter::new(Some(50 * MIB)));
-    // 单连接：把内核 socket 缓冲区带来的"已发送但未读取"字节降到最小，
-    // 让服务器写出字节数成为真实传输量的准确度量。
-    let mut opts = options(tmp.path(), "dyn-down.bin", default_config(1));
+    let (tx, mut rx) = watch::channel(ProgressSnapshot::default());
+    let mut opts = options(tmp.path(), "dyn-down.bin", default_config(4));
+    opts.progress_tx = Some(tx);
     opts.global_limiter = Some(Arc::clone(&rl));
     let url = srv.url("/file.bin");
     let p = pool()?;
@@ -125,17 +126,24 @@ async fn dynamic_rate_decrease_clamps_burst() -> TestResult {
     rl.set_rate(Some(MIB));
     assert_eq!(rl.current_rate(), Some(MIB));
     assert_eq!(rl.capacity(), MIB);
-    // 变更前的 50 MiB/s 会让若干 MiB 停留在内核/TCP 缓冲区里；给一点时间让
-    // 这些"已发出但未读取"的字节被新速率吸收，之后 2 秒才是新速率下的真实
-    // 传输量（否则测到的是旧数据排空，而不是降速后的突发）。
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let before = sent.load(Ordering::SeqCst);
+
+    // 进度快照按 200ms 节流发布，直接读当前值可能还是 50 MiB/s 阶段的旧值。
+    // 先把当前值标记为已读，再等变更后的**第一次新发布**作为基准：这是与进度
+    // 通道同步，不是固定的稳定等待（通常 <= 200ms）。
+    let _ = rx.borrow_and_update().downloaded;
+    let _ = tokio::time::timeout(Duration::from_millis(500), rx.changed()).await;
+    let before_progress = rx.borrow_and_update().downloaded;
+    let before_sent = sent.load(Ordering::SeqCst);
+
     tokio::time::sleep(Duration::from_millis(2000)).await;
-    let after = sent.load(Ordering::SeqCst);
-    let transferred = after.saturating_sub(before);
+    let after_progress = rx.borrow_and_update().downloaded;
+    let after_sent = sent.load(Ordering::SeqCst);
+    let client_growth = after_progress.saturating_sub(before_progress);
+    let server_growth = after_sent.saturating_sub(before_sent);
+    // 2.4 MiB = 2 MiB (2 秒 × 1 MiB/s) + 0.4 MiB 余量。
     assert!(
-        transferred <= 2 * MIB + 512 * KIB,
-        "降速后 2 秒内不得突发超过 2.5 MiB，实际 {transferred} 字节"
+        client_growth <= 2 * MIB + 409 * KIB,
+        "降速后 2 秒内客户端落盘增长不得超过 2.4 MiB，实际 {client_growth} 字节"
     );
 
     // 恢复不限速让下载尽快结束，顺便校验文件完整性。
@@ -144,8 +152,9 @@ async fn dynamic_rate_decrease_clamps_burst() -> TestResult {
     let elapsed = started.elapsed();
     assert_eq!(outcome, DownloadOutcome::Completed);
     verify_file(&tmp.path().join("dyn-down.bin"), size)?;
+    srv.shutdown();
     println!(
-        "DYNAMIC_DECREASE window_2s_bytes={transferred} total_elapsed={elapsed:?} size={size}"
+        "DYNAMIC_DECREASE client_2s_bytes={client_growth} server_2s_bytes={server_growth} total_elapsed={elapsed:?} size={size}"
     );
     Ok(())
 }
