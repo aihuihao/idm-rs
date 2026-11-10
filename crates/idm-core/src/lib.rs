@@ -23,6 +23,10 @@ pub mod net;
 #[cfg(windows)]
 pub mod task;
 
+/// 多任务下载队列与调度器（依赖 `task`、`disk`、`net`、`store`）。
+#[cfg(windows)]
+pub mod queue;
+
 /// SQLite 状态持久化：独立线程持有连接、迁移、检查点与启动恢复。
 pub mod store;
 

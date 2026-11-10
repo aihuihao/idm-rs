@@ -57,7 +57,9 @@ pub async fn resume(
 
     match rec.state {
         TaskStateDb::Finalizing => return finish_finalizing(&rec, &store).await,
-        TaskStateDb::Paused | TaskStateDb::Failed => {}
+        // `Queued` 也允许续传：调度器把暂停/失败的任务重新入队后状态为 `Queued`，
+        // 但其 `.idm-part` 仍存在，需要走续传路径而不是从头重新下载。
+        TaskStateDb::Paused | TaskStateDb::Failed | TaskStateDb::Queued => {}
         other => {
             return Err(resume_err(format!(
                 "task {task_id} is in state {other:?}, which cannot be resumed"

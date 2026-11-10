@@ -133,3 +133,10 @@
 - 第 4 步的确认条件放宽为 reserved ≤ split（普通对半切分仍为 reserved < split）。不变式 committed ≤ acked ≤ reserved ≤ end 保持不变
 - 唤醒：end 被缩小后，必须能唤醒正在等待网络数据或正在退避等待的分块任务。被唤醒的分块如果发现 acked == end，立即丢弃连接，以"完成"结束
 - 第 5 到 7 步（数据库事务 → shrink_end → 新分块）不变
+
+## 11. 多任务队列与调度器（Phase 3b 确立）
+- 队列持久化：SQLite `tasks` 表维护 `Queued` 状态、单任务限速 `max_speed` 与队列序号 `queue_order`。
+- 调度规则：`DownloadQueue` 按 `queue_order ASC, id ASC` 自动拉起 `Queued` 任务，任何时刻活动下载任务数（处于 `Downloading` / `Probing` / `Finalizing` 的受管任务）严格不超过 `max_concurrent_tasks`（默认 3，可动态调整）。
+- 全局资源共享：同一队列启动的所有任务共用同一个 `DiskWriterPool`、全局 `RateLimiter` 与按服务器 `HostConnectionLimiter`。
+- 状态联动：活动任务完成、失败或被用户暂停后立即释放并发槽位并自动唤醒调度器拉起下一个 `Queued` 任务；对已暂停或失败的任务执行队列恢复时，将其置为 `Queued` 交由调度器按序执行。
+- 启动恢复：程序重启执行 `recover` 时，保留数据库中原有的 `Queued` 任务状态与顺序不变。

@@ -6,6 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Pending,
+    Queued,
     Probing,
     Downloading,
     Finalizing,
@@ -64,6 +65,12 @@ impl TaskState {
                 | (Failed, Pending)
                 | (Cancelled, Pending)
                 | (Paused, Pending)
+                | (Pending, Queued)
+                | (Queued, Probing)
+                | (Queued, Paused)
+                | (Queued, Cancelled)
+                | (Paused, Queued)
+                | (Failed, Queued)
         )
     }
 }

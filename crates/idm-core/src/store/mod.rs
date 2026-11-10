@@ -24,7 +24,7 @@ use crate::error::{Error, Result, is_sharing_violation};
 // ---------------------------------------------------------------------------
 
 /// 迁移脚本数组；当前为版本 2。
-pub const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
+pub const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
 
 /// 当前 schema 版本。
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -72,6 +72,13 @@ CREATE TABLE chunks (
 /// 第 `parent_index` 号分块切出来的（工作窃取的产物）。
 const MIGRATION_V2: &str = r#"
 ALTER TABLE chunks ADD COLUMN parent_index INTEGER;
+"#;
+
+/// 版本 3（Phase 3b 多任务队列）：任务增加队列序号与单任务限速。
+const MIGRATION_V3: &str = r#"
+ALTER TABLE tasks ADD COLUMN queue_order INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN max_speed INTEGER;
+UPDATE tasks SET queue_order = id;
 "#;
 
 fn db_err(e: rusqlite::Error) -> Error {
@@ -130,6 +137,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStateDb {
     Pending,
+    Queued,
     Probing,
     Downloading,
     Finalizing,
@@ -142,6 +150,7 @@ impl TaskStateDb {
     pub fn as_str(self) -> &'static str {
         match self {
             TaskStateDb::Pending => "Pending",
+            TaskStateDb::Queued => "Queued",
             TaskStateDb::Probing => "Probing",
             TaskStateDb::Downloading => "Downloading",
             TaskStateDb::Finalizing => "Finalizing",
@@ -154,6 +163,7 @@ impl TaskStateDb {
     fn parse(s: &str) -> TaskStateDb {
         match s {
             "Pending" => TaskStateDb::Pending,
+            "Queued" => TaskStateDb::Queued,
             "Probing" => TaskStateDb::Probing,
             "Downloading" => TaskStateDb::Downloading,
             "Finalizing" => TaskStateDb::Finalizing,
@@ -199,6 +209,29 @@ pub struct NewTask {
     pub dir: String,
     pub strategy: String,
     pub connections: usize,
+}
+
+/// 队列内调整任务顺序的方向（Phase 3b）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMove {
+    /// 移到队首（最小 `queue_order` 之前）。
+    Top,
+    /// 移到队尾（最大 `queue_order` 之后）。
+    Bottom,
+    /// 与前一个 `Queued` 任务交换顺序。
+    Up,
+    /// 与后一个 `Queued` 任务交换顺序。
+    Down,
+}
+
+/// 入队（状态 `Queued`）任务信息（Phase 3b）。
+#[derive(Debug, Clone)]
+pub struct QueuedTask {
+    pub url: String,
+    pub dir: String,
+    pub strategy: String,
+    pub connections: usize,
+    pub max_speed: Option<u64>,
 }
 
 /// Probe 成功后回填的元信息。
@@ -257,8 +290,10 @@ pub struct TaskRecord {
     pub pause_reason: Option<PauseReasonDb>,
     pub last_error: Option<String>,
     pub resumable: bool,
+    pub max_speed: Option<u64>,
     pub created_at: String,
     pub updated_at: String,
+    pub queue_order: i64,
     pub chunks: Vec<ChunkRecord>,
 }
 
@@ -283,6 +318,7 @@ pub struct TaskSummary {
     pub total_size: Option<u64>,
     pub last_error: Option<String>,
     pub part_path: Option<String>,
+    pub queue_order: i64,
 }
 
 /// 启动恢复统计（9.4 / 9.5）。
@@ -351,6 +387,22 @@ enum Command {
         reply: Reply<Option<String>>,
     },
     Recover(Reply<RecoveryReport>),
+    /// Phase 3b：入队一条 `Queued` 任务。
+    EnqueueTask(QueuedTask, Reply<i64>),
+    /// Phase 3b：按 `queue_order ASC, id ASC` 列出所有 `Queued` 任务。
+    ListQueued(Reply<Vec<TaskRecord>>),
+    /// Phase 3b：将 `Paused`/`Failed`/`Finalizing` 任务改回 `Queued`。
+    RequeueTask {
+        id: i64,
+        to_front: bool,
+        reply: Reply<()>,
+    },
+    /// Phase 3b：调整队列顺序。
+    MoveInQueue {
+        id: i64,
+        pos: QueueMove,
+        reply: Reply<()>,
+    },
     Shutdown(Reply<()>),
 }
 
@@ -358,6 +410,8 @@ enum Command {
 pub struct Store {
     tx: mpsc::UnboundedSender<Command>,
     fail_checkpoints: Arc<AtomicBool>,
+    /// 专用线程的句柄；`shutdown()` 会 join 它，确保连接关闭、WAL 完全回写后再返回。
+    handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -385,7 +439,7 @@ impl Store {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
         let fail_checkpoints = Arc::new(AtomicBool::new(false));
         let fail_for_thread = fail_checkpoints.clone();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("idm-store".to_string())
             .spawn(move || store_thread(path, rx, ready_tx, fail_for_thread))
             .map_err(|e| Error::Io {
@@ -400,6 +454,7 @@ impl Store {
         Ok(Arc::new(Store {
             tx,
             fail_checkpoints,
+            handle: std::sync::Mutex::new(Some(handle)),
         }))
     }
 
@@ -511,8 +566,46 @@ impl Store {
     }
 
     /// 显式关闭专用线程（Drop 时线程也会随通道关闭自行退出）。
+    /// 发送 `Shutdown` 让线程回写 WAL 后退出，并 **join** 线程，确保连接完全关闭、
+    /// 数据落盘后再返回，避免调用方紧接着 `std::process::exit` 时线程被强杀导致数据丢失。
     pub async fn shutdown(&self) -> Result<()> {
-        self.call(Command::Shutdown).await
+        self.call(Command::Shutdown).await?;
+        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = handle {
+            // join 阻塞在 std 线程上，用 spawn_blocking 避免阻塞 tokio 调度器。
+            let _ = tokio::task::spawn_blocking(move || h.join()).await;
+        }
+        Ok(())
+    }
+
+    // --- Phase 3b 多任务队列 -------------------------------------------------
+
+    /// 入队一条状态为 `Queued` 的任务，`queue_order` 自动设为 `MAX(queue_order)+1`，
+    /// 并返回新任务 id。
+    pub async fn enqueue_task(&self, t: QueuedTask) -> Result<i64> {
+        self.call(|reply| Command::EnqueueTask(t, reply)).await
+    }
+
+    /// 按 `queue_order ASC, id ASC` 返回所有 `Queued` 任务。
+    pub async fn list_queued_tasks(&self) -> Result<Vec<TaskRecord>> {
+        self.call(Command::ListQueued).await
+    }
+
+    /// 将 `Paused`/`Failed`/`Finalizing` 任务改回 `Queued`；其他状态返回非法参数错误。
+    /// `to_front = true` 时排到队首，否则保持/置于合适位置。
+    pub async fn requeue_task(&self, id: i64, to_front: bool) -> Result<()> {
+        self.call(|reply| Command::RequeueTask {
+            id,
+            to_front,
+            reply,
+        })
+        .await
+    }
+
+    /// 调整队列中某任务的顺序。
+    pub async fn move_in_queue(&self, id: i64, pos: QueueMove) -> Result<()> {
+        self.call(|reply| Command::MoveInQueue { id, pos, reply })
+            .await
     }
 }
 
@@ -623,7 +716,26 @@ fn handle_command(conn: &mut Connection, cmd: Command, fail: &AtomicBool) {
         Command::Recover(reply) => {
             let _ = reply.send(recover(conn));
         }
+        Command::EnqueueTask(t, reply) => {
+            let _ = reply.send(enqueue_task(conn, t));
+        }
+        Command::ListQueued(reply) => {
+            let _ = reply.send(list_queued_tasks(conn));
+        }
+        Command::RequeueTask {
+            id,
+            to_front,
+            reply,
+        } => {
+            let _ = reply.send(requeue_task(conn, id, to_front));
+        }
+        Command::MoveInQueue { id, pos, reply } => {
+            let _ = reply.send(move_in_queue(conn, id, pos));
+        }
         Command::Shutdown(reply) => {
+            // 关闭前把 WAL 折叠回主库文件（TRUNCATE），避免进程退出后其它进程读不到未
+            // checkpoint 的 WAL 帧（Windows 上文件锁释放存在竞态）。
+            let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
             let _ = reply.send(Ok(()));
         }
     }
@@ -854,7 +966,7 @@ fn get_task(conn: &Connection, id: i64) -> Result<TaskRecord> {
         .prepare(
             "SELECT id, url, final_url, dir, file_name, part_path, total_size, supports_range, \
              etag, etag_weak, last_modified, strategy, connections, state, pause_reason, \
-             last_error, resumable, created_at, updated_at FROM tasks WHERE id=?1",
+             last_error, resumable, max_speed, created_at, updated_at, queue_order FROM tasks WHERE id=?1",
         )
         .map_err(db_err)?;
     let rec = stmt
@@ -879,8 +991,10 @@ fn get_task(conn: &Connection, id: i64) -> Result<TaskRecord> {
                 pause_reason: pause.as_deref().and_then(PauseReasonDb::parse),
                 last_error: row.get(15)?,
                 resumable: row.get::<_, i64>(16)? != 0,
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                max_speed: row.get::<_, Option<i64>>(17)?.map(|v| v as u64),
+                created_at: row.get(18)?,
+                updated_at: row.get(19)?,
+                queue_order: row.get::<_, i64>(20)?,
                 chunks: Vec::new(),
             })
         })
@@ -896,7 +1010,7 @@ fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>> {
         .prepare(
             "SELECT t.id, t.file_name, t.state, t.pause_reason, t.last_error, t.total_size, \
              t.part_path, COALESCE((SELECT SUM(c.committed - c.start) FROM chunks c \
-             WHERE c.task_id = t.id), 0) FROM tasks t ORDER BY t.id",
+             WHERE c.task_id = t.id), 0), t.queue_order FROM tasks t ORDER BY t.id",
         )
         .map_err(db_err)?;
     let rows = stmt
@@ -912,6 +1026,7 @@ fn list_tasks(conn: &Connection) -> Result<Vec<TaskSummary>> {
                 total_size: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                 part_path: row.get(6)?,
                 committed: row.get::<_, i64>(7)? as u64,
+                queue_order: row.get::<_, i64>(8)?,
             })
         })
         .map_err(db_err)?
@@ -935,6 +1050,207 @@ fn delete_task(conn: &Connection, id: i64) -> Result<Option<String>> {
     conn.execute("DELETE FROM tasks WHERE id=?1", params![id])
         .map_err(db_err)?;
     Ok(part)
+}
+
+// --- Phase 3b 队列 SQL -----------------------------------------------------
+
+fn enqueue_task(conn: &Connection, t: QueuedTask) -> Result<i64> {
+    let now = now_text();
+    conn.execute(
+        "INSERT INTO tasks (url, dir, strategy, connections, state, queue_order, max_speed, \
+         created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, 'Queued', (SELECT COALESCE(MAX(queue_order), 0) + 1 FROM tasks), \
+         ?5, ?6, ?6)",
+        params![
+            t.url,
+            t.dir,
+            t.strategy,
+            t.connections as i64,
+            t.max_speed.map(|v| v as i64),
+            now
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn list_queued_tasks(conn: &Connection) -> Result<Vec<TaskRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, url, final_url, dir, file_name, part_path, total_size, supports_range, \
+             etag, etag_weak, last_modified, strategy, connections, state, pause_reason, \
+             last_error, resumable, max_speed, created_at, updated_at, queue_order FROM tasks \
+             WHERE state='Queued' ORDER BY queue_order ASC, id ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let state: String = row.get(13)?;
+            let pause: Option<String> = row.get(14)?;
+            Ok(TaskRecord {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                final_url: row.get(2)?,
+                dir: row.get(3)?,
+                file_name: row.get(4)?,
+                part_path: row.get(5)?,
+                total_size: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                supports_range: row.get::<_, i64>(7)? != 0,
+                etag: row.get(8)?,
+                etag_weak: row.get::<_, i64>(9)? != 0,
+                last_modified: row.get(10)?,
+                strategy: row.get(11)?,
+                connections: row.get(12)?,
+                state: TaskStateDb::parse(&state),
+                pause_reason: pause.as_deref().and_then(PauseReasonDb::parse),
+                last_error: row.get(15)?,
+                resumable: row.get::<_, i64>(16)? != 0,
+                max_speed: row.get::<_, Option<i64>>(17)?.map(|v| v as u64),
+                created_at: row.get(18)?,
+                updated_at: row.get(19)?,
+                queue_order: row.get::<_, i64>(20)?,
+                chunks: Vec::new(),
+            })
+        })
+        .map_err(db_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
+fn requeue_task(conn: &Connection, id: i64, to_front: bool) -> Result<()> {
+    let state: Option<String> = conn
+        .query_row("SELECT state FROM tasks WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(db_err)?;
+    let Some(state) = state else {
+        return Err(Error::TaskNotFound { id });
+    };
+    match TaskStateDb::parse(&state) {
+        TaskStateDb::Paused | TaskStateDb::Failed | TaskStateDb::Finalizing => {}
+        _ => {
+            return Err(Error::InvalidArgument {
+                message: format!("cannot requeue task {id} in state {state}"),
+            });
+        }
+    }
+    let queue_order = if to_front {
+        let min: i64 = conn
+            .query_row("SELECT COALESCE(MIN(queue_order), 0) FROM tasks", [], |r| {
+                r.get(0)
+            })
+            .map_err(db_err)?;
+        min - 1
+    } else {
+        conn.query_row(
+            "SELECT queue_order FROM tasks WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?
+    };
+    conn.execute(
+        "UPDATE tasks SET state='Queued', queue_order=?2, pause_reason=NULL, last_error=NULL, \
+         updated_at=?3 WHERE id=?1",
+        params![id, queue_order, now_text()],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+fn move_in_queue(conn: &mut Connection, id: i64, pos: QueueMove) -> Result<()> {
+    let cur: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT id, queue_order FROM tasks WHERE id=?1 AND state='Queued'",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some((_, my_order)) = cur else {
+        return Err(Error::InvalidArgument {
+            message: format!("task {id} is not in the queue"),
+        });
+    };
+    match pos {
+        QueueMove::Top => {
+            let min: i64 = conn
+                .query_row("SELECT COALESCE(MIN(queue_order), 0) FROM tasks", [], |r| {
+                    r.get(0)
+                })
+                .map_err(db_err)?;
+            conn.execute(
+                "UPDATE tasks SET queue_order=?2 WHERE id=?1",
+                params![id, min - 1],
+            )
+            .map_err(db_err)?;
+        }
+        QueueMove::Bottom => {
+            let max: i64 = conn
+                .query_row("SELECT COALESCE(MAX(queue_order), 0) FROM tasks", [], |r| {
+                    r.get(0)
+                })
+                .map_err(db_err)?;
+            conn.execute(
+                "UPDATE tasks SET queue_order=?2 WHERE id=?1",
+                params![id, max + 1],
+            )
+            .map_err(db_err)?;
+        }
+        QueueMove::Up => {
+            let neighbor: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT id, queue_order FROM tasks WHERE state='Queued' AND queue_order < ?1 \
+                     ORDER BY queue_order DESC LIMIT 1",
+                    params![my_order],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?;
+            if let Some((nid, norder)) = neighbor {
+                let tx = conn.transaction().map_err(db_err)?;
+                tx.execute(
+                    "UPDATE tasks SET queue_order=?2 WHERE id=?1",
+                    params![id, norder],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "UPDATE tasks SET queue_order=?2 WHERE id=?1",
+                    params![nid, my_order],
+                )
+                .map_err(db_err)?;
+                tx.commit().map_err(db_err)?;
+            }
+        }
+        QueueMove::Down => {
+            let neighbor: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT id, queue_order FROM tasks WHERE state='Queued' AND queue_order > ?1 \
+                     ORDER BY queue_order ASC LIMIT 1",
+                    params![my_order],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?;
+            if let Some((nid, norder)) = neighbor {
+                let tx = conn.transaction().map_err(db_err)?;
+                tx.execute(
+                    "UPDATE tasks SET queue_order=?2 WHERE id=?1",
+                    params![id, norder],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "UPDATE tasks SET queue_order=?2 WHERE id=?1",
+                    params![nid, my_order],
+                )
+                .map_err(db_err)?;
+                tx.commit().map_err(db_err)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 启动恢复时从 Finalizing 任务读出的一行。

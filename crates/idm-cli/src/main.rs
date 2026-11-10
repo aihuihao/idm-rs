@@ -272,7 +272,8 @@ mod dl {
     use idm_core::net::filename::{resolve_conflict, sanitize_windows_filename};
     use idm_core::net::host_limit::{DEFAULT_MAX_PER_HOST, MAX_PER_HOST_CEILING};
     use idm_core::net::probe::Probe;
-    use idm_core::store::{NewTask, Store};
+    use idm_core::queue::{DownloadQueue, QueueConfig, QueueMove};
+    use idm_core::store::{NewTask, QueuedTask, Store};
     use idm_core::task::{
         CancelSignal, ChunkState, DownloadContext, DownloadOptions, DownloadOutcome,
         ProgressSnapshot, download_with_store, resume,
@@ -982,7 +983,7 @@ mod dl {
                 return 1;
             }
         };
-        println!("ID | FILE | STATE | PAUSE | PROGRESS | LAST_ERROR");
+        println!("ID | QUEUE_ORDER | FILE | STATE | PAUSE | PROGRESS | LAST_ERROR");
         for t in tasks {
             let progress = match t.total_size {
                 Some(n) => format!("{}/{}", t.committed, n),
@@ -993,8 +994,9 @@ mod dl {
                 .map(|p| format!("{p:?}"))
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "{} | {} | {:?} | {} | {} | {}",
+                "{} | {} | {} | {:?} | {} | {} | {}",
                 t.id,
+                t.queue_order,
                 t.file_name.as_deref().unwrap_or("-"),
                 t.state,
                 pause,
@@ -1062,6 +1064,316 @@ mod dl {
         }
         println!("removed task {id}");
         0
+    }
+
+    /// `enqueue <URL> [--dir DIR] [--connections N] [--out NAME] [--max-speed 500K|3M] [--db PATH]`
+    /// 以 `Queued` 状态入队，打印任务 ID 与 `queue_order` 后退出（不立即下载）。
+    pub async fn run_enqueue(args: &[String], store: Arc<Store>) -> i32 {
+        let mut url: Option<String> = None;
+        let mut dir: Option<String> = None;
+        let mut connections: usize = 8;
+        let mut out_name: Option<String> = None;
+        let mut max_speed: Option<u64> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--dir" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --dir");
+                        return 2;
+                    }
+                    dir = Some(args[i].clone());
+                }
+                "--connections" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --connections");
+                        return 2;
+                    }
+                    match args[i].parse::<usize>() {
+                        Ok(v) if (1..=32).contains(&v) => connections = v,
+                        _ => {
+                            eprintln!("--connections must be in 1..=32");
+                            return 2;
+                        }
+                    }
+                }
+                "--out" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --out");
+                        return 2;
+                    }
+                    out_name = Some(args[i].clone());
+                }
+                "--max-speed" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-speed");
+                        return 2;
+                    }
+                    match parse_max_speed(&args[i]) {
+                        Some(v) => max_speed = Some(v),
+                        None => {
+                            eprintln!("invalid --max-speed: {}", args[i]);
+                            return 2;
+                        }
+                    }
+                }
+                "--db" | "--log-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for {}", args[i - 1]);
+                        return 2;
+                    }
+                }
+                other if url.is_none() && !other.starts_with("--") => url = Some(other.to_string()),
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    return 2;
+                }
+            }
+            i += 1;
+        }
+        let url = match url {
+            Some(u) => u,
+            None => {
+                eprintln!(
+                    "usage: idm-cli enqueue <URL> [--dir DIR] [--connections N] \
+                     [--out NAME] [--max-speed 500K|3M] [--db PATH]"
+                );
+                return 2;
+            }
+        };
+        let dir = match dir {
+            Some(d) => PathBuf::from(d),
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            crate::print_error("cannot create dir", &e);
+            return 1;
+        }
+        let id = match store
+            .enqueue_task(QueuedTask {
+                url: url.clone(),
+                dir: dir.to_string_lossy().into_owned(),
+                strategy: "Auto".to_string(),
+                connections,
+                max_speed,
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                crate::print_error("cannot enqueue task", &e);
+                return 1;
+            }
+        };
+        let queue_order = store.get_task(id).await.map(|r| r.queue_order).unwrap_or(0);
+        println!("ENQUEUED id={id} queue_order={queue_order}");
+        let _ = out_name;
+        0
+    }
+
+    /// `queue run [--max-tasks N] [--global-max-speed 3M] [--max-host-connections N]
+    /// [--proxy URL] [--no-proxy] [--db PATH]`：恢复并调度所有 `Queued` 任务直至空闲，打印
+    /// 汇总后退出；支持 Ctrl+C 安全停止所有活动任务。
+    pub async fn run_queue_run(args: &[String], store: Arc<Store>) -> i32 {
+        let mut max_tasks: usize = 3;
+        let mut global_max_speed: Option<u64> = None;
+        let mut max_host_connections: usize = DEFAULT_MAX_PER_HOST;
+        let mut proxy_url: Option<String> = None;
+        let mut no_proxy = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--max-tasks" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-tasks");
+                        return 2;
+                    }
+                    match args[i].parse::<usize>() {
+                        Ok(v) if (1..=16).contains(&v) => max_tasks = v,
+                        _ => {
+                            eprintln!("--max-tasks must be in 1..=16");
+                            return 2;
+                        }
+                    }
+                }
+                "--global-max-speed" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --global-max-speed");
+                        return 2;
+                    }
+                    match parse_max_speed(&args[i]) {
+                        Some(v) => global_max_speed = Some(v),
+                        None => {
+                            eprintln!("invalid --global-max-speed: {}", args[i]);
+                            return 2;
+                        }
+                    }
+                }
+                "--max-host-connections" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --max-host-connections");
+                        return 2;
+                    }
+                    match args[i].parse::<usize>() {
+                        Ok(v) if (1..=MAX_PER_HOST_CEILING).contains(&v) => {
+                            max_host_connections = v
+                        }
+                        _ => {
+                            eprintln!(
+                                "--max-host-connections must be in 1..={MAX_PER_HOST_CEILING}"
+                            );
+                            return 2;
+                        }
+                    }
+                }
+                "--proxy" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for --proxy");
+                        return 2;
+                    }
+                    proxy_url = Some(args[i].clone());
+                }
+                "--no-proxy" => no_proxy = true,
+                "--db" | "--log-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for {}", args[i - 1]);
+                        return 2;
+                    }
+                }
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    return 2;
+                }
+            }
+            i += 1;
+        }
+        if proxy_url.is_some() && no_proxy {
+            eprintln!("usage error: --proxy and --no-proxy are mutually exclusive");
+            return 2;
+        }
+        let proxy = if no_proxy {
+            ProxyConfig::Disabled
+        } else {
+            proxy_url.map_or(ProxyConfig::System, ProxyConfig::Custom)
+        };
+        let config = QueueConfig {
+            max_concurrent_tasks: max_tasks,
+            global_max_speed,
+            default_download_config: DownloadConfig {
+                max_connections_per_host: max_host_connections,
+                proxy,
+                ..DownloadConfig::default()
+            },
+            default_strategy: AllocationStrategy::Auto,
+        };
+        let pool = match DiskWriterPool::new(8, 64) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                crate::print_error("disk writer pool init failed", &e);
+                return 1;
+            }
+        };
+        let queue = DownloadQueue::new(store.clone(), pool, config);
+        match queue.adopt_queued().await {
+            Ok(_n) => {}
+            Err(e) => {
+                crate::print_error("adopt failed", &e);
+                return 1;
+            }
+        }
+        let q2 = queue.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = q2.shutdown().await;
+        });
+        match queue.wait_for_idle().await {
+            Ok(s) => {
+                let secs = s.total_elapsed.as_secs_f64();
+                println!(
+                    "QUEUE DONE completed={} failed={} paused={} elapsed={secs:.2}s",
+                    s.completed, s.failed, s.paused
+                );
+                0
+            }
+            Err(e) => {
+                crate::print_error("queue run failed", &e);
+                1
+            }
+        }
+    }
+
+    /// `queue move <id> <top|bottom|up|down> [--db PATH]`：调整排队任务顺序。
+    pub async fn run_queue_move(args: &[String], store: Arc<Store>) -> i32 {
+        let mut id: Option<i64> = None;
+        let mut pos: Option<QueueMove> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--db" | "--log-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for {}", args[i - 1]);
+                        return 2;
+                    }
+                }
+                other if id.is_none() && !other.starts_with("--") => match other.parse::<i64>() {
+                    Ok(v) => id = Some(v),
+                    Err(_) => {
+                        eprintln!("invalid task id: {other}");
+                        return 2;
+                    }
+                },
+                other if pos.is_none() && !other.starts_with("--") => match other {
+                    "top" => pos = Some(QueueMove::Top),
+                    "bottom" => pos = Some(QueueMove::Bottom),
+                    "up" => pos = Some(QueueMove::Up),
+                    "down" => pos = Some(QueueMove::Down),
+                    other => {
+                        eprintln!("unknown position: {other} (expected top|bottom|up|down)");
+                        return 2;
+                    }
+                },
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    return 2;
+                }
+            }
+            i += 1;
+        }
+        let id = match id {
+            Some(v) => v,
+            None => {
+                eprintln!("usage: idm-cli queue move <id> <top|bottom|up|down> [--db PATH]");
+                return 2;
+            }
+        };
+        let pos = match pos {
+            Some(p) => p,
+            None => {
+                eprintln!("missing position (top|bottom|up|down)");
+                return 2;
+            }
+        };
+        match store.move_in_queue(id, pos).await {
+            Ok(()) => {
+                println!("MOVED id={id} pos={pos:?}");
+                0
+            }
+            Err(e) => {
+                crate::print_error("move failed", &e);
+                1
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1311,7 +1623,7 @@ async fn main() {
             None => match default_db_path() {
                 Ok(p) => p,
                 Err(e) => {
-                    print_error("cannot resolve default db path", &e);
+                    crate::print_error("cannot resolve default db path", &e);
                     std::process::exit(1);
                 }
             },
@@ -1319,13 +1631,13 @@ async fn main() {
         let store = match Store::open(&db_path) {
             Ok(s) => s,
             Err(e) => {
-                print_error("cannot open database", &e);
+                crate::print_error("cannot open database", &e);
                 std::process::exit(1);
             }
         };
         // 启动时自动执行一次启动恢复（9.4）。
         if let Err(e) = store.recover().await {
-            print_error("startup recovery failed", &e);
+            crate::print_error("startup recovery failed", &e);
             std::process::exit(1);
         }
         let code = match sub {
@@ -1333,11 +1645,27 @@ async fn main() {
             "resume" => dl::run_resume(&args[2..], Arc::clone(&store)).await,
             "list" => dl::run_list(&args[2..], Arc::clone(&store)).await,
             "remove" => dl::run_remove(&args[2..], Arc::clone(&store)).await,
+            "enqueue" => dl::run_enqueue(&args[2..], Arc::clone(&store)).await,
+            "queue" => {
+                let sub2 = args.get(2).map(String::as_str).unwrap_or("");
+                match sub2 {
+                    "run" => dl::run_queue_run(&args[3..], Arc::clone(&store)).await,
+                    "move" => dl::run_queue_move(&args[3..], Arc::clone(&store)).await,
+                    other => {
+                        eprintln!("unknown queue subcommand: {other}");
+                        2
+                    }
+                }
+            }
             other => {
                 eprintln!("unknown subcommand: {other}");
                 2
             }
         };
+        // 显式关闭数据库（触发 WAL checkpoint），再退出，避免 `std::process::exit`
+        // 跳过 Store 析构导致 WAL 未被回写、其它进程读不到数据。
+        let _ = store.shutdown().await;
+        drop(store);
         std::process::exit(code);
     }
     #[cfg(not(windows))]
