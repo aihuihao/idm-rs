@@ -272,7 +272,7 @@ mod dl {
     use idm_core::net::filename::{resolve_conflict, sanitize_windows_filename};
     use idm_core::net::host_limit::{DEFAULT_MAX_PER_HOST, MAX_PER_HOST_CEILING};
     use idm_core::net::probe::Probe;
-    use idm_core::queue::{DownloadQueue, QueueConfig, QueueMove};
+    use idm_core::queue::{DownloadQueue, QueueConfig, QueueEvent, QueueMove};
     use idm_core::store::{NewTask, QueuedTask, Store};
     use idm_core::task::{
         CancelSignal, ChunkState, DownloadContext, DownloadOptions, DownloadOutcome,
@@ -1296,7 +1296,40 @@ mod dl {
             let _ = tokio::signal::ctrl_c().await;
             let _ = q2.shutdown().await;
         });
-        match queue.wait_for_idle().await {
+        // Phase 3c：恢复 CLI 对单个任务进度的访问。订阅事件维护活动任务 id 集合，
+        // 每秒通过 `DownloadQueue::progress(task_id)` 读取每个活动任务的最新快照。
+        let q_progress = queue.clone();
+        let progress_task = tokio::spawn(async move {
+            let mut events = q_progress.subscribe_events();
+            let mut active = std::collections::HashSet::<i64>::new();
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    ev = events.recv() => match ev {
+                        Ok(QueueEvent::TaskStarted { id }) => { active.insert(id); }
+                        Ok(QueueEvent::TaskCompleted { id })
+                        | Ok(QueueEvent::TaskPaused { id })
+                        | Ok(QueueEvent::TaskFailed { id }) => { active.remove(&id); }
+                        Err(_) => break,
+                        _ => {}
+                    },
+                    _ = ticker.tick() => {
+                        let ids: Vec<i64> = active.iter().copied().collect();
+                        for id in ids {
+                            if let Some(snap) = q_progress.progress(id).await {
+                                println!(
+                                    "TASK PROGRESS id={id} downloaded={} total={:?} speed={:.0} B/s",
+                                    snap.downloaded, snap.total_size, snap.speed
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let idle_result = queue.wait_for_idle().await;
+        progress_task.abort();
+        match idle_result {
             Ok(s) => {
                 let secs = s.total_elapsed.as_secs_f64();
                 println!(

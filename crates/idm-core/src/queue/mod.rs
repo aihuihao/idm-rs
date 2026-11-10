@@ -93,6 +93,8 @@ struct ActiveTask {
     cancel: Arc<CancelSignal>,
     done: Arc<Notify>,
     finished: Arc<AtomicBool>,
+    /// 该任务的进度快照接收端，供 `DownloadQueue::progress` 读取（CLI 逐任务进度）。
+    progress_rx: watch::Receiver<ProgressSnapshot>,
 }
 
 /// 调度器内部状态（被 [`DownloadQueue`] 以 `Arc` 持有）。
@@ -192,14 +194,15 @@ impl DownloadQueue {
         };
         if let (Some(cancel), Some(done), Some(finished)) = (cancel, done, finished) {
             cancel.cancel();
+            // 先创建 notified()（构造时捕获 notify_waiters 调用计数），再检查条件，
+            // 最后 await：这样即使任务恰好在「检查条件之后、注册等待之前」结束并
+            // 调用 notify_waiters，唤醒也不会丢失（首次 poll 会看到计数变化而立即返回）。
             loop {
+                let notified = done.notified();
                 if finished.load(Ordering::SeqCst) {
                     break;
                 }
-                done.notified().await;
-                if finished.load(Ordering::SeqCst) {
-                    break;
-                }
+                notified.await;
             }
             Ok(())
         } else {
@@ -268,11 +271,21 @@ impl DownloadQueue {
         self.inner.events.subscribe()
     }
 
+    /// 读取某个活动任务的最新进度快照；任务不在活动表中时返回 `None`。
+    ///
+    /// 供 CLI 在 `queue run` 期间逐个任务打印进度，无需为每个任务另外建立通道。
+    pub async fn progress(&self, task_id: i64) -> Option<ProgressSnapshot> {
+        let active = self.inner.active.lock().await;
+        active.get(&task_id).map(|t| t.progress_rx.borrow().clone())
+    }
+
     /// 让队列接纳数据库中所有已存在的 `Queued` 任务（CLI `queue run` 启动恢复后调用）。
     pub async fn adopt_queued(&self) -> Result<u64> {
         let queued = self.inner.store.list_queued_tasks().await?;
         let n = queued.len() as u64;
-        self.inner.outstanding.store(n, Ordering::SeqCst);
+        // 原子累加而非覆盖写：store(n) 会与并发的 enqueue / 任务收尾互相覆盖，
+        // 丢失这 n 个任务的未完成计数。
+        self.inner.outstanding.fetch_add(n, Ordering::SeqCst);
         self.inner.wake.notify_one();
         Ok(n)
     }
@@ -291,19 +304,43 @@ impl DownloadQueue {
     }
 
     /// 停止接纳新任务，取消所有当前活动任务并等待它们安全收尾退出。
-    /// 未被启动的排队任务（因停更而不再运行）移出未完成计数，避免 `wait_for_idle` 悬挂。
+    /// 未被启动的排队任务（因停机而不再运行）移出未完成计数，避免 `wait_for_idle` 悬挂。
     pub async fn shutdown(&self) -> Result<()> {
+        // 1. 先立停机标志：调度循环不再拉起任何 `Queued` 任务。
         self.inner.shutdown.store(true, Ordering::SeqCst);
+
+        // 2. 在取消生效前快照活动任务的取消句柄，并精确统计「未被启动的排队任务」。
+        //    活动任务的 DB 状态可能已是 `Downloading`（不在 `list_queued_tasks` 里），
+        //    因此不能简单用 `queued.len() - active.len()` 估算，必须按 id 排除活动项。
         let queued = self.inner.store.list_queued_tasks().await?;
-        let active_count = self.inner.active.lock().await.len();
-        let not_started = (queued.len() as i64 - active_count as i64).max(0);
+        let (cancels, not_started) = {
+            let active = self.inner.active.lock().await;
+            let cancels = active
+                .values()
+                .map(|t| Arc::clone(&t.cancel))
+                .collect::<Vec<_>>();
+            let not_started = queued
+                .iter()
+                .filter(|r| !active.contains_key(&r.id))
+                .count() as i64;
+            (cancels, not_started)
+        };
         bump_outstanding(&self.inner, -not_started);
+
+        // 3. 先取消所有活动任务（Ctrl+C 安全停止：状态落为 `Paused(User)`）。
+        for c in &cancels {
+            c.cancel();
+        }
         self.inner.wake.notify_one();
+
+        // 4. 再等待它们收尾：先创建 notified()，再检查条件，最后 await，
+        //    避免「最后一个任务恰好在检查之后结束」时丢失唤醒。
         loop {
+            let notified = self.inner.idle.notified();
             if self.inner.active.lock().await.is_empty() {
                 break;
             }
-            self.inner.idle.notified().await;
+            notified.await;
         }
         Ok(())
     }
@@ -355,13 +392,14 @@ async fn spawn_task(inner: &Arc<Inner>, rec: TaskRecord) {
     let cancel = Arc::new(CancelSignal::new());
     let done = Arc::new(Notify::new());
     let finished = Arc::new(AtomicBool::new(false));
-    let (ptx, _prx) = watch::channel(ProgressSnapshot::default());
+    let (ptx, prx) = watch::channel(ProgressSnapshot::default());
     inner.active.lock().await.insert(
         id,
         ActiveTask {
             cancel: Arc::clone(&cancel),
             done: Arc::clone(&done),
             finished: Arc::clone(&finished),
+            progress_rx: prx,
         },
     );
     let inner2 = Arc::clone(inner);
@@ -394,7 +432,7 @@ async fn run_one(
     Ok(outcome)
 }
 
-/// 任务结束后清理：移除活动项、递减计数、发事件、必要时唤醒空闲等待者。
+/// 任务结束后清理：错误时落终态、移除活动项、递减计数、发事件、唤醒等待者。
 async fn on_finished(
     inner: &Arc<Inner>,
     id: i64,
@@ -402,6 +440,24 @@ async fn on_finished(
     finished: Arc<AtomicBool>,
     done: Arc<Notify>,
 ) {
+    // 1. 错误路径：若数据库里该任务仍是 `Queued`，说明下载在写入任何状态之前
+    //    就失败了。必须立刻落终态，否则 `list_queued_tasks` 始终能查到它，
+    //    调度器会把同一个任务反复拉起。
+    //    该写入必须早于「移除活动项」和「唤醒调度器」：期间 `active` 仍持有这个
+    //    id，`try_schedule` 会把它排除，杜绝并发重复拉起。
+    if let Err(e) = &result
+        && let Ok(rec) = inner.store.get_task(id).await
+        && rec.state == TaskStateDb::Queued
+    {
+        let (state, pause, last_error) = if matches!(e, Error::TaskInUse { .. }) {
+            // 9.5：另一个进程正占用该任务，放回暂停状态等待后续恢复，不改失败态。
+            (TaskStateDb::Paused, Some(PauseReasonDb::Interrupted), None)
+        } else {
+            (TaskStateDb::Failed, None, Some(format!("{e}")))
+        };
+        let _ = inner.store.update_state(id, state, pause, last_error).await;
+    }
+
     finished.store(true, Ordering::SeqCst);
     done.notify_waiters();
     inner.active.lock().await.remove(&id);
@@ -423,12 +479,15 @@ async fn on_finished(
     if let Some(ev) = event {
         let _ = inner.events.send(ev);
     }
-    if inner.outstanding.load(Ordering::SeqCst) == 0 {
-        if let Some(start) = inner.started_at.lock().await.take() {
-            inner.summary.lock().await.total_elapsed = start.elapsed();
-        }
-        inner.idle.notify_waiters();
+    if inner.outstanding.load(Ordering::SeqCst) == 0
+        && let Some(start) = inner.started_at.lock().await.take()
+    {
+        inner.summary.lock().await.total_elapsed = start.elapsed();
     }
+    // 无条件唤醒：既服务 `wait_for_idle`（判断 outstanding），也服务 `shutdown`
+    // （判断 active）；只在计数归零时通知会让 `shutdown` 因活动任务已清空但
+    // 计数不为 0 而永远等不到唤醒。
+    inner.idle.notify_waiters();
     inner.wake.notify_one();
 }
 
@@ -460,10 +519,22 @@ fn build_options(
     }
 }
 
+/// 原子地增减未完成计数，下限为 0（饱和）。
+///
+/// 增加走 `fetch_add`，减少走原子读改写 `try_update`（即旧名 `fetch_update`，
+/// rustc 1.99.1 起重命名）；绝不使用 `load` + `store` 的非原子读改写，否则并发的
+/// `on_finished` 会互相覆盖，计数永远无法归零，`wait_for_idle` 随之永久挂起。
 fn bump_outstanding(inner: &Arc<Inner>, delta: i64) {
-    let old = inner.outstanding.load(Ordering::SeqCst);
-    let new = (old as i64 + delta).max(0) as u64;
-    inner.outstanding.store(new, Ordering::SeqCst);
+    if delta >= 0 {
+        let _ = inner.outstanding.fetch_add(delta as u64, Ordering::SeqCst);
+    } else {
+        let n = delta.unsigned_abs();
+        let _ = inner
+            .outstanding
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                Some(cur.saturating_sub(n))
+            });
+    }
 }
 
 async fn inc_summary(inner: &Arc<Inner>, f: impl FnOnce(&mut QueueSummary)) {
@@ -476,6 +547,33 @@ mod tests {
     use super::*;
     use crate::store::Store;
     use tempfile::tempdir;
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    /// 构造一个带独立 SQLite 库的测试队列。
+    fn test_queue(dir: &std::path::Path) -> TestResult<DownloadQueue> {
+        let store = Store::open(dir.join("q.db"))?;
+        let pool = Arc::new(DiskWriterPool::new(2, 16)?);
+        Ok(DownloadQueue::new(store, pool, QueueConfig::default()))
+    }
+
+    /// 在活动表中登记一个「正在运行」的任务句柄（不启动真实下载），
+    /// 返回完成信号与结束标志，供测试精确模拟任务在任意时刻自然结束。
+    async fn install_active(q: &DownloadQueue, id: i64) -> (Arc<Notify>, Arc<AtomicBool>) {
+        let done = Arc::new(Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = watch::channel(ProgressSnapshot::default());
+        q.inner.active.lock().await.insert(
+            id,
+            ActiveTask {
+                cancel: Arc::new(CancelSignal::new()),
+                done: Arc::clone(&done),
+                finished: Arc::clone(&finished),
+                progress_rx: rx,
+            },
+        );
+        (done, finished)
+    }
 
     #[tokio::test]
     async fn enqueue_preserves_order_and_state() {
@@ -508,5 +606,74 @@ mod tests {
             assert_eq!(r.state, TaskStateDb::Queued);
         }
         q.shutdown().await.unwrap();
+    }
+
+    /// 任务在 `pause()` 调用的同一时刻自然结束：重复 200 次，每次 `pause`
+    /// 都必须在 1 秒内返回。多线程 + 不同 yield 次数扫描「检查条件之后、
+    /// 注册等待之前」这一会丢失 `notify_waiters` 唤醒的竞态窗口。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pause_does_not_hang_when_task_finishes_concurrently() -> TestResult {
+        let dir = tempdir()?;
+        let q = test_queue(dir.path())?;
+        for iteration in 0..200 {
+            let id = (iteration + 1) as i64;
+            let (done, finished) = install_active(&q, id).await;
+            let fin = Arc::clone(&finished);
+            let yields = iteration % 16;
+            // 模拟任务恰好在 pause 调用期间自然结束：先置位结束标志，再
+            // notify_waiters（与 on_finished 的顺序一致）。故意不立即移出活动表，
+            // 保证 pause 每次都进入「等待活动任务收尾」的循环。
+            let finisher = tokio::spawn(async move {
+                for _ in 0..yields {
+                    tokio::task::yield_now().await;
+                }
+                fin.store(true, Ordering::SeqCst);
+                done.notify_waiters();
+            });
+            match tokio::time::timeout(Duration::from_secs(1), q.pause(id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => panic!("iteration {iteration}: pause 挂起超过 1 秒"),
+            }
+            finisher.await?;
+            q.inner.active.lock().await.remove(&id);
+        }
+        q.shutdown().await?;
+        Ok(())
+    }
+
+    /// 20 个任务同时结束：未完成计数必须精确归零，`wait_for_idle` 正常返回；
+    /// 重复 50 次。旧实现 `load` + `store` 的非原子读改写会丢失并发递减。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn outstanding_stays_consistent_under_concurrent_finish() -> TestResult {
+        for iteration in 0..50 {
+            let dir = tempdir()?;
+            let q = test_queue(dir.path())?;
+            let mut joins = Vec::new();
+            for i in 0..20 {
+                let id = (i + 1) as i64;
+                let (done, finished) = install_active(&q, id).await;
+                bump_outstanding(&q.inner, 1);
+                let inner = Arc::clone(&q.inner);
+                joins.push(tokio::spawn(async move {
+                    on_finished(&inner, id, Ok(DownloadOutcome::Completed), finished, done).await;
+                }));
+            }
+            for j in joins {
+                j.await?;
+            }
+            assert_eq!(
+                q.inner.outstanding.load(Ordering::SeqCst),
+                0,
+                "iteration {iteration}: 并发收尾后未完成计数未归零"
+            );
+            match tokio::time::timeout(Duration::from_secs(2), q.wait_for_idle()).await {
+                Ok(Ok(s)) => assert_eq!(s.completed, 20, "iteration {iteration}: 汇总计数错误"),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => panic!("iteration {iteration}: wait_for_idle 挂起"),
+            }
+            q.shutdown().await?;
+        }
+        Ok(())
     }
 }
