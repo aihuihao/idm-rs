@@ -70,12 +70,22 @@ struct SharedInner {
     reserved: u64,
     /// 当前区间终点，可被切分缩小。
     end: u64,
-    /// 分块启动时刻（Phase 2.1：区分"刚创建"与"已卡住超过一个速度窗口"）。
+    /// 请求发出时刻（Phase 2.1 区分"刚创建"与"已卡住超过一个速度窗口"；
+    /// Phase 3d 改为**置位时刻**，排队等 Host 名额的时间不算在内）。
     started: Instant,
     /// 是否已经写入过任何数据。
     has_data: bool,
     /// 速度采样：(采样时间, 当时的 acked 位置)。
     samples: VecDeque<(Instant, u64)>,
+    /// Phase 3d：本次请求是否仍持有 Host 名额。拿到名额、请求即将发出时置位；
+    /// 请求结束 / 出错 / 进入退避时复位。排队等名额的分块为 `false`，不计入在途连接数。
+    holds_permit: bool,
+    /// Phase 3d：是否已发出过请求（可参与 `select_victim`）。排队等名额的分块为
+    /// `false`；一旦发出过请求就保持 `true`——退避中的分块仍可被接管（10.5）。
+    eligible_for_split: bool,
+    /// Phase 3d：当前是否正卡在名额申请里排队等 Host 名额。用于把排队分块从
+    /// 「在途连接数」中扣除；退避 / 下载 / 完成态均为 `false`。
+    waiting_for_permit: bool,
 }
 
 impl ChunkShared {
@@ -95,6 +105,9 @@ impl ChunkShared {
                 started: now,
                 has_data: false,
                 samples,
+                holds_permit: false,
+                eligible_for_split: false,
+                waiting_for_permit: false,
             }),
             end_tx,
             end_rx,
@@ -103,6 +116,52 @@ impl ChunkShared {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SharedInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Phase 3d：拿到 Host 名额、`req.send()` 即将开始时调用。
+    ///
+    /// 同时置位 `holds_permit` 与 `eligible_for_split`，并把 `is_fresh` /
+    /// `is_stalled` 的计时起点与速度采样重置到此刻——排队等名额的时间不得被
+    /// 当作"卡住"，否则排队分块会在 4 秒后被误判为接管对象。
+    pub(super) fn mark_request_started(&self) {
+        let now = Instant::now();
+        let pos = self.acked.load(Ordering::Acquire);
+        let mut g = self.lock();
+        g.holds_permit = true;
+        g.eligible_for_split = true;
+        g.started = now;
+        g.samples.clear();
+        g.samples.push_back((now, pos));
+    }
+
+    /// Phase 3d：请求结束（完成 / 出错 / 被接管提前关闭 / 进入退避）时释放名额标记。
+    /// 幂等：只有当前确实持有名额时才复位。`eligible_for_split` 保持不变——
+    /// 退避中的分块仍可被接管（10.5）。
+    pub(super) fn release_permit(&self) {
+        if self.holds_permit() {
+            self.lock().holds_permit = false;
+        }
+    }
+
+    pub(super) fn holds_permit(&self) -> bool {
+        self.lock().holds_permit
+    }
+
+    pub(super) fn eligible_for_split(&self) -> bool {
+        self.lock().eligible_for_split
+    }
+
+    /// Phase 3d：进入 / 退出「排队等 Host 名额」状态。
+    pub(super) fn mark_waiting_for_permit(&self) {
+        self.lock().waiting_for_permit = true;
+    }
+
+    pub(super) fn clear_waiting_for_permit(&self) {
+        self.lock().waiting_for_permit = false;
+    }
+
+    pub(super) fn waiting_for_permit(&self) -> bool {
+        self.lock().waiting_for_permit
     }
 
     /// 订阅 end 变更（10.5 唤醒）。返回的接收端把"当前值"标记为已读，
@@ -302,6 +361,11 @@ impl ChunkSlot {
     pub(super) fn new(shared: Arc<ChunkShared>, pc: PoolChunk, idx: usize) -> Self {
         ChunkSlot { shared, pc, idx }
     }
+
+    /// 供主循环统计在途连接数（Phase 3d）。
+    pub(super) fn shared(&self) -> &Arc<ChunkShared> {
+        &self.shared
+    }
 }
 
 /// 10.5 零进度接管：第 7 步延迟到被接管分块的任务结束、释放写入器之后再执行。
@@ -357,12 +421,17 @@ fn select_victim(
     min_split: u64,
 ) -> Option<(usize, f64, f64, SplitMode)> {
     let now = Instant::now();
-    // 每个分块只取一次状态快照。
-    let states: Vec<(u64, u64, u64, f64, bool, bool)> = shared
+    // Phase 3d：只在「已发出请求」的分块中选择。排队等 Host 名额的分块既没有
+    // 速度数据，也还没有连接可以释放，不能被当作卡住的分块接管。
+    // 元组第一项是它在 `shared` 中的原始下标（try_split 用它索引 slots）。
+    let states: Vec<(usize, u64, u64, u64, f64, bool, bool)> = shared
         .iter()
-        .map(|s| {
+        .enumerate()
+        .filter(|(_, s)| s.eligible_for_split())
+        .map(|(i, s)| {
             let (reserved, end) = s.reserved_end();
             (
+                i,
                 s.remaining(),
                 reserved,
                 end,
@@ -375,14 +444,14 @@ fn select_victim(
     // 平均速度只统计"正在下载且有速度数据"的分块（2.1 / 10.5 共用）。
     let (sum, count) = states
         .iter()
-        .filter(|(remaining, _, _, speed, _, _)| *remaining > 0 && *speed > 0.0)
-        .fold((0.0f64, 0usize), |(s, n), (_, _, _, v, _, _)| {
+        .filter(|(_, remaining, _, _, speed, _, _)| *remaining > 0 && *speed > 0.0)
+        .fold((0.0f64, 0usize), |(s, n), (_, _, _, _, v, _, _)| {
             (s + *v, n + 1)
         });
     let avg_speed = if count == 0 { 0.0 } else { sum / count as f64 };
 
     let mut best: Option<(usize, f64, f64, SplitMode)> = None;
-    for (i, (remaining, reserved, end, speed, fresh, stalled)) in states.iter().enumerate() {
+    for (i, remaining, reserved, end, speed, fresh, stalled) in &states {
         if *remaining == 0 {
             continue;
         }
@@ -411,10 +480,25 @@ fn select_victim(
             f64::INFINITY
         };
         if best.is_none_or(|(_, best_eta, _, _)| eta > best_eta) {
-            best = Some((i, eta, effective_speed, mode));
+            best = Some((*i, eta, effective_speed, mode));
         }
     }
     best
+}
+
+/// Phase 3d：在途连接数 = 仍在跑的分块任务 + 延迟分配 pending
+/// − 正在排队等 Host 名额的分块（它们尚未持有连接槽位）。
+///
+/// 等价于「统计已置位（已发出请求）的分块与 pending 之和」：退避中的分块没有
+/// 排队等名额，`holds_permit` 虽为 `false` 但仍计入，与 10.5「退避期间可被接管」
+/// 的既有行为一致；只有从未发出请求、卡在 `acquire` 里的分块被扣除。
+pub(super) fn in_flight_count(
+    join_set_len: usize,
+    pending_len: usize,
+    shared: &[Arc<ChunkShared>],
+) -> usize {
+    let queued = shared.iter().filter(|s| s.waiting_for_permit()).count();
+    (join_set_len + pending_len).saturating_sub(queued)
 }
 
 /// Phase 2 工作窃取：按 ARCHITECTURE 10.3 的 7 个步骤切分一个分块。
@@ -567,8 +651,12 @@ mod tests {
             .collect();
     }
 
+    /// 单元测试构造的分块一律模拟「已发出请求」：真实下载中每个分块在
+    /// `attempt_chunk_once` 拿到 Host 名额后都会置位。
     fn chunk(start: u64, end: u64, idx: i64) -> Arc<ChunkShared> {
-        Arc::new(ChunkShared::new(start, end, idx))
+        let s = Arc::new(ChunkShared::new(start, end, idx));
+        s.mark_request_started();
+        s
     }
 
     /// 已经卡住超过一个速度窗口、速度为 0 的采样。
@@ -951,6 +1039,95 @@ mod tests {
             "reserved == split 时对半切必须放弃"
         );
         assert_eq!(half.end(), 8 * MIB);
+        Ok(())
+    }
+
+    /// Phase 3d 单元测试：`select_victim` 忽略尚未发出请求（排队等 Host 名额）的分块。
+    /// 排队分块即使"卡住超过一个速度窗口、ETA 无穷大"，也不能被选为接管对象。
+    #[test]
+    fn select_victim_ignores_chunks_without_request() -> T {
+        let queued = Arc::new(ChunkShared::new(0, 16 * MIB, 0));
+        set_state(
+            &queued,
+            0,
+            0,
+            Duration::from_secs(6),
+            false,
+            &stuck_samples(0),
+        );
+        assert!(!queued.eligible_for_split());
+        assert_eq!(queued.recent_speed(), 0.0);
+        assert!(
+            queued.is_stalled(Instant::now()),
+            "排队久的分块看起来像卡住"
+        );
+
+        let active = chunk(16 * MIB, 32 * MIB, 1);
+        set_state(
+            &active,
+            16 * MIB + MIB,
+            16 * MIB + MIB,
+            Duration::from_secs(1),
+            true,
+            &moving_samples(16 * MIB, MIB),
+        );
+
+        let (idx, _, _, _) = select_victim(&[Arc::clone(&queued), Arc::clone(&active)], MIB)
+            .ok_or("应选中已发出请求的分块")?;
+        assert_eq!(idx, 1, "排队等名额的分块不得成为接管 / 切分对象");
+
+        assert!(
+            select_victim(&[queued], MIB).is_none(),
+            "全是排队分块时不得触发任何切分"
+        );
+        Ok(())
+    }
+
+    /// Phase 3d：排队等名额的分块不占在途连接槽位；增加排队分块不会让
+    /// `in_flight < max_concurrent` 的判断提前触发新的切分。
+    #[test]
+    fn in_flight_count_excludes_queued_chunks() -> T {
+        let held_a = chunk(0, 4 * MIB, 0);
+        let held_b = chunk(4 * MIB, 8 * MIB, 1);
+        let queued_a = Arc::new(ChunkShared::new(8 * MIB, 12 * MIB, 2));
+        let queued_b = Arc::new(ChunkShared::new(12 * MIB, 16 * MIB, 3));
+        queued_a.mark_waiting_for_permit();
+        queued_b.mark_waiting_for_permit();
+        let shared = vec![
+            Arc::clone(&held_a),
+            Arc::clone(&held_b),
+            Arc::clone(&queued_a),
+            Arc::clone(&queued_b),
+        ];
+
+        // 4 个任务在跑，其中 2 个排队等名额 → 在途连接数只有 2。
+        assert_eq!(in_flight_count(4, 0, &shared), 2);
+        assert!(in_flight_count(4, 0, &shared) < 4usize);
+        // 再增加一个排队分块（join_set 同步 +1），在途连接数与判断结果都不变。
+        let extra = Arc::new(ChunkShared::new(0, MIB, 9));
+        extra.mark_waiting_for_permit();
+        let mut more = shared.clone();
+        more.push(extra);
+        assert_eq!(
+            in_flight_count(5, 0, &more),
+            2,
+            "排队分块数量不得改变在途连接数判断"
+        );
+        assert_eq!(in_flight_count(4, 1, &shared), 3, "pending 仍占槽位");
+
+        // 退避：只复位 holds_permit，任务仍在跑且不在排队 → 仍计入在途连接数。
+        held_a.release_permit();
+        assert_eq!(in_flight_count(4, 0, &shared), 2, "退避中的分块仍计入");
+        assert!(!held_a.holds_permit(), "退避期间 holds_permit 必须为 false");
+        assert!(
+            held_a.eligible_for_split(),
+            "退避中的分块仍可被接管（10.5）"
+        );
+        assert!(!queued_a.eligible_for_split(), "排队分块始终不参与切分选择");
+        // 排队分块拿到名额后不再被扣除。
+        queued_a.clear_waiting_for_permit();
+        queued_a.mark_request_started();
+        assert_eq!(in_flight_count(4, 0, &shared), 3);
         Ok(())
     }
 }

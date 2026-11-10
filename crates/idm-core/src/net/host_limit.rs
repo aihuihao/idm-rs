@@ -10,7 +10,10 @@
 //! 下一次重试会重新申请。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use reqwest::Url;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -92,15 +95,54 @@ impl HostConnectionLimiter {
     ///
     /// 返回的 [`HostPermit`] 一旦被 drop 就立即把名额还给该 Host 的信号量。
     pub async fn acquire(&self, url: &Url, cancel: &CancelSignal) -> Result<HostPermit> {
-        let sem = self.semaphore_for(url)?;
-        let permit = tokio::select! {
+        let mut fut = self.acquire_future(url)?;
+        tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(Error::Cancelled),
-            p = sem.acquire_owned() => p.map_err(|_| Error::InvalidArgument {
-                message: "host connection semaphore closed".to_string(),
-            })?,
-        };
-        Ok(HostPermit { _permit: permit })
+            _ = cancel.cancelled() => Err(Error::Cancelled),
+            p = &mut fut => p,
+        }
+    }
+
+    /// 返回一个可复用的名额申请 future（Phase 3d：可被 `select!` 中断而不丢失排队位置）。
+    ///
+    /// `Semaphore::acquire_owned` 的 future 在第一次 poll 时进入公平等待队列；若因
+    /// `select!` 的其它分支先完成而被 drop，排队位置会丢失，重新申请只能排到队尾。
+    /// 本方法把该 future **pin 住并返回**：调用方用 `&mut fut` 反复 poll 同一个
+    /// future，即可在并列监听取消 / `end` 缩小的同时保持原来的排队位置。
+    pub fn acquire_future(&self, url: &Url) -> Result<HostPermitFuture> {
+        let sem = self.semaphore_for(url)?;
+        Ok(HostPermitFuture {
+            inner: Box::pin(async move {
+                let permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::InvalidArgument {
+                        message: "host connection semaphore closed".to_string(),
+                    })?;
+                Ok(HostPermit { _permit: permit })
+            }),
+        })
+    }
+
+    /// 指定 Host 当前可用的名额数（诊断 / 测试用）。
+    pub fn available_permits(&self, url: &Url) -> Result<usize> {
+        Ok(self.semaphore_for(url)?.available_permits())
+    }
+}
+
+/// 可被 `select!` 中断而不丢失 Semaphore 公平队列位置的名额申请 future。
+///
+/// 实现了 [`Future`]，且内部是 `Pin<Box<...>>`，因此自身 [`Unpin`]：调用方可以直接
+/// 在 `tokio::select!` 里写 `p = &mut fut`，而不会因为其它分支先完成就 drop 它。
+pub struct HostPermitFuture {
+    inner: Pin<Box<dyn Future<Output = Result<HostPermit>> + Send>>,
+}
+
+impl Future for HostPermitFuture {
+    type Output = Result<HostPermit>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
     }
 }
 
@@ -174,5 +216,42 @@ mod tests {
         let cancelled = limiter2.acquire(&url, &sig).await;
         assert!(matches!(cancelled, Err(Error::Cancelled)));
         drop(held);
+    }
+
+    /// Phase 3d：`select!` 中断后继续 poll 同一个 `acquire_future`，必须保持
+    /// Semaphore 公平队列中的位置——先入队的等待者要先于后入队者拿到名额。
+    #[tokio::test]
+    async fn acquire_future_keeps_queue_position_when_interrupted() {
+        let url = Url::parse("http://example.com/f").unwrap();
+        let limiter = HostConnectionLimiter::new(1).unwrap();
+        let sig = CancelSignal::new();
+        let held = limiter.acquire(&url, &sig).await.unwrap();
+
+        // A 先入队，并在 select! 中被无关分支中断一次（future 本身不被 drop）。
+        let mut a = limiter.acquire_future(&url).unwrap();
+        tokio::select! {
+            biased;
+            _ = tokio::task::yield_now() => {}
+            _ = &mut a => panic!("A must not complete while permit is held"),
+        }
+        // B 后入队。
+        let mut b = limiter.acquire_future(&url).unwrap();
+        tokio::select! {
+            biased;
+            _ = tokio::task::yield_now() => {}
+            _ = &mut b => panic!("B must not complete while permit is held"),
+        }
+        assert_eq!(limiter.available_permits(&url).unwrap(), 0);
+
+        drop(held);
+        // 若 A 丢了排队位置（被重新排到 B 之后），这里会一直等 B 完成而挂起。
+        let first = tokio::time::timeout(Duration::from_millis(500), &mut a).await;
+        assert!(
+            matches!(first, Ok(Ok(_))),
+            "先入队且被中断过的等待者必须先拿到名额"
+        );
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_millis(500), &mut b).await;
+        assert!(matches!(second, Ok(Ok(_))), "A 释放名额后 B 应拿到名额");
     }
 }

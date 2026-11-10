@@ -152,6 +152,9 @@ pub struct ServerConfig {
     pub max_active: Option<Arc<AtomicU64>>,
     /// 服务器实际写出的响应正文字节数（Phase 3a：动态降速测试统计真实传输量）。
     pub bytes_sent: Option<Arc<AtomicU64>>,
+    /// Phase 3d：前 N 个非 Probe 响应在发送响应头之前延迟（模拟请求已发出、
+    /// 服务器迟迟不响应，让这些分块持有 Host 名额却卡在 `req.send()`）。
+    pub response_delay: Option<(u64, Duration)>,
 }
 
 impl Default for ServerConfig {
@@ -191,6 +194,7 @@ impl Default for ServerConfig {
             active: None,
             max_active: None,
             bytes_sent: None,
+            response_delay: None,
         }
     }
 }
@@ -498,6 +502,14 @@ async fn handle_conn(
         && wait_for_client_close(&mut sock, st).await?
     {
         return Ok(());
+    }
+    // Phase 3d：前 N 个非 Probe 响应在响应头之前停住。客户端仍持有 Host 名额，
+    // 服务器却迟迟不响应，正好构造「2 个请求占满名额、其余分块排队」的场景。
+    if !is_probe
+        && let Some((count, delay)) = cfg.response_delay
+        && request_no <= count
+    {
+        tokio::time::sleep(delay).await;
     }
     sock.write_all(head.as_bytes()).await?;
 

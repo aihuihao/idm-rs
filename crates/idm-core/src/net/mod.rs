@@ -12,8 +12,8 @@ pub use client::{DownloadConfig, ProxyConfig};
 pub use filename::{infer_filename, resolve_conflict, sanitize_windows_filename};
 pub use headers::{ContentRange, HeaderParseError, parse_content_disposition, parse_content_range};
 pub use host_limit::{
-    DEFAULT_MAX_PER_HOST, HostConnectionLimiter, HostKey, HostPermit, MAX_PER_HOST_CEILING,
-    host_key,
+    DEFAULT_MAX_PER_HOST, HostConnectionLimiter, HostKey, HostPermit, HostPermitFuture,
+    MAX_PER_HOST_CEILING, host_key,
 };
 pub use probe::{Probe, ProbeResult};
 pub use ratelimit::{BandwidthLimiter, RateLimiter};

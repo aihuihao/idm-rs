@@ -31,11 +31,13 @@ use crate::net::retry::{
     MAX_TOTAL_ATTEMPTS, PROGRESS_RESET_BYTES, XorShift64, backoff_delay, is_retryable,
     parse_retry_after,
 };
-use crate::net::{BandwidthLimiter, HostConnectionLimiter, RateLimiter};
+use crate::net::{BandwidthLimiter, HostConnectionLimiter, HostPermit, RateLimiter};
 use crate::store::{ChunkRow, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
 use crate::task::cancel::{CancelSignal, wait_cancelled};
 use crate::task::progress::{ChunkInit, ProgressPublisher, ProgressSnapshot};
-use crate::task::split::{ChunkShared, ChunkSlot, PendingChunk, launch_new_chunk, try_split};
+use crate::task::split::{
+    ChunkShared, ChunkSlot, PendingChunk, in_flight_count, launch_new_chunk, try_split,
+};
 use crate::task::state::{ChunkState, TaskState};
 
 /// 各分块的 `(chunk_index, acked 绝对位置)` 列表。
@@ -641,6 +643,23 @@ async fn run_download(
     // 10.5 零进度接管：等待被接管分块释放写器之后才启动的新分块。
     let mut pending: Vec<PendingChunk> = Vec::new();
 
+    // Phase 3d：在途连接数 = 仍在跑的分块任务 + 延迟分配 pending − 正在排队
+    // 等 Host 名额的分块。排队分块不占连接槽位，也不会触发新的切分
+    // （它们同时被 select_victim 排除）；退避中的分块仍计入，保持 10.5 行为。
+    let in_flight = |slots: &[ChunkSlot],
+                     join_set: &JoinSet<Result<ChunkResult>>,
+                     pending: &[PendingChunk]|
+     -> usize {
+        in_flight_count(
+            join_set.len(),
+            pending.len(),
+            &slots
+                .iter()
+                .map(|s| Arc::clone(s.shared()))
+                .collect::<Vec<_>>(),
+        )
+    };
+
     let mut outcome: Option<Result<DownloadOutcome>> = None;
     loop {
         // pending 也占着一个连接名额，不能因为 join_set 暂时为空就收尾。
@@ -680,7 +699,7 @@ async fn run_download(
                         }
                         if opts.config.dynamic_split
                             && !streaming
-                            && join_set.len() + pending.len() < max_concurrent
+                            && in_flight(&slots, &join_set, &pending) < max_concurrent
                             && let Err(e) = try_split(
                                 ctx,
                                 &spawner,
@@ -741,7 +760,7 @@ async fn run_download(
                 }
                 if opts.config.dynamic_split
                     && !streaming
-                    && join_set.len() + pending.len() < max_concurrent
+                    && in_flight(&slots, &join_set, &pending) < max_concurrent
                     && let Err(e) = try_split(
                         ctx,
                         &spawner,
@@ -1206,6 +1225,61 @@ async fn wake_on_shrink(
     }
 }
 
+/// Phase 3d：申请 Host 名额，等待期间与「取消」和 10.5 的「end 缩小」并列监听。
+///
+/// `acquire_future` 只创建一次并跨 `select!` 轮次复用：被 end 缩小唤醒但
+/// `acked < end` 时继续等**同一个**申请，不会把分块重新排到 Semaphore 公平队列的
+/// 队尾。被接管到 `acked >= end` 时返回 `Ok(None)`——丢弃等待、不占名额，调用方
+/// 立即以 `Completed` 结束（零进度接管等它 5 秒的场景由此不再超时失败）。
+async fn acquire_with_shrink(
+    limiter: &HostConnectionLimiter,
+    url: &Url,
+    cancel: &CancelSignal,
+    shared: &ChunkShared,
+    acked: &AtomicU64,
+    end_rx: &mut watch::Receiver<u64>,
+) -> Result<Option<HostPermit>> {
+    // 排队等名额期间标记自己，供主循环把排队分块从在途连接数中扣除。
+    shared.mark_waiting_for_permit();
+    let _waiting = WaitingForPermitGuard(shared);
+    let mut permit_fut = limiter.acquire_future(url)?;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            exit = wake_on_shrink(end_rx, shared, acked) => {
+                if exit.is_some() {
+                    return Ok(None);
+                }
+            }
+            p = &mut permit_fut => return p.map(Some),
+        }
+    }
+}
+
+/// 离开名额申请（拿到名额 / 被接管唤醒 / 取消 / 任务被 abort）时清除排队标记。
+struct WaitingForPermitGuard<'a>(&'a ChunkShared);
+
+impl Drop for WaitingForPermitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clear_waiting_for_permit();
+    }
+}
+
+/// 请求结束时复位 `holds_permit` 的 RAII 守卫：无论完成、出错、被取消还是被接管
+/// 提前关闭，`attempt_chunk_once` 返回时都会释放「持有名额」标记。
+/// `eligible_for_split` 不复位——退避中的分块仍可被接管（10.5）。
+struct HeldPermit<'a> {
+    _permit: HostPermit,
+    shared: &'a ChunkShared,
+}
+
+impl Drop for HeldPermit<'_> {
+    fn drop(&mut self) {
+        self.shared.release_permit();
+    }
+}
+
 /// 分块主体（Phase 1d 重试循环）：每一步网络读取与磁盘写入之前都检查取消。
 /// 分块请求**不**设总时长超时（依赖 Client 级别的 `connect_timeout` 与
 /// `read_timeout`），避免大分块在慢速网络下失败。
@@ -1374,13 +1448,31 @@ async fn attempt_chunk_once(
         return Ok(ChunkExit::Completed);
     }
 
-    // Phase 3a：每次请求前申请按 Host 的连接名额，等待期间响应取消。
-    // 变量在本函数返回（完成 / 出错 / 被唤醒提前关闭）时立即 drop 释放名额；
-    // 重试退避发生在 run_chunk_inner 中，此时本函数已返回，名额不会死占。
-    let _host_permit = match host_limiter.acquire(url, cancel).await {
-        Ok(permit) => permit,
+    // Phase 3d：每次尝试（含重试）都重新申请 Host 名额；等待期间与取消、10.5 的
+    // end 缩小并列监听，且保持 Semaphore 公平队列中的位置。被接管到 acked 时
+    // 立即以 Completed 结束：不发请求、不占名额、不再排队。
+    let permit = match acquire_with_shrink(
+        host_limiter,
+        url,
+        cancel,
+        shared.as_ref(),
+        acked_counter,
+        &mut end_rx,
+    )
+    .await
+    {
+        Ok(Some(permit)) => permit,
+        Ok(None) => return Ok(ChunkExit::Completed),
         Err(Error::Cancelled) => return Ok(ChunkExit::Cancelled),
         Err(e) => return Err(e.into()),
+    };
+    // 拿到名额、`req.send()` 即将开始：置位 holds_permit 与 eligible_for_split，
+    // 并把速度采样 / is_fresh 的计时起点重置到此刻。守卫在函数任何返回路径上
+    // 复位 holds_permit（退避期间不占在途连接数）。
+    shared.mark_request_started();
+    let _held = HeldPermit {
+        _permit: permit,
+        shared: shared.as_ref(),
     };
 
     // 流式（总长未知）模式不发送 Range；分块模式发送精确区间。
@@ -1794,6 +1886,55 @@ mod tests {
             started.elapsed() < Duration::from_millis(100),
             "唤醒必须在 100ms 内完成，实际 {:?}",
             started.elapsed()
+        );
+    }
+
+    /// Phase 3d：排队等 Host 名额的分块被接管到 acked 时，必须在 100 毫秒内
+    /// 以 Completed 退出（丢弃名额等待），且不占用任何名额。
+    #[tokio::test]
+    async fn queued_chunk_released_by_takeover_wakes_immediately() {
+        let url = Url::parse("http://example.com/f").unwrap();
+        let limiter = Arc::new(HostConnectionLimiter::new(1).unwrap());
+        let cancel = CancelSignal::new();
+        // 唯一名额被别的请求持有：本分块只能排队。
+        let held = limiter.acquire(&url, &cancel).await.unwrap();
+
+        let shared = Arc::new(ChunkShared::new(0, 4 * 1024 * 1024, 0));
+        let mut end_rx = shared.subscribe_end();
+        let acked = Arc::clone(&shared.acked);
+        let lim = Arc::clone(&limiter);
+        let sh = Arc::clone(&shared);
+        let url2 = url.clone();
+        let cancel2 = cancel.clone();
+        let handle = tokio::spawn(async move {
+            acquire_with_shrink(&lim, &url2, &cancel2, sh.as_ref(), &acked, &mut end_rx).await
+        });
+
+        // 等它真正进入 Semaphore 等待队列。
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(limiter.available_permits(&url).unwrap(), 0);
+
+        // 测试钩子：直接把 end 缩到 acked（零进度接管），唤醒排队中的分块。
+        assert!(shared.commit_split(0, 4 * 1024 * 1024, true));
+
+        let started = Instant::now();
+        let res = tokio::time::timeout(Duration::from_millis(100), handle).await;
+        assert!(
+            matches!(&res, Ok(Ok(Ok(None)))),
+            "被接管到 acked 的排队分块必须丢弃等待、以 Completed 退出: {res:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "唤醒必须在 100ms 内完成，实际 {:?}",
+            started.elapsed()
+        );
+        // 不占名额：held 仍是唯一持有者。
+        assert_eq!(limiter.available_permits(&url).unwrap(), 0);
+        drop(held);
+        assert_eq!(
+            limiter.available_permits(&url).unwrap(),
+            1,
+            "排队者不得偷拿 / 残留占用名额"
         );
     }
 }
