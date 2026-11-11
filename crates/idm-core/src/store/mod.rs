@@ -23,8 +23,8 @@ use crate::error::{Error, Result, is_sharing_violation};
 // 迁移：数组下标 i 对应 user_version = i + 1
 // ---------------------------------------------------------------------------
 
-/// 迁移脚本数组；当前为版本 2。
-pub const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
+/// 迁移脚本数组；当前为版本 4（Phase 4a 新增 V4：task_headers / settings）。
+pub const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
 
 /// 当前 schema 版本。
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -79,6 +79,23 @@ const MIGRATION_V3: &str = r#"
 ALTER TABLE tasks ADD COLUMN queue_order INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN max_speed INTEGER;
 UPDATE tasks SET queue_order = id;
+"#;
+
+/// 版本 4（Phase 4a 浏览器接管）：任务请求头与全局设置。
+///
+/// `task_headers` 与 `tasks` 外键级联：删除任务时请求头随之删除；任务完成后再显式清除，
+/// 确保 Cookie 不会长期残留在数据库里。
+const MIGRATION_V4: &str = r#"
+CREATE TABLE task_headers (
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    name    TEXT NOT NULL,
+    value   TEXT NOT NULL,
+    PRIMARY KEY (task_id, name)
+);
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 fn db_err(e: rusqlite::Error) -> Error {
@@ -232,6 +249,8 @@ pub struct QueuedTask {
     pub strategy: String,
     pub connections: usize,
     pub max_speed: Option<u64>,
+    /// Phase 4a：浏览器接管指定的文件名（经 Windows 合法化）；`None` 时由核心自动命名。
+    pub file_name: Option<String>,
 }
 
 /// Probe 成功后回填的元信息。
@@ -387,8 +406,35 @@ enum Command {
         reply: Reply<Option<String>>,
     },
     Recover(Reply<RecoveryReport>),
-    /// Phase 3b：入队一条 `Queued` 任务。
-    EnqueueTask(QueuedTask, Reply<i64>),
+    /// Phase 3b：入队一条 `Queued` 任务；`headers` 为可选的请求头（同一事务写入）。
+    EnqueueTask(QueuedTask, Option<Vec<(String, String)>>, Reply<i64>),
+    /// Phase 4a：写入（覆盖式）任务的请求头。
+    SetTaskHeaders {
+        id: i64,
+        headers: Vec<(String, String)>,
+        reply: Reply<()>,
+    },
+    /// Phase 4a：读取任务的请求头。
+    GetTaskHeaders {
+        id: i64,
+        reply: Reply<Vec<(String, String)>>,
+    },
+    /// Phase 4a：清除任务的请求头（任务完成时调用）。
+    ClearTaskHeaders {
+        id: i64,
+        reply: Reply<()>,
+    },
+    /// Phase 4a：读取全局设置。
+    GetSetting {
+        key: String,
+        reply: Reply<Option<String>>,
+    },
+    /// Phase 4a：写入（覆盖式）全局设置。
+    SetSetting {
+        key: String,
+        value: String,
+        reply: Reply<()>,
+    },
     /// Phase 3b：按 `queue_order ASC, id ASC` 列出所有 `Queued` 任务。
     ListQueued(Reply<Vec<TaskRecord>>),
     /// Phase 3b：将 `Paused`/`Failed`/`Finalizing` 任务改回 `Queued`。
@@ -412,6 +458,8 @@ pub struct Store {
     fail_checkpoints: Arc<AtomicBool>,
     /// 专用线程的句柄；`shutdown()` 会 join 它，确保连接关闭、WAL 完全回写后再返回。
     handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 数据库文件路径（含文件名）。`runner.lock` 等运行器锁放在其所在目录。
+    path: PathBuf,
 }
 
 impl std::fmt::Debug for Store {
@@ -425,6 +473,7 @@ impl Store {
     /// 返回时迁移已完成，后续命令可立即使用。
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Store>> {
         let path = path.as_ref().to_path_buf();
+        let path_for_field = path.clone();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -455,6 +504,7 @@ impl Store {
             tx,
             fail_checkpoints,
             handle: std::sync::Mutex::new(Some(handle)),
+            path: path_for_field,
         }))
     }
 
@@ -547,6 +597,11 @@ impl Store {
             .await
     }
 
+    /// 返回数据库文件路径（含文件名）。运行器锁 `runner.lock` 放在其所在目录。
+    pub fn db_path(&self) -> &Path {
+        &self.path
+    }
+
     pub async fn get_task(&self, id: i64) -> Result<TaskRecord> {
         self.call(|reply| Command::GetTask { id, reply }).await
     }
@@ -581,9 +636,47 @@ impl Store {
     // --- Phase 3b 多任务队列 -------------------------------------------------
 
     /// 入队一条状态为 `Queued` 的任务，`queue_order` 自动设为 `MAX(queue_order)+1`，
-    /// 并返回新任务 id。
-    pub async fn enqueue_task(&self, t: QueuedTask) -> Result<i64> {
-        self.call(|reply| Command::EnqueueTask(t, reply)).await
+    /// 并返回新任务 id。`headers` 为可选的请求头（与任务写入同一事务）。
+    pub async fn enqueue_task(
+        &self,
+        t: QueuedTask,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Result<i64> {
+        self.call(|reply| Command::EnqueueTask(t, headers, reply))
+            .await
+    }
+
+    /// 写入（覆盖式）任务的请求头。
+    pub async fn set_task_headers(&self, id: i64, headers: &[(String, String)]) -> Result<()> {
+        let headers = headers.to_vec();
+        self.call(|reply| Command::SetTaskHeaders { id, headers, reply })
+            .await
+    }
+
+    /// 读取任务的请求头。
+    pub async fn get_task_headers(&self, id: i64) -> Result<Vec<(String, String)>> {
+        self.call(|reply| Command::GetTaskHeaders { id, reply })
+            .await
+    }
+
+    /// 清除任务的请求头（任务完成或删除时调用）。
+    pub async fn clear_task_headers(&self, id: i64) -> Result<()> {
+        self.call(|reply| Command::ClearTaskHeaders { id, reply })
+            .await
+    }
+
+    /// 读取全局设置；不存在返回 `None`。
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let key = key.to_string();
+        self.call(|reply| Command::GetSetting { key, reply }).await
+    }
+
+    /// 写入（覆盖式）全局设置。
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let key = key.to_string();
+        let value = value.to_string();
+        self.call(|reply| Command::SetSetting { key, value, reply })
+            .await
     }
 
     /// 按 `queue_order ASC, id ASC` 返回所有 `Queued` 任务。
@@ -716,8 +809,23 @@ fn handle_command(conn: &mut Connection, cmd: Command, fail: &AtomicBool) {
         Command::Recover(reply) => {
             let _ = reply.send(recover(conn));
         }
-        Command::EnqueueTask(t, reply) => {
-            let _ = reply.send(enqueue_task(conn, t));
+        Command::EnqueueTask(t, headers, reply) => {
+            let _ = reply.send(enqueue_task(conn, t, headers));
+        }
+        Command::SetTaskHeaders { id, headers, reply } => {
+            let _ = reply.send(set_task_headers(conn, id, &headers));
+        }
+        Command::GetTaskHeaders { id, reply } => {
+            let _ = reply.send(get_task_headers(conn, id));
+        }
+        Command::ClearTaskHeaders { id, reply } => {
+            let _ = reply.send(clear_task_headers(conn, id));
+        }
+        Command::GetSetting { key, reply } => {
+            let _ = reply.send(get_setting(conn, &key));
+        }
+        Command::SetSetting { key, value, reply } => {
+            let _ = reply.send(set_setting(conn, &key, &value));
         }
         Command::ListQueued(reply) => {
             let _ = reply.send(list_queued_tasks(conn));
@@ -1054,24 +1162,97 @@ fn delete_task(conn: &Connection, id: i64) -> Result<Option<String>> {
 
 // --- Phase 3b 队列 SQL -----------------------------------------------------
 
-fn enqueue_task(conn: &Connection, t: QueuedTask) -> Result<i64> {
+fn enqueue_task(
+    conn: &mut Connection,
+    t: QueuedTask,
+    headers: Option<Vec<(String, String)>>,
+) -> Result<i64> {
     let now = now_text();
-    conn.execute(
+    let tx = conn.transaction().map_err(db_err)?;
+    tx.execute(
         "INSERT INTO tasks (url, dir, strategy, connections, state, queue_order, max_speed, \
-         created_at, updated_at) \
+         file_name, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, 'Queued', (SELECT COALESCE(MAX(queue_order), 0) + 1 FROM tasks), \
-         ?5, ?6, ?6)",
+         ?5, ?6, ?7, ?7)",
         params![
             t.url,
             t.dir,
             t.strategy,
             t.connections as i64,
             t.max_speed.map(|v| v as i64),
+            t.file_name,
             now
         ],
     )
     .map_err(db_err)?;
-    Ok(conn.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    if let Some(headers) = headers {
+        for (name, value) in headers {
+            tx.execute(
+                "INSERT INTO task_headers (task_id, name, value) VALUES (?1, ?2, ?3)",
+                params![id, name, value],
+            )
+            .map_err(db_err)?;
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(id)
+}
+
+fn set_task_headers(conn: &mut Connection, id: i64, headers: &[(String, String)]) -> Result<()> {
+    let tx = conn.transaction().map_err(db_err)?;
+    tx.execute("DELETE FROM task_headers WHERE task_id=?1", params![id])
+        .map_err(db_err)?;
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO task_headers (task_id, name, value) VALUES (?1, ?2, ?3)")
+            .map_err(db_err)?;
+        for (name, value) in headers {
+            stmt.execute(params![id, name, value]).map_err(db_err)?;
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+fn get_task_headers(conn: &Connection, id: i64) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn
+        .prepare("SELECT name, value FROM task_headers WHERE task_id=?1")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(db_err)?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
+fn clear_task_headers(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM task_headers WHERE task_id=?1", params![id])
+        .map_err(db_err)?;
+    Ok(())
+}
+
+fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    Ok(v)
+}
+
+fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .map_err(db_err)?;
+    Ok(())
 }
 
 fn list_queued_tasks(conn: &Connection) -> Result<Vec<TaskRecord>> {

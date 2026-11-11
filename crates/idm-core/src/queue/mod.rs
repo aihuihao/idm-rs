@@ -166,8 +166,9 @@ impl DownloadQueue {
             strategy: format!("{:?}", req.strategy),
             connections: req.connections,
             max_speed: req.max_speed,
+            file_name: None,
         };
-        let id = self.inner.store.enqueue_task(queued).await?;
+        let id = self.inner.store.enqueue_task(queued, None).await?;
         let queue_order = self.inner.store.get_task(id).await?.queue_order;
         bump_outstanding(&self.inner, 1);
         let _ = self
@@ -420,7 +421,7 @@ async fn run_one(
     ptx: watch::Sender<ProgressSnapshot>,
 ) -> Result<DownloadOutcome> {
     let rec = inner.store.get_task(id).await?;
-    let opts = build_options(inner, &rec, ptx);
+    let opts = build_options(inner, &rec, ptx).await;
     let (outcome, _rx) = resume(
         id,
         Arc::clone(&inner.store),
@@ -492,7 +493,7 @@ async fn on_finished(
 }
 
 /// 构造单个任务的 [`DownloadOptions`]，复用队列的全局限速与每主机连接限制。
-fn build_options(
+async fn build_options(
     inner: &Inner,
     rec: &TaskRecord,
     ptx: watch::Sender<ProgressSnapshot>,
@@ -501,6 +502,13 @@ fn build_options(
     if let Ok(cs) = u8::try_from(rec.connections) {
         config.connections = (cs as usize).clamp(1, 32);
     }
+    // Phase 4a：从数据库读取该任务的请求头（Referer / Cookie / User-Agent）并注入配置，
+    // 随后经 `build_client` 的默认头对所有请求生效。
+    config.extra_headers = inner
+        .store
+        .get_task_headers(rec.id)
+        .await
+        .unwrap_or_default();
     let strategy = match rec.strategy.as_str() {
         "SetLen" => AllocationStrategy::SetLen,
         "Reserve" => AllocationStrategy::Reserve,

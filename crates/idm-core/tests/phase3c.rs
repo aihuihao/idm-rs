@@ -31,13 +31,17 @@ async fn failed_before_state_write_is_not_rescheduled() -> TestResult {
     let store = Store::open(dir.path().join("q.db"))?;
     // 1. 先以 `Queued` 入队。
     let id = store
-        .enqueue_task(QueuedTask {
-            url: "http://127.0.0.1:9/never.bin".to_string(),
-            dir: dir.path().to_string_lossy().into_owned(),
-            strategy: "Auto".to_string(),
-            connections: 1,
-            max_speed: None,
-        })
+        .enqueue_task(
+            QueuedTask {
+                url: "http://127.0.0.1:9/never.bin".to_string(),
+                dir: dir.path().to_string_lossy().into_owned(),
+                strategy: "Auto".to_string(),
+                connections: 1,
+                max_speed: None,
+                file_name: None,
+            },
+            None,
+        )
         .await?;
 
     // 2. 回填 probe 元信息，但把 `.idm-part` 指向一个不存在的文件，然后把状态

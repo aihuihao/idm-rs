@@ -1,0 +1,64 @@
+# Phase 4a 进度（实时记录，上下文将满时据此续做）
+
+基线 HEAD：`dd5bf76 docs: save phase4b prompt`（之前 `9f30e8c phase3`）。
+预期未提交改动：`Cargo.lock`、`crates/idm-ipc/Cargo.toml`（serde/serde_json，已就绪）。
+本阶段不写浏览器扩展（4b）。测试只用本地回环服务器 + 测试数据库，不碰真实注册表/外网。
+所有构建 `--offline`。Cargo.lock 相对基线仅新增 `serde_json 1.0.154` 与 `zmij 1.0.23`。
+
+## 任务分解与状态
+- [ ] 一、依赖：迁移 serde/serde_json 到 workspace.dependencies，idm-ipc 用 workspace=true
+- [ ] 二、DB 迁移 V4：task_headers + settings 表；Store 方法；enqueue_task 带 headers
+- [ ] 三、请求头透传：DownloadConfig.extra_headers + 校验；probe/chunk/retry/resume 带头；build_options/resume 读库；日志不含 Cookie 值
+- [ ] 四、常驻运行器：`queue run --watch`；runner.lock 单实例(退出码3)；`config set/get download-dir`
+- [ ] 五、idm-nmhost 二进制：帧协议；stdout 仅帧；panic hook + nmhost.log；ping/enqueue；校验；拉起 runner
+- [ ] 六、测试（crates/idm-ipc/tests/、crates/idm-core/tests/）：1..15 + 回归
+- [ ] 七、ARCHITECTURE.md 第 12 节
+- [ ] 八、docs/phase4a-report.md 自查表（每项测试名 + 10/10）
+- [ ] 九、提交（docs crates scripts ARCHITECTURE.md Cargo.toml Cargo.lock），不 push
+
+## 已完成
+- 保存 `docs/prompts/phase4a.md`
+- Part 2：store/mod.rs V4 迁移（task_headers/settings）+ 6 个新方法 + enqueue_task 带 headers（同一事务）。cargo check 通过
+- Part 3：DownloadConfig.extra_headers + 手动 Debug（遮蔽 Cookie）+ validate_extra_headers + build_client 注入默认头（User-Agent 覆盖）；build_options/resume 从 DB 读头；download.rs 完成时 clear_task_headers。cargo check 通过
+- 已读取 store/mod.rs、client.rs、queue/mod.rs、download.rs、main.rs 相关段
+
+## 已完成
+- 保存 `docs/prompts/phase4a.md`
+- Part 2：store/mod.rs V4 迁移（task_headers/settings）+ 6 个新方法 + enqueue_task 带 headers
+- Part 3：DownloadConfig.extra_headers + 手动 Debug（遮蔽 Cookie）+ validate_extra_headers + build_client 注入；build_options/resume 读库；download.rs 完成清头
+- Part 1：serde/serde_json 迁移到 workspace.dependencies（idm-ipc 用 workspace=true）
+- Part 4：queue run --watch + runner.lock 单实例(退出码3) + config set/get download-dir
+- Part 5：idm-nmhost 二进制（帧协议/stdout纪律/panic hook/ping/enqueue/校验/拉起 runner）+ QueuedTask.file_name
+- cargo check --workspace --offline --all-targets 全绿
+
+## 已完成（测试部分）
+- frame.rs 单元测试（item 1）：6 个，全绿
+- idm-core/tests/phase4a.rs（7,8,9,10,14）：6 个，全绿
+- idm-ipc/tests/nmhost.rs（2,3,4,4b,5,6,13）：7 个，全绿
+- idm-cli/tests/phase4a.rs（11,12 + config）：3 个，全绿
+- 修复：nmhost 改用共享 frame 模块；frame 截断返回 Eof；ReadFrame 派生 Debug；
+  phase4a core 测试 helper 改 Arc<Store>；headers_cleared 用 run_queue 避免双任务抢同一文件；
+  tracing-subscriber dev 依赖 + 闭包式 MakeWriter；CLI watch 测试用异步等待避免饿死测试服务器
+
+## 已完成（收尾）
+- 七、ARCHITECTURE.md 第 12 节（按原文）
+- 八、docs/phase4a-report.md 自查表（22 项 10/10）
+- 九、验收脚本 22 个新测试各连续 10 次全 PASS（exit 0）；全量回归 241 passed/0 failed；
+  两个崩溃测试 2 passed/0 failed（EXIT=0）。Cargo.lock 相对基线仅新增 serde_json 1.0.154 与 zmij 1.0.23
+
+## 待做
+- [ ] 提交（docs crates scripts ARCHITECTURE.md Cargo.toml Cargo.lock），不 push
+
+## 关键代码位置（边做边补）
+- 迁移数组：`crates/idm-core/src/store/mod.rs` L27 (`MIGRATIONS`), L30 (`SCHEMA_VERSION`)
+- enqueue_task：`store/mod.rs` L585 (pub) / L1057 (sql)
+- 完成清理钩子位置：待在 `crates/idm-core/src/queue/mod.rs` 完成处接 clear_task_headers
+- 删除级联：task_headers REFERENCES tasks(id) ON DELETE CASCADE（已设计）
+
+## 下一步
+1. 实现 Part 2（迁移 V4 + Store 方法 + enqueue_task headers）
+2. 读 net/headers.rs / net/filename.rs / net/client.rs / net/probe.rs / task/download.rs / task/resume.rs / queue/mod.rs / main.rs 相关段
+3. 实现 Part 3 请求头透传
+4. 实现 Part 4 运行器
+5. 实现 Part 5 nmhost
+6. 测试 + 报告 + 提交

@@ -6,3 +6,6 @@
 //!
 //! 当前阶段（Phase 0）本 crate 不含任何功能，仅保留文档注释与物理隔离结构，
 //! 以便在 workspace 中验证依赖边界与 lint 规范。
+
+//! Phase 4a：Firefox Native Messaging 帧编解码（供 `idm-nmhost` 二进制与单元测试复用）。
+pub mod frame;

@@ -52,7 +52,7 @@ fn validate_proxy_url(raw: &str) -> Result<Url> {
 /// `danger_accept_invalid_certs` / `danger_accept_invalid_hostnames`、
 /// 自定义根证书或关闭证书校验的开关。`build_client()` 直接使用 reqwest 的默认
 /// TLS 后端，证书链与主机名校验始终开启，调用方无法削弱。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DownloadConfig {
     pub connections: usize,
     pub min_chunk_size: u64,
@@ -78,6 +78,47 @@ pub struct DownloadConfig {
     pub max_connections_per_host: usize,
     /// 代理配置（Phase 3a）。默认使用系统 / 环境变量代理。
     pub proxy: ProxyConfig,
+    /// Phase 4a：浏览器接管透传的请求头（Referer / Cookie / User-Agent）。
+    ///
+    /// 仅这三个名字（不区分大小写）被 [`validate_extra_headers`] 接受；值不得含 `\r`/`\n`，
+    /// 单值 ≤ 8 KiB。注入到 `build_client` 的默认请求头，对 Probe 与所有分块 / 重试 / 续传
+    /// 请求统一生效。`User-Agent` 覆盖默认值，其余名字并入默认头。
+    pub extra_headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for DownloadConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadConfig")
+            .field("connections", &self.connections)
+            .field("min_chunk_size", &self.min_chunk_size)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .field("user_agent", &self.user_agent)
+            .field("max_redirects", &self.max_redirects)
+            .field("max_retries", &self.max_retries)
+            .field("retry_base_delay", &self.retry_base_delay)
+            .field("retry_max_delay", &self.retry_max_delay)
+            .field("min_split_size", &self.min_split_size)
+            .field("dynamic_split", &self.dynamic_split)
+            .field("max_connections_per_host", &self.max_connections_per_host)
+            .field("proxy", &self.proxy)
+            // Cookie 的值不进入任何日志 / 调试输出，仅显示是否存在。
+            .field(
+                "extra_headers",
+                &self
+                    .extra_headers
+                    .iter()
+                    .map(|(k, v)| {
+                        if k.eq_ignore_ascii_case("Cookie") {
+                            (k.as_str(), "<cookie>")
+                        } else {
+                            (k.as_str(), v.as_str())
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl Default for DownloadConfig {
@@ -96,8 +137,36 @@ impl Default for DownloadConfig {
             dynamic_split: true,
             max_connections_per_host: 8,
             proxy: ProxyConfig::System,
+            extra_headers: Vec::new(),
         }
     }
+}
+
+/// Phase 4a：校验浏览器传来的请求头。
+///
+/// 只允许 `Referer` / `Cookie` / `User-Agent`（不区分大小写）；值中不得含 `\r` 或 `\n`；
+/// 单值长度不超过 8 KiB。错误信息中**不包含**任何请求头的值（避免泄露 Cookie）。
+pub fn validate_extra_headers(headers: &[(String, String)]) -> Result<()> {
+    const ALLOWED: [&str; 3] = ["Referer", "Cookie", "User-Agent"];
+    const MAX_VALUE: usize = 8 * 1024;
+    for (name, value) in headers {
+        if !ALLOWED.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+            return Err(Error::InvalidArgument {
+                message: format!("header name not allowed: {name}"),
+            });
+        }
+        if value.contains('\r') || value.contains('\n') {
+            return Err(Error::InvalidArgument {
+                message: format!("header value for {name} contains forbidden CR/LF"),
+            });
+        }
+        if value.len() > MAX_VALUE {
+            return Err(Error::InvalidArgument {
+                message: format!("header value for {name} exceeds {MAX_VALUE} bytes"),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl DownloadConfig {
@@ -161,12 +230,32 @@ impl DownloadConfig {
         };
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        // Phase 4a：把浏览器透传的请求头（Referer / Cookie）并入默认头；
+        // User-Agent 单独覆盖默认值（见下方 `builder.user_agent`）。
+        for (name, value) in &self.extra_headers {
+            if name.eq_ignore_ascii_case("User-Agent") {
+                continue;
+            }
+            if let (Ok(hn), Ok(hv)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                headers.insert(hn, hv);
+            }
+        }
         let mut builder = reqwest::Client::builder()
-            .user_agent(&self.user_agent)
             .default_headers(headers)
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
             .redirect(reqwest::redirect::Policy::limited(self.max_redirects));
+        // User-Agent：浏览器传来则覆盖默认值，否则保持。
+        let mut user_agent = self.user_agent.clone();
+        for (name, value) in &self.extra_headers {
+            if name.eq_ignore_ascii_case("User-Agent") {
+                user_agent = value.clone();
+            }
+        }
+        builder = builder.user_agent(user_agent);
         match &self.proxy {
             ProxyConfig::System => {
                 // reqwest 默认读取系统 / 环境变量代理，不做额外设置。

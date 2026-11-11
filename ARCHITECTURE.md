@@ -140,3 +140,10 @@
 - 全局资源共享：同一队列启动的所有任务共用同一个 `DiskWriterPool`、全局 `RateLimiter` 与按服务器 `HostConnectionLimiter`。
 - 状态联动：活动任务完成、失败或被用户暂停后立即释放并发槽位并自动唤醒调度器拉起下一个 `Queued` 任务；对已暂停或失败的任务执行队列恢复时，将其置为 `Queued` 交由调度器按序执行。
 - 启动恢复：程序重启执行 `recover` 时，保留数据库中原有的 `Queued` 任务状态与顺序不变。
+
+## 12. 浏览器接管（Phase 4 确立）
+- 通信：只使用 Native Messaging（Firefox 清单的 allowed_extensions 限定扩展 ID）。不监听任何本地网络端口。
+- idm-nmhost 只做校验和入队，不做下载；下载由独立的常驻队列运行器执行。两者只通过 SQLite 队列通信。
+- 浏览器传来的一切数据都不可信：限制长度、限制 scheme、请求头白名单（Referer / Cookie / User-Agent）、文件名只取安全的文件名部分。
+- Cookie 只在任务存续期间保存在 task_headers 表，任务完成或删除时清除；日志和错误信息中不得出现 Cookie 的值。
+- idm-nmhost 的标准输出只能写协议帧。

@@ -119,6 +119,9 @@ pub struct ServerConfig {
     /// 收到的每个请求的 `Range` 头都会被 push 到这里（Phase 1d 测试 2：
     /// 验证重试请求的起点等于断开前已写入的位置）。
     pub range_sink: Option<Arc<Mutex<Vec<String>>>>,
+    /// Phase 4a：所有收到的请求头（名字转小写, 值）都会被 push 到这里，用于断言
+    /// 浏览器接管透传的 Referer / Cookie / User-Agent 到达了服务器。
+    pub header_sink: Option<Arc<Mutex<Vec<(String, String)>>>>,
     /// 只记录**非 Probe** 请求的 Range 头（Phase 2.2：断言没有起点等于终点的请求）。
     pub chunk_range_sink: Option<Arc<Mutex<Vec<String>>>>,
     /// 非 Probe 请求计数（Phase 1d：验证"服务器一共收到 N 次请求"/
@@ -179,6 +182,7 @@ impl Default for ServerConfig {
             error_responses: None,
             error_switch: None,
             range_sink: None,
+            header_sink: None,
             chunk_range_sink: None,
             request_counter: None,
             request_times: None,
@@ -317,9 +321,17 @@ async fn handle_conn(
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
-        match k.trim().to_ascii_lowercase().as_str() {
-            "range" => range_header = Some(v.trim().to_string()),
-            "if-range" => if_range = Some(v.trim().to_string()),
+        let k_trim = k.trim();
+        let v_trim = v.trim();
+        // 记录所有请求头（名字转小写）到 header_sink，供 Phase 4a 测试断言透传的请求头。
+        if let Some(sink) = &cfg.header_sink {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((k_trim.to_ascii_lowercase(), v_trim.to_string()));
+        }
+        match k_trim.to_ascii_lowercase().as_str() {
+            "range" => range_header = Some(v_trim.to_string()),
+            "if-range" => if_range = Some(v_trim.to_string()),
             _ => {}
         }
     }

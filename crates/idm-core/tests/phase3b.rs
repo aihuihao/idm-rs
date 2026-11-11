@@ -90,13 +90,17 @@ async fn migration_v2_to_v3_and_recover_preserves_queued() -> TestResult {
     let db = dir.path().join("q.db");
     let store = Store::open(&db)?; // 打开即应用 V3 迁移（新增 queue_order / max_speed 列与 Queued 状态）。
     let q_id = store
-        .enqueue_task(QueuedTask {
-            url: "http://h/q.bin".into(),
-            dir: dir.path().to_string_lossy().into_owned(),
-            strategy: "Auto".into(),
-            connections: 8,
-            max_speed: None,
-        })
+        .enqueue_task(
+            QueuedTask {
+                url: "http://h/q.bin".into(),
+                dir: dir.path().to_string_lossy().into_owned(),
+                strategy: "Auto".into(),
+                connections: 8,
+                max_speed: None,
+                file_name: None,
+            },
+            None,
+        )
         .await?;
     let d_id = store
         .create_task(NewTask {

@@ -940,6 +940,8 @@ async fn finalize_download(
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default();
             c.store.set_final_name(c.task_id, &name).await?;
+            // Phase 4a：任务已完成，清除其请求头（Cookie 不得长期留在数据库）。
+            let _ = c.store.clear_task_headers(c.task_id).await;
         }
         advance(&mut state, TaskState::Completed);
         info!(task_id = rt.task_id, state = ?state, "download completed");

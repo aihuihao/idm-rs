@@ -890,6 +890,8 @@ mod dl {
         } else {
             proxy_url.map_or(ProxyConfig::System, ProxyConfig::Custom)
         };
+        // Phase 4a：从数据库读取该任务的请求头（Referer / Cookie / User-Agent）并注入配置。
+        let extra_headers = store.get_task_headers(rec.id).await.unwrap_or_default();
         let opts = DownloadOptions {
             global_limiter: None,
             host_limiter: None,
@@ -899,6 +901,7 @@ mod dl {
                 dynamic_split,
                 max_connections_per_host: max_host_connections,
                 proxy,
+                extra_headers,
                 ..DownloadConfig::default()
             },
             strategy,
@@ -1155,13 +1158,17 @@ mod dl {
             return 1;
         }
         let id = match store
-            .enqueue_task(QueuedTask {
-                url: url.clone(),
-                dir: dir.to_string_lossy().into_owned(),
-                strategy: "Auto".to_string(),
-                connections,
-                max_speed,
-            })
+            .enqueue_task(
+                QueuedTask {
+                    url: url.clone(),
+                    dir: dir.to_string_lossy().into_owned(),
+                    strategy: "Auto".to_string(),
+                    connections,
+                    max_speed,
+                    file_name: None,
+                },
+                None,
+            )
             .await
         {
             Ok(id) => id,
@@ -1185,6 +1192,7 @@ mod dl {
         let mut max_host_connections: usize = DEFAULT_MAX_PER_HOST;
         let mut proxy_url: Option<String> = None;
         let mut no_proxy = false;
+        let mut watch = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -1243,6 +1251,7 @@ mod dl {
                     proxy_url = Some(args[i].clone());
                 }
                 "--no-proxy" => no_proxy = true,
+                "--watch" => watch = true,
                 "--db" | "--log-file" => {
                     i += 1;
                     if i >= args.len() {
@@ -1266,6 +1275,24 @@ mod dl {
         } else {
             proxy_url.map_or(ProxyConfig::System, ProxyConfig::Custom)
         };
+        // 单实例锁：在数据目录（数据库所在目录）下创建 runner.lock，独占打开；
+        // 已有实例持有时打印 "already running" 并以退出码 3 退出。锁句柄保持到进程退出。
+        let lock_dir = store
+            .db_path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let lock_path = lock_dir.join("runner.lock");
+        let mut lock_opt = std::fs::OpenOptions::new();
+        lock_opt.read(true).write(true).create(true).truncate(false);
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut lock_opt, 0);
+        let _runner_lock = match lock_opt.open(&lock_path) {
+            Ok(f) => Some(f),
+            Err(_) => {
+                eprintln!("already running");
+                return 3;
+            }
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let config = QueueConfig {
             max_concurrent_tasks: max_tasks,
             global_max_speed,
@@ -1292,8 +1319,10 @@ mod dl {
             }
         }
         let q2 = queue.clone();
+        let stop_ctrl = stop.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
+            stop_ctrl.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = q2.shutdown().await;
         });
         // Phase 3c：恢复 CLI 对单个任务进度的访问。订阅事件维护活动任务 id 集合，
@@ -1327,20 +1356,97 @@ mod dl {
                 }
             }
         });
-        let idle_result = queue.wait_for_idle().await;
         progress_task.abort();
-        match idle_result {
-            Ok(s) => {
-                let secs = s.total_elapsed.as_secs_f64();
-                println!(
-                    "QUEUE DONE completed={} failed={} paused={} elapsed={secs:.2}s",
-                    s.completed, s.failed, s.paused
-                );
+        if watch {
+            // 常驻模式：队列空闲后不退出，每秒检查一次数据库中新增的 Queued 任务并调度。
+            // Ctrl+C 会触发 stop 标志并安全停止所有活动任务后退出。
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(e) = queue.adopt_queued().await {
+                    crate::print_error("adopt failed", &e);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            println!("QUEUE WATCH STOPPED");
+            0
+        } else {
+            match queue.wait_for_idle().await {
+                Ok(s) => {
+                    let secs = s.total_elapsed.as_secs_f64();
+                    println!(
+                        "QUEUE DONE completed={} failed={} paused={} elapsed={secs:.2}s",
+                        s.completed, s.failed, s.paused
+                    );
+                    0
+                }
+                Err(e) => {
+                    crate::print_error("queue run failed", &e);
+                    1
+                }
+            }
+        }
+    }
+
+    /// `config <set|get> <key> [<value>]`：读写全局设置。当前仅支持 key `download-dir`
+    /// （目录必须存在或能创建）。
+    pub async fn run_config(args: &[String], store: Arc<Store>) -> i32 {
+        if args.is_empty() {
+            eprintln!("usage: config <set|get> <key> [<value>]");
+            return 2;
+        }
+        match args[0].as_str() {
+            "set" => {
+                if args.len() < 3 {
+                    eprintln!("usage: config set <key> <value>");
+                    return 2;
+                }
+                let key = &args[1];
+                let value = &args[2];
+                if key != "download-dir" {
+                    eprintln!("unknown config key: {key} (only 'download-dir' is supported)");
+                    return 2;
+                }
+                let p = std::path::Path::new(value);
+                if !p.exists() {
+                    if let Err(e) = std::fs::create_dir_all(p) {
+                        eprintln!("cannot create download-dir {value}: {e}");
+                        return 1;
+                    }
+                }
+                if let Err(e) = store.set_setting(key, value).await {
+                    crate::print_error("config set failed", &e);
+                    return 1;
+                }
+                println!("CONFIG SET {key}={value}");
                 0
             }
-            Err(e) => {
-                crate::print_error("queue run failed", &e);
-                1
+            "get" => {
+                if args.len() < 2 {
+                    eprintln!("usage: config get <key>");
+                    return 2;
+                }
+                let key = &args[1];
+                match store.get_setting(key).await {
+                    Ok(Some(v)) => {
+                        println!("CONFIG GET {key}={v}");
+                        0
+                    }
+                    Ok(None) => {
+                        println!("CONFIG GET {key}=<unset>");
+                        0
+                    }
+                    Err(e) => {
+                        crate::print_error("config get failed", &e);
+                        1
+                    }
+                }
+            }
+            other => {
+                eprintln!("unknown config subcommand: {other}");
+                2
             }
         }
     }
@@ -1679,6 +1785,7 @@ async fn main() {
             "list" => dl::run_list(&args[2..], Arc::clone(&store)).await,
             "remove" => dl::run_remove(&args[2..], Arc::clone(&store)).await,
             "enqueue" => dl::run_enqueue(&args[2..], Arc::clone(&store)).await,
+            "config" => dl::run_config(&args[2..], Arc::clone(&store)).await,
             "queue" => {
                 let sub2 = args.get(2).map(String::as_str).unwrap_or("");
                 match sub2 {
