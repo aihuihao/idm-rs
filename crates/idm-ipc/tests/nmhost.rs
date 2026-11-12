@@ -328,32 +328,45 @@ fn host_url_validation_cases() -> TestResult {
         "内网主机名 http://nas/file.zip 必须允许: {r_nas}"
     );
 
-    // 必须允许：带 userinfo 的 URL。同时塞一个含换行的 Cookie 触发一次
-    // nmhost.log 写入，以便断言 userinfo 从未进入日志。
+    // 必须拒绝：带 userinfo 的 URL，错误信息固定且不含凭据。
     send_frame(
         &mut child,
-        &serde_json::json!({
-            "type": "enqueue",
-            "url": "http://user:pass@host/x",
-            "cookies": "a\r\nb"
-        }),
+        &serde_json::json!({"type": "enqueue", "url": "http://user:pass@host/x"}),
     )?;
     let r_userinfo = expect_frame(&mut child, "userinfo url response")?;
     assert_eq!(
         r_userinfo["ok"],
-        serde_json::json!(true),
-        "带 userinfo 的 URL 必须允许: {r_userinfo}"
+        serde_json::json!(false),
+        "带 userinfo 的 URL 必须拒绝: {r_userinfo}"
     );
+    assert_eq!(
+        r_userinfo["error"].as_str(),
+        Some("url must not contain credentials")
+    );
+
+    // 用一个合法 URL + 含换行的 Cookie 触发一次 nmhost.log 写入，
+    // 以便断言 userinfo 从未进入日志。
+    send_frame(
+        &mut child,
+        &serde_json::json!({
+            "type": "enqueue",
+            "url": "http://example.com/log-probe.bin",
+            "cookies": "a\r\nb"
+        }),
+    )?;
+    let r_probe = expect_frame(&mut child, "log probe response")?;
+    assert_eq!(r_probe["ok"], serde_json::json!(true));
 
     // host 仍存活
     send_frame(&mut child, &serde_json::json!({"type": "ping"}))?;
     let pong = expect_frame(&mut child, "host 应存活")?;
     assert_eq!(pong["ok"], serde_json::json!(true));
 
-    // 数据库里两条合法任务 URL 正确。
+    // 数据库里两条合法任务 URL 正确，凭据 URL 未入队。
     let tasks = query_queued(&db)?;
     assert!(task_by_url(&tasks, "http://nas/file.zip").is_some());
-    assert!(task_by_url(&tasks, "http://user:pass@host/x").is_some());
+    assert!(task_by_url(&tasks, "http://example.com/log-probe.bin").is_some());
+    assert!(task_by_url(&tasks, "http://user:pass@host/x").is_none());
 
     // 关闭 stdin 让 host 退出，随后检查日志。
     drop(child.stdin.take());
@@ -372,6 +385,79 @@ fn host_url_validation_cases() -> TestResult {
             && !log.contains("user:pass@host"),
         "userinfo 不得写入 nmhost.log: {log}"
     );
+    Ok(())
+}
+
+// --- 4a-extra. 入队时拒绝 URL 凭据，且绝不入库/入日志 -----------------------
+
+/// URL 含 userinfo（用户名或密码）时，`enqueue` 必须直接返回
+/// `"url must not contain credentials"`，不创建任何任务，凭据也不进入日志；
+/// host 仍存活，且无凭据的 URL 仍可正常入队。
+#[test]
+fn host_enqueue_rejects_url_credentials() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let db = tmp.path().join("nm.db");
+    let mut child = spawn_nmhost(&db, &[])?;
+
+    let with_credentials = [
+        "http://user@host/x",
+        "http://user:pass@host/x",
+        "http://:pass@host/x",
+        "https://user:pass@example.com/a",
+        "http://user:pass@nas/file.zip", // 内网主机名同样不许带凭据
+    ];
+    for url in with_credentials {
+        let before = query_queued(&db)?.len();
+        send_frame(
+            &mut child,
+            &serde_json::json!({
+                "type": "enqueue",
+                "url": url,
+                "filename": "x.bin",
+                "cookies": "session=abc"
+            }),
+        )?;
+        let resp = expect_frame(&mut child, "credentials rejection response")?;
+        assert_eq!(
+            resp["ok"],
+            serde_json::json!(false),
+            "{url:?} 必须被拒绝: {resp}"
+        );
+        assert_eq!(
+            resp["error"].as_str(),
+            Some("url must not contain credentials"),
+            "{url:?} 的错误原因必须精确: {resp}"
+        );
+        assert_eq!(query_queued(&db)?.len(), before, "{url:?} 不得创建任务");
+    }
+
+    // 无凭据 URL 仍可入队（避免误杀）。
+    send_frame(
+        &mut child,
+        &serde_json::json!({"type": "enqueue", "url": "http://nas/ok.zip"}),
+    )?;
+    let ok = expect_frame(&mut child, "no-credentials enqueue response")?;
+    assert_eq!(ok["ok"], serde_json::json!(true), "无凭据 URL 应入队: {ok}");
+    let tasks = query_queued(&db)?;
+    assert_eq!(tasks.len(), 1, "只有无凭据的那条应入库");
+    assert_eq!(tasks[0].url, "http://nas/ok.zip");
+
+    // host 仍存活。
+    send_frame(&mut child, &serde_json::json!({"type": "ping"}))?;
+    let pong = expect_frame(&mut child, "host 应存活")?;
+    assert_eq!(pong["ok"], serde_json::json!(true));
+
+    drop(child.stdin.take());
+    child.wait()?;
+
+    // 凭据不得出现在日志中（日志文件可能根本不存在）。
+    let log = std::fs::read_to_string(log_path(tmp.path())).unwrap_or_default();
+    for secret in ["user:pass", ":pass@", "pass@", "user@", "session=abc"] {
+        assert!(
+            !log.contains(secret),
+            "nmhost.log 不得包含 {secret:?}: {log}"
+        );
+    }
     Ok(())
 }
 

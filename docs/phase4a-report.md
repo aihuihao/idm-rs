@@ -27,7 +27,9 @@
 | 2 | ping 往返（真实帧协议子进程） | `host_ping_roundtrip` | 10/10 PASS |
 | 3 | enqueue 创建 Queued 任务（URL/目录/请求头正确） | `host_enqueue_creates_queued_task` | 10/10 PASS |
 | 4 | 拒绝非法输入（scheme/host/超长 URL/超大消息/非法 JSON/未知 type/含换行头） | `host_rejects_bad_input`, `host_rejects_oversized_message` | 2 项各 10/10 PASS |
-| 4（补充） | URL 严格校验：空白/`http://:80/`/畸形 IPv6/控制字符拒绝；内网主机名与 userinfo 允许且不入日志 | `host_url_validation_cases` | 10/10 PASS |
+| 4（补充） | URL 严格校验：空白/`http://:80/`/畸形 IPv6/控制字符拒绝；内网主机名允许；userinfo（凭据）一律拒绝且不入日志（4b 前置小改动后的行为） | `host_url_validation_cases` | 10/10 PASS |
+| 4（补充） | 入队时含 userinfo 的 URL 返回 `url must not contain credentials` 且绝不入队 | `host_enqueue_rejects_url_credentials` | 见 4b 报告（前置改动） |
+| 4（补充） | `validate_url` 对 userinfo 全形态的拒绝 | `url_tests::validate_url_rejects_all_userinfo_forms` | 见 4b 报告（前置改动） |
 | 4（补充） | `validate_url` 对三个边界输入的实际返回值 | `url_tests::validate_url_returns_for_three_inputs` | 10/10 PASS |
 | 4（补充） | `config set/get download-dir` | `config_set_get_download_dir` | 10/10 PASS |
 | 5 | stdout 只写帧、panic 写入 nmhost.log | `host_stdout_contains_only_frames` | 10/10 PASS |
@@ -96,7 +98,7 @@
 - `crates/idm-ipc/src/bin/idm-nmhost.rs:159` `handle_message`（ping / enqueue / 未知 type / 非法 JSON）
 - `crates/idm-ipc/src/bin/idm-nmhost.rs:170` `handle_enqueue`（头白名单校验 + 丢弃非法头并记日志 + 入队）
 - `crates/idm-ipc/src/bin/idm-nmhost.rs:182` 文件名先取最后一个路径分隔符后的部分再 `sanitize_windows_filename`
-- `crates/idm-ipc/src/bin/idm-nmhost.rs:245` `validate_url`（`idm_core::net::Url::parse`；长度 ≤ 8 KiB、无空白/控制字符、scheme 仅 http/https、`host_str()` 非空；错误不回显 URL，userinfo 不入日志）
+- `crates/idm-ipc/src/bin/idm-nmhost.rs:245` `validate_url`（`idm_core::net::Url::parse`；长度 ≤ 8 KiB、无空白/控制字符、scheme 仅 http/https、`host_str()` 非空；4b 前置小改动追加：含 userinfo 时返回 `"url must not contain credentials"`，错误不回显 URL）
 - `crates/idm-ipc/src/bin/idm-nmhost.rs:289` `spawn_runner_if_needed`（runner.lock 单实例、DETACHED_PROCESS|CREATE_NO_WINDOW、`runner:"not_started"`）
 
 ### clippy 修正（修正提交）

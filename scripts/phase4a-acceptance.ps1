@@ -39,6 +39,8 @@ $tests = @(
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_rejects_oversized_message' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_url_validation_cases' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--bin', 'idm-nmhost'); Name = 'url_tests::validate_url_returns_for_three_inputs' }
+    [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--bin', 'idm-nmhost'); Name = 'url_tests::validate_url_rejects_all_userinfo_forms' }
+    [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_enqueue_rejects_url_credentials' }
     [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Feature = 'test-hooks'; Name = 'host_stdout_contains_only_frames' }
     [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Feature = 'test-hooks'; Name = 'host_stdout_single_ping_frame_then_panic' }
     [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'default_build_ignores_panic_env' }
