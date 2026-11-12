@@ -9,9 +9,11 @@ const HOST_NAME = "idm_rs";
 const PING_TIMEOUT_MS = 5000;
 const ENQUEUE_TIMEOUT_MS = 8000;
 const DEDUP_WINDOW_MS = 10000;
+const FAIL_BACKOFF_MS = 30000;
 
 let enabled = true;
 let lastFailed = false;
+let lastFailAt = 0;
 const recent = new Map();
 
 function badge() {
@@ -74,6 +76,11 @@ async function handoff(item) {
     // Toggle off: let Firefox download normally.
     if (!enabled) return;
 
+    // Failure backoff: for 30 seconds after a failed handoff, let every new
+    // download go straight to Firefox. No ping, no native message at all.
+    // The toolbar keeps its "!" badge during this window.
+    if (lastFailAt !== 0 && Date.now() - lastFailAt < FAIL_BACKOFF_MS) return;
+
     const url = item.url || "";
     // blob:, data:, file:, about: and anything else are left to Firefox.
     if (!/^https?:\/\//i.test(url)) return;
@@ -105,21 +112,34 @@ async function handoff(item) {
             userAgent: navigator.userAgent
         };
 
-        // Step 3: enqueue; only a positive reply allows us to cancel Firefox's copy.
+        // Step 3: enqueue. Only a positive reply allows us to cancel Firefox's copy.
         const reply = await withTimeout(
             browser.runtime.sendNativeMessage(HOST_NAME, message),
             ENQUEUE_TIMEOUT_MS
         );
-        if (!reply || reply.ok !== true) throw new Error("enqueue rejected");
+        const accepted = !!(reply && reply.ok === true);
+        if (!accepted) throw new Error("enqueue rejected");
 
         await browser.downloads.cancel(item.id);
+        // Best effort: Firefox may have deleted the file already. A failure here
+        // must not prevent erase() from cleaning the download history entry.
+        try {
+            await browser.downloads.removeFile({ id: item.id });
+        } catch (e) {
+            // Ignore: the download was already cancelled and handed over.
+        }
         await browser.downloads.erase({ id: item.id });
+        // A successful handoff clears the failure state and its backoff window.
+        lastFailAt = 0;
         lastFailed = false;
         await paint();
     } catch (e) {
         // Never cancel on failure (missing host, rejection, or timeout).
         // Only a fixed message is logged: no URL, no cookie, no header value.
         console.warn("idm-rs: handoff failed; keeping Firefox download");
+        // Drop the dedup entry so an immediate manual retry is not blocked.
+        recent.delete(url);
+        lastFailAt = Date.now();
         lastFailed = true;
         await paint();
     }

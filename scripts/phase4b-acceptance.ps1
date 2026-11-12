@@ -99,12 +99,132 @@ function Test-BackgroundHasNoForbiddenCode {
     return $true
 }
 
+# --- Phase 4b-fix: text/structure checks on background.js -------------------
+# Pure PowerShell. No JavaScript is executed, no Node/npm is required.
+function Get-BackgroundText {
+    $p = Join-Path $fxDir 'background.js'
+    if (-not (Test-Path $p)) { return $null }
+    return (Get-Content -Encoding UTF8 -Raw $p)
+}
+
+# Extract every `catch (...) { ... }` block with brace counting, so nested
+# try/catch blocks (e.g. removeFile) are handled correctly.
+function Get-CatchBlocks {
+    param([string]$Text)
+    $blocks = @()
+    foreach ($m in [regex]::Matches($Text, 'catch\s*\(\w+\)\s*\{')) {
+        $open = $Text.IndexOf('{', $m.Index)
+        if ($open -lt 0) { continue }
+        $depth = 0
+        for ($i = $open; $i -lt $Text.Length; $i++) {
+            if ($Text[$i] -eq '{') { $depth++ }
+            elseif ($Text[$i] -eq '}') {
+                $depth--
+                if ($depth -eq 0) {
+                    $blocks += $Text.Substring($open, $i - $open + 1)
+                    break
+                }
+            }
+        }
+    }
+    return ,$blocks
+}
+
+# Slice the handoff() failure branch: from the fixed failure log line up to the
+# end of handoff() (the onCreated listener registration follows it).
+function Get-FailureBranchText {
+    param([string]$Text)
+    $marker = 'console.warn("idm-rs: handoff failed'
+    $start = $Text.IndexOf($marker, [System.StringComparison]::Ordinal)
+    if ($start -lt 0) { return $null }
+    $end = $Text.IndexOf('browser.downloads.onCreated', $start, [System.StringComparison]::Ordinal)
+    if ($end -lt 0 -or $end -le $start) { return $null }
+    return $Text.Substring($start, $end - $start)
+}
+
+# Order check: every `downloads.cancel` must come AFTER the `reply.ok === true`
+# acceptance check, i.e. cancelling is only reachable on a positive reply.
+function Test-CancelOnlyAfterOkReply {
+    $text = Get-BackgroundText
+    if ($null -eq $text) { return $false }
+    $gate = $text.IndexOf('reply.ok === true', [System.StringComparison]::Ordinal)
+    if ($gate -lt 0) { return $false }
+    $cancels = [regex]::Matches($text, 'downloads\.cancel')
+    if ($cancels.Count -eq 0) { return $false }
+    foreach ($m in $cancels) {
+        if ($m.Index -le $gate) { return $false }
+    }
+    return $true
+}
+
+function Test-CatchBranchesHaveNoCancel {
+    $text = Get-BackgroundText
+    if ($null -eq $text) { return $false }
+    $blocks = @(Get-CatchBlocks -Text $text)
+    if ($blocks.Count -eq 0) { return $false }
+    foreach ($b in $blocks) {
+        if ($b -match 'downloads\.cancel') { return $false }
+    }
+    return $true
+}
+
+function Test-ContainsRemoveFile {
+    $text = Get-BackgroundText
+    if ($null -eq $text) { return $false }
+    return ($text -match 'downloads\.removeFile')
+}
+
+function Test-ContainsLastFailAt {
+    $text = Get-BackgroundText
+    if ($null -eq $text) { return $false }
+    return ($text -match 'lastFailAt')
+}
+
+# Part 3: PowerShell text/structure test - failure branch clears the dedup entry.
+function Test-FailureBranchDeletesRecent {
+    $text = Get-BackgroundText
+    if ($null -eq $text) { return $false }
+    $branch = Get-FailureBranchText -Text $text
+    if ($null -eq $branch) { return $false }
+    return ($branch -match 'recent\.delete\(url\)')
+}
+
+# Part 3: PowerShell text/structure test - 30 second backoff constant exists
+# and is actually used as the backoff window.
+function Test-BackoffConstantIsThirtySeconds {
+    $text = Get-BackgroundText
+    if ($null -eq $text) { return $false }
+    if ($text -notmatch 'FAIL_BACKOFF_MS\s*=\s*30000') { return $false }
+    if ($text -notmatch 'lastFailAt\s*!==\s*0') { return $false }
+    if ($text -notmatch 'FAIL_BACKOFF_MS') { return $false }
+    return $true
+}
+
+# Part 3: PowerShell text/structure test - forbidden JS constructs are absent.
+function Test-NoForbiddenJsConstructs {
+    $text = Get-BackgroundText
+    if ($null -eq $text) { return $false }
+    if ($text -match 'eval\(') { return $false }
+    if ($text -match 'new\s+Function') { return $false }
+    if ($text -match 'innerHTML') { return $false }
+    return $true
+}
+
 $staticTests = @(
     [pscustomobject]@{ Id = 4; Name = 'static_manifest_json_is_valid'; Fn = { Test-ManifestJson } }
     [pscustomobject]@{ Id = 4; Name = 'static_permissions_are_exactly_five'; Fn = { Test-Permissions } }
     [pscustomobject]@{ Id = 5; Name = 'static_no_package_json_anywhere'; Fn = { Test-NoPackageJson } }
     [pscustomobject]@{ Id = 4; Name = 'static_background_required_calls'; Fn = { Test-BackgroundContainsRequiredCalls } }
     [pscustomobject]@{ Id = 4; Name = 'static_background_no_forbidden_code'; Fn = { Test-BackgroundHasNoForbiddenCode } }
+    # Part 2.2 additions
+    [pscustomobject]@{ Id = 2; Name = 'static_cancel_only_after_ok_reply'; Fn = { Test-CancelOnlyAfterOkReply } }
+    [pscustomobject]@{ Id = 2; Name = 'static_catch_branches_have_no_cancel'; Fn = { Test-CatchBranchesHaveNoCancel } }
+    [pscustomobject]@{ Id = 2; Name = 'static_contains_removeFile'; Fn = { Test-ContainsRemoveFile } }
+    [pscustomobject]@{ Id = 2; Name = 'static_contains_lastFailAt'; Fn = { Test-ContainsLastFailAt } }
+    # Part 3 additions: PowerShell text/structure tests
+    [pscustomobject]@{ Id = 3; Name = 'ps_test_failure_branch_deletes_recent'; Fn = { Test-FailureBranchDeletesRecent } }
+    [pscustomobject]@{ Id = 3; Name = 'ps_test_backoff_constant_30s'; Fn = { Test-BackoffConstantIsThirtySeconds } }
+    [pscustomobject]@{ Id = 3; Name = 'ps_test_no_forbidden_js_constructs'; Fn = { Test-NoForbiddenJsConstructs } }
 )
 
 # --- New Rust tests (registration commands) ----------------------------------
