@@ -1410,11 +1410,11 @@ mod dl {
                     return 2;
                 }
                 let p = std::path::Path::new(value);
-                if !p.exists() {
-                    if let Err(e) = std::fs::create_dir_all(p) {
-                        eprintln!("cannot create download-dir {value}: {e}");
-                        return 1;
-                    }
+                if !p.exists()
+                    && let Err(e) = std::fs::create_dir_all(p)
+                {
+                    eprintln!("cannot create download-dir {value}: {e}");
+                    return 1;
                 }
                 if let Err(e) = store.set_setting(key, value).await {
                     crate::print_error("config set failed", &e);

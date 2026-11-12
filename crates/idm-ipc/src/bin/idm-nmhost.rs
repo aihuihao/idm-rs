@@ -19,6 +19,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use idm_core::error::Error;
+use idm_core::net::Url;
 use idm_core::net::client::validate_extra_headers;
 use idm_core::net::filename::sanitize_windows_filename;
 use idm_core::store::{QueuedTask, Store, default_db_path};
@@ -97,19 +98,25 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // 测试开关：首个消息触发 panic，用于验证 stdout 纯净 & panic 入日志（仅供测试构建/运行）。
-    let test_panic = std::env::var("IDM_NMHOST_TEST_PANIC").is_ok();
-    if let Err(e) = run_loop(&db, test_panic).await {
+    // 测试开关：值为 N 时在第 N 条消息触发 panic（缺省按 1 处理），用于验证
+    // stdout 纯净 & panic 入日志。仅由集成测试注入环境变量使用。
+    let panic_at: Option<usize> = std::env::var("IDM_NMHOST_TEST_PANIC").ok().map(|v| match v
+        .parse::<usize>()
+    {
+        Ok(n) => n.max(1),
+        Err(_) => 1,
+    });
+    if let Err(e) = run_loop(&db, panic_at).await {
         host_log(&format!("run_loop error: {e}"));
         std::process::exit(1);
     }
 }
 
 /// 主循环：读取帧 → 解析 → 处理 → 写回响应帧。标准输入关闭则退出。
-async fn run_loop(db: &Store, test_panic: bool) -> Result<(), Error> {
+async fn run_loop(db: &Store, panic_at: Option<usize>) -> Result<(), Error> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut first = true;
+    let mut seen = 0usize;
     loop {
         let payload = match read_frame(&mut stdin).await.map_err(|e| Error::Io {
             operation: "nmhost read_frame",
@@ -129,10 +136,10 @@ async fn run_loop(db: &Store, test_panic: bool) -> Result<(), Error> {
                 break;
             }
         };
-        if test_panic && first {
+        seen += 1;
+        if panic_at == Some(seen) {
             panic!("injected panic for self-test");
         }
-        first = false;
         match handle_message(&payload, db).await {
             Ok(resp) => {
                 if write_frame(&mut stdout, &resp).await.is_err() {
@@ -166,13 +173,15 @@ async fn handle_enqueue(v: &Value, db: &Store) -> Result<Value, String> {
         .and_then(|u| u.as_str())
         .unwrap_or("")
         .to_string();
-    // URL 校验（不引入新依赖，手动校验 scheme / host / 长度）。
-    if !is_http_url(&url) {
-        return Err("url must be http(s) with a host".to_string());
-    }
-    // 文件名：只取合法化后的文件名部分；空则不指定。
+    // URL 校验：用 idm_core 重导出的 reqwest::Url 做严格解析。
+    // 错误信息一律不含 URL 本身，避免 userinfo 等凭据泄入日志/回复。
+    let _ = validate_url(&url)?;
+    // 文件名：先取最后一个路径分隔符后的部分，再做 Windows 合法化；空则不指定。
     let file_name = match v.get("filename").and_then(|f| f.as_str()) {
-        Some(f) if !f.is_empty() => Some(sanitize_windows_filename(f)),
+        Some(f) if !f.is_empty() => {
+            let base = f.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(f);
+            Some(sanitize_windows_filename(base))
+        }
         _ => None,
     };
     // 请求头：按白名单逐个校验，非法的直接丢弃并记录日志（不影响入队）。
@@ -227,28 +236,29 @@ async fn handle_enqueue(v: &Value, db: &Store) -> Result<Value, String> {
     }
 }
 
-/// 校验 URL：scheme 只能 http/https（大小写不敏感），长度 ≤ 8 KiB，且必须有 host。
-fn is_http_url(url: &str) -> bool {
+/// 校验 URL：总长 ≤ 8 KiB、不含空白字符/控制字符、scheme 只能是 http/https、
+/// `host_str()` 必须非空。内网单标签主机名（如 `nas`）合法。
+///
+/// 使用 `idm_core::net::Url`（reqwest/url crate）而非手写字符串切分，可正确拒绝
+/// `http://a b/`、`http://:80/`、`http://[::1/` 等畸形 authority。
+/// 错误信息不含 URL 本身，`user:pass@` 形式的 userinfo 不会进入日志。
+fn validate_url(url: &str) -> Result<Url, String> {
     if url.len() > 8 * 1024 {
-        return false;
+        return Err("url exceeds 8 KiB".to_string());
     }
-    let lc = url.to_ascii_lowercase();
-    let rest = match lc
-        .strip_prefix("https://")
-        .or_else(|| lc.strip_prefix("http://"))
-    {
-        Some(r) => r,
-        None => return false,
-    };
-    // authority：到第一个路径/查询/片段分隔符为止。
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return false;
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("url contains whitespace or control characters".to_string());
     }
-    // host 必须含 '.'，或为 localhost，或含 ':'（端口 / IPv6）。
-    authority.contains('.')
-        || authority.eq_ignore_ascii_case("localhost")
-        || authority.contains(':')
+    let parsed =
+        Url::parse(url).map_err(|_| "url must be a valid http(s) URL with a host".to_string())?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("url scheme must be http or https".to_string()),
+    }
+    match parsed.host_str() {
+        Some(h) if !h.is_empty() => Ok(parsed),
+        _ => Err("url must have a host".to_string()),
+    }
 }
 
 /// 默认下载目录：`%USERPROFILE%\Downloads\idm-rs`。

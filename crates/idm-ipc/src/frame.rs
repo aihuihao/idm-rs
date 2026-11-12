@@ -49,11 +49,15 @@ where
 }
 
 /// 向 `writer` 写一帧：`[4 字节本机字节序长度][UTF-8 JSON]`。
-pub async fn write_frame<W>(writer: &mut W, value: &serde_json::Value) -> std::io::Result<()>
+///
+/// 序列化失败时返回 `Err` 且**不写出任何字节**：绝不发送长度为 0 的空帧。
+pub async fn write_frame<W, V>(writer: &mut W, value: &V) -> std::io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
+    V: serde::Serialize + ?Sized,
 {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let len = bytes.len() as u32;
     writer.write_all(&len.to_ne_bytes()).await?;
     writer.write_all(&bytes).await?;
@@ -151,6 +155,29 @@ mod tests {
                 other => panic!("expected Message, got {other:?}"),
             }
         }
+    }
+
+    /// 序列化失败时 `write_frame` 必须返回 Err 且不写出任何字节（含空帧）。
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_failure_emits_no_bytes() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = BufWriter::new(&mut buf);
+            let res = write_frame(&mut w, &Unserializable).await;
+            assert!(res.is_err(), "序列化失败必须返回 Err");
+            w.flush().await.unwrap();
+        }
+        assert!(buf.is_empty(), "失败时不得发送空帧或任何字节: {buf:?}");
     }
 
     // write_frame 与 read_frame 端到端。

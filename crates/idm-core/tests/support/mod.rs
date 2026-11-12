@@ -69,6 +69,9 @@ pub struct StallConfig {
     pub close_after_ms: Arc<AtomicU64>,
 }
 
+/// Phase 4a：测试服务器收集到的请求头汇（名字 + 值）。
+pub type HeaderSink = Arc<Mutex<Vec<(String, String)>>>;
+
 /// 服务器配置；所有字段都在请求处理中被读取。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -121,7 +124,7 @@ pub struct ServerConfig {
     pub range_sink: Option<Arc<Mutex<Vec<String>>>>,
     /// Phase 4a：所有收到的请求头（名字转小写, 值）都会被 push 到这里，用于断言
     /// 浏览器接管透传的 Referer / Cookie / User-Agent 到达了服务器。
-    pub header_sink: Option<Arc<Mutex<Vec<(String, String)>>>>,
+    pub header_sink: Option<HeaderSink>,
     /// 只记录**非 Probe** 请求的 Range 头（Phase 2.2：断言没有起点等于终点的请求）。
     pub chunk_range_sink: Option<Arc<Mutex<Vec<String>>>>,
     /// 非 Probe 请求计数（Phase 1d：验证"服务器一共收到 N 次请求"/

@@ -42,12 +42,25 @@
 
 ## 已完成（收尾）
 - 七、ARCHITECTURE.md 第 12 节（按原文）
-- 八、docs/phase4a-report.md 自查表（22 项 10/10）
-- 九、验收脚本 22 个新测试各连续 10 次全 PASS（exit 0）；全量回归 241 passed/0 failed；
-  两个崩溃测试 2 passed/0 failed（EXIT=0）。Cargo.lock 相对基线仅新增 serde_json 1.0.154 与 zmij 1.0.23
+- 八、docs/phase4a-report.md 自查表
+- 九、初版提交 `20c3429`（22 项 10/10）
+
+## 已完成（修正提交 phase4a-fix）
+- clippy STEP 6 全绿：`verify-workspace.ps1` 16 步全 PASS，exit 0
+  （core support HeaderSink 别名、phase4a 去 unwrap/vec/多余引用、main.rs 折叠 if、
+   nmhost.rs 测试全改 `?`；未使用任何 `#[allow]`）
+- host 安全修正：删手写 is_http_url 改 `Url::parse`（8 KiB / 无空白控制字符 / scheme / host_str）；
+  文件名先取 basename 再 sanitize；`write_frame` 序列化失败返回 Err 且不发空帧；
+  lib.rs 注释更新；panic 开关支持第 N 条消息
+- 新增 3 个测试：`write_frame_failure_emits_no_bytes`、`host_url_validation_cases`、
+  `host_stdout_single_ping_frame_then_panic`；`filename_is_sanitized` 改对具体值断言
+- 25 个新测试各 10 次全 PASS（ACCEPT_EXIT=0）；全量回归 244 passed/0 failed（REG_EXIT=0）；
+  崩溃测试 2 passed/0 failed（CRASH_EXIT=0）；verify-workspace.ps1 SCRIPT_EXIT=0
+- 报告更正「验收脚本 exit code 0」的指向，补第 8 条不一致与并发单实例说明
 
 ## 待做
-- [ ] 提交（docs crates scripts ARCHITECTURE.md Cargo.toml Cargo.lock），不 push
+- [ ] 追加提交 `phase4a-fix: clippy and host input validation`
+  （docs crates scripts ARCHITECTURE.md Cargo.toml Cargo.lock），不 push
 
 ## 关键代码位置（边做边补）
 - 迁移数组：`crates/idm-core/src/store/mod.rs` L27 (`MIGRATIONS`), L30 (`SCHEMA_VERSION`)

@@ -9,7 +9,6 @@ mod support;
 mod verify;
 
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use idm_core::disk::DiskWriterPool;
@@ -17,7 +16,7 @@ use idm_core::net::client::DownloadConfig;
 use idm_core::net::client::validate_extra_headers;
 use idm_core::queue::{DownloadQueue, QueueConfig};
 use idm_core::store::{QueuedTask, Store, TaskStateDb};
-use support::{ServerConfig, start};
+use support::{HeaderSink, ServerConfig, start};
 use tempfile::tempdir;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -83,7 +82,7 @@ async fn run_queue(store: Arc<Store>) -> TestResult {
 // --- 10：core 拒绝非法请求头 -------------------------------------------
 
 #[test]
-fn invalid_headers_rejected_in_core() {
+fn invalid_headers_rejected_in_core() -> TestResult {
     // 非白名单名字
     assert!(validate_extra_headers(&[("X-Evil".to_string(), "v".to_string())]).is_err());
     // 含换行
@@ -94,17 +93,18 @@ fn invalid_headers_rejected_in_core() {
     // 合法
     assert!(validate_extra_headers(&headers_vec()).is_ok());
     // 错误信息不得包含 Cookie 值：用一个确实会被拒（含 CR/LF）且带密钥的 Cookie。
-    let err = validate_extra_headers(&vec![(
+    let err = validate_extra_headers(&[(
         "Cookie".to_string(),
         "secret_session=abcd1234xyz\r\n".to_string(),
     )])
     .err()
-    .unwrap();
+    .ok_or("expected validation error")?;
     let msg = format!("{err:?}");
     assert!(
         !msg.contains("abcd1234xyz"),
         "错误信息不得泄露 Cookie 值: {msg}"
     );
+    Ok(())
 }
 
 // --- 14：迁移 V4 ------------------------------------------------------
@@ -151,7 +151,7 @@ async fn migration_v4_creates_tables_and_is_idempotent() -> TestResult {
 async fn headers_reach_server_including_retry() -> TestResult {
     let dir = tempdir()?;
     let size = 2 * MIB;
-    let hsink: Arc<StdMutex<Vec<(String, String)>>> = Default::default();
+    let hsink: HeaderSink = Default::default();
     let srv = start(ServerConfig {
         size,
         // 第一个非 Probe 分块请求返回错误，触发客户端重试。
@@ -213,7 +213,7 @@ async fn headers_reach_server_including_retry() -> TestResult {
 async fn headers_reach_server_on_resume() -> TestResult {
     let dir = tempdir()?;
     let size = 8 * MIB;
-    let hsink: Arc<StdMutex<Vec<(String, String)>>> = Default::default();
+    let hsink: HeaderSink = Default::default();
     let srv = start(ServerConfig {
         size,
         speed: Some(support::SpeedPolicy(Arc::new(|_, _| Some(MIB)))), // 1 MiB/s，慢速便于暂停
@@ -312,7 +312,7 @@ async fn cookie_not_in_logs() -> TestResult {
     let dir = tempdir()?;
     let size = MIB;
     let log_path = dir.path().join("test.log");
-    install_log_capture(&log_path);
+    install_log_capture(&log_path)?;
     let srv = start(ServerConfig {
         size,
         ..ServerConfig::default()
@@ -346,23 +346,21 @@ async fn cookie_not_in_logs() -> TestResult {
     assert!(
         !log.contains("abcd1234xyz"),
         "日志中不得出现 Cookie 值。日志片段: {}",
-        &log.chars().take(500).collect::<String>()
+        log.chars().take(500).collect::<String>()
     );
     Ok(())
 }
 
 /// 安装一个把 tracing 事件写入指定文件的订阅者（进程级，仅首个调用生效）。
-fn install_log_capture(path: &std::path::Path) {
-    let p = path.to_path_buf();
+fn install_log_capture(path: &std::path::Path) -> TestResult {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     let _ = tracing_subscriber::fmt()
-        .with_writer(move || {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&p)
-                .unwrap()
-        })
+        .with_writer(std::sync::Mutex::new(file))
         .with_ansi(false)
         .with_target(false)
         .try_init();
+    Ok(())
 }

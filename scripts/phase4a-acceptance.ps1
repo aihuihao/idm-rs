@@ -31,12 +31,15 @@ $tests = @(
     [pscustomobject]@{ Id = 1;  Section = 'frame'; Pkg = 'idm-ipc';  Target = @('--lib');              Name = 'frame::tests::frame_truncated_then_eof' }
     [pscustomobject]@{ Id = 1;  Section = 'frame'; Pkg = 'idm-ipc';  Target = @('--lib');              Name = 'frame::tests::frame_multiple' }
     [pscustomobject]@{ Id = 1;  Section = 'frame'; Pkg = 'idm-ipc';  Target = @('--lib');              Name = 'frame::tests::frame_write_then_read' }
+    [pscustomobject]@{ Id = 1;  Section = 'frame'; Pkg = 'idm-ipc';  Target = @('--lib');              Name = 'frame::tests::write_frame_failure_emits_no_bytes' }
 
     [pscustomobject]@{ Id = 2;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_ping_roundtrip' }
     [pscustomobject]@{ Id = 3;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_enqueue_creates_queued_task' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_rejects_bad_input' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_rejects_oversized_message' }
+    [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_url_validation_cases' }
     [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_stdout_contains_only_frames' }
+    [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_stdout_single_ping_frame_then_panic' }
     [pscustomobject]@{ Id = 6;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'filename_is_sanitized' }
     [pscustomobject]@{ Id = 13; Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_spawns_runner_once' }
 
