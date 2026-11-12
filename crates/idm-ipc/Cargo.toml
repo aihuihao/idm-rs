@@ -8,6 +8,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# 仅供集成测试使用的 host 自测钩子（panic 注入）。默认关闭，
+# 因此 release / 默认构建不含 `IDM_NMHOST_TEST_PANIC` 读取逻辑与注入点。
+default = []
+test-hooks = []
+
 [dependencies]
 idm-core = { workspace = true }
 serde.workspace = true

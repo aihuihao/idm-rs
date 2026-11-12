@@ -58,8 +58,21 @@
   崩溃测试 2 passed/0 failed（CRASH_EXIT=0）；verify-workspace.ps1 SCRIPT_EXIT=0
 - 报告更正「验收脚本 exit code 0」的指向，补第 8 条不一致与并发单实例说明
 
+## 已完成（第二次修正：test-hooks feature 隔离）
+- 实测改造前 release 二进制含 `IDM_NMHOST_TEST_PANIC` 与 `injected panic for self-test`（True/True）
+- `crates/idm-ipc/Cargo.toml` 加 `[features] default=[] / test-hooks=[]`；
+  `idm-nmhost.rs` 的 `maybe_test_panic` 拆成两个 cfg 版本，main/run_loop 不再传开关参数
+- 实测改造后 release 二进制 `CONTAINS_ENV_NAME=False`、`CONTAINS_PANIC_MSG=False`
+- 两个 panic 测试改为 `#[cfg(feature = "test-hooks")]`；新增 `default_build_ignores_panic_env`
+  （`#[cfg(not(...))]`）确认默认构建下环境变量无效
+- 新增 `url_tests::validate_url_returns_for_three_inputs` 打印三个边界输入实际返回值；
+  `host_url_validation_cases` 打印 nmhost.log 原文并断言不含 user/pass
+- 验收脚本加 `Feature` 字段（panic 测试用 `--features test-hooks`）与 2 个新测试项，共 27 项
+- 27 项各 10 次全 PASS（ACCEPT_EXIT=0）；verify-workspace.ps1 16/16 PASS（SCRIPT_EXIT=0）；
+  两种 feature 下 clippy -D warnings 均 exit 0
+
 ## 待做
-- [ ] 追加提交 `phase4a-fix: clippy and host input validation`
+- [ ] 追加提交 `phase4a-fix: gate panic test hook behind cargo feature`
   （docs crates scripts ARCHITECTURE.md Cargo.toml Cargo.lock），不 push
 
 ## 关键代码位置（边做边补）

@@ -38,8 +38,10 @@ $tests = @(
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_rejects_bad_input' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_rejects_oversized_message' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_url_validation_cases' }
-    [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_stdout_contains_only_frames' }
-    [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_stdout_single_ping_frame_then_panic' }
+    [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--bin', 'idm-nmhost'); Name = 'url_tests::validate_url_returns_for_three_inputs' }
+    [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Feature = 'test-hooks'; Name = 'host_stdout_contains_only_frames' }
+    [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Feature = 'test-hooks'; Name = 'host_stdout_single_ping_frame_then_panic' }
+    [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'default_build_ignores_panic_env' }
     [pscustomobject]@{ Id = 6;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'filename_is_sanitized' }
     [pscustomobject]@{ Id = 13; Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_spawns_runner_once' }
 
@@ -85,7 +87,9 @@ foreach ($t in $selected) {
     $passed = 0
     for ($i = 1; $i -le $Repeat; $i++) {
         Remove-Item $outFile, $markFile -Force -ErrorAction SilentlyContinue
-        $cargoLine = 'cargo test -p ' + $t.Pkg + ' --offline ' +
+        $featArg = ''
+        if ($t.Feature) { $featArg = '--features ' + $t.Feature + ' ' }
+        $cargoLine = 'cargo test -p ' + $t.Pkg + ' --offline ' + $featArg +
                      (@($t.Target) -join ' ') + ' ' + $t.Name +
                      ' -- --exact --test-threads=1'
         # cmd: run cargo, on success grep for "1 passed", only then write marker.

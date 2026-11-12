@@ -4,17 +4,22 @@
 所有构建/测试均使用 `--offline`，未执行 `cargo update`。测试只用本地回环服务器与临时数据库，
 未访问外网、未碰真实注册表。
 
-本报告经一次修正提交（`phase4a-fix: clippy and host input validation`）更新：修正了
-`verify-workspace.ps1` STEP 6 的 clippy 错误、host 的 URL/文件名校验与 `write_frame` 行为，
-并补做了工作区验收脚本全量运行。文中的所有结果均为修正后重新实测的数据。
+本报告经两次修正提交更新：
+- `phase4a-fix: clippy and host input validation`：修正 `verify-workspace.ps1` STEP 6 的
+  clippy 错误、host 的 URL/文件名校验与 `write_frame` 行为，补做工作区验收脚本全量运行。
+- `phase4a-fix: gate panic test hook behind cargo feature`：把 host 的 panic 测试开关
+  `IDM_NMHOST_TEST_PANIC` 从无条件编译改为仅 `test-hooks` feature 启用时存在（默认/发布构建
+  完全不含该开关），并补测默认构建下环境变量无效。文中的所有结果均为修正后重新实测的数据。
 
 ## 一、提交前自查表（第六部分编号）
 
 每个新测试用 `scripts/phase4a-acceptance.ps1 -Section all -Repeat 10` 单独连续运行 10 次。
 判定标准：单次 `cargo test --exact` 退出码 0 **且**输出含 `1 passed`；任一不满足即计失败。
-修正后重跑结果：`SUMMARY: all 25 tests reached 10/10 : PASS`，`ACCEPT_EXIT=0`
-（日志 `target/accept-fix.out`）。工作区验收脚本 `scripts/verify-workspace.ps1` 单独运行结果：
-`SUMMARY: all 16 steps executed; final result: PASS`，`SCRIPT_EXIT=0`（日志 `target/vw2.out`）。
+第二次修正后重跑结果：`SUMMARY: all 27 tests reached 10/10 : PASS`，`ACCEPT_EXIT=0`
+（日志 `target/accept-hooks.out`）。工作区验收脚本 `scripts/verify-workspace.ps1` 单独运行结果：
+`SUMMARY: all 16 steps executed; final result: PASS`，`SCRIPT_EXIT=0`（日志 `target/vw3.out`）。
+其中 `host_stdout_contains_only_frames` 与 `host_stdout_single_ping_frame_then_panic` 由验收脚本
+以 `cargo test --features test-hooks` 运行；`default_build_ignores_panic_env` 以默认 features 运行。
 
 | 第六部分编号 | 要求摘要 | 测试名 | 单独连续运行 10 次的结果 |
 |---|---|---|---|
@@ -23,9 +28,11 @@
 | 3 | enqueue 创建 Queued 任务（URL/目录/请求头正确） | `host_enqueue_creates_queued_task` | 10/10 PASS |
 | 4 | 拒绝非法输入（scheme/host/超长 URL/超大消息/非法 JSON/未知 type/含换行头） | `host_rejects_bad_input`, `host_rejects_oversized_message` | 2 项各 10/10 PASS |
 | 4（补充） | URL 严格校验：空白/`http://:80/`/畸形 IPv6/控制字符拒绝；内网主机名与 userinfo 允许且不入日志 | `host_url_validation_cases` | 10/10 PASS |
+| 4（补充） | `validate_url` 对三个边界输入的实际返回值 | `url_tests::validate_url_returns_for_three_inputs` | 10/10 PASS |
 | 4（补充） | `config set/get download-dir` | `config_set_get_download_dir` | 10/10 PASS |
 | 5 | stdout 只写帧、panic 写入 nmhost.log | `host_stdout_contains_only_frames` | 10/10 PASS |
 | 5（补充） | 先正常回复 ping 再 panic，stdout 恰好一个完整 ping 回复帧、无其它字节 | `host_stdout_single_ping_frame_then_panic` | 10/10 PASS |
+| 5（补充） | 默认/发布构建下 `IDM_NMHOST_TEST_PANIC` 环境变量完全无效 | `default_build_ignores_panic_env` | 10/10 PASS |
 | 6 | 文件名 sanitize（对 5 个具体结果值断言） | `filename_is_sanitized` | 10/10 PASS |
 | 7 | 请求头到达服务器（含重试、续传） | `headers_reach_server_including_retry`, `headers_reach_server_on_resume` | 2 项各 10/10 PASS |
 | 8 | 任务完成后 task_headers 清空 | `headers_cleared_on_completion` | 10/10 PASS |
@@ -52,7 +59,8 @@
 
 ### 依赖
 - `Cargo.toml:22-23`：`serde` / `serde_json` 提升到 workspace.dependencies
-- `crates/idm-ipc/Cargo.toml:11-15,17-19`：`workspace = true`、`idm-core`、tokio features、`[[bin]] idm-nmhost`
+- `crates/idm-ipc/Cargo.toml:11-15,23-28`：`workspace = true`、`idm-core`、tokio features、
+  `[features] default=[] / test-hooks=[]`、`[[bin]] idm-nmhost`
 
 ### 迁移 V4 与 Store（第二部分）
 - `crates/idm-core/src/store/mod.rs:27` `MIGRATIONS` 追加 V4；`:30` SCHEMA_VERSION=4
@@ -81,6 +89,9 @@
 - `crates/idm-ipc/src/lib.rs` 导出 `pub mod frame`，文档注释改为 Phase 4a 实际说明
 - `crates/idm-ipc/src/frame.rs:8` `MAX_MESSAGE_LEN=64 KiB`；`:12` `ReadFrame`；`:26` `read_frame`（先校验长度再分配）；`:54` `write_frame`（泛型 `Serialize`，序列化失败返回 `Err` 且不写任何字节，绝不发空帧）
 - `crates/idm-ipc/src/bin/idm-nmhost.rs:54` `host_log`（1 MiB 覆写、绝不到 stdout）；`:77` panic hook
+- `crates/idm-ipc/src/bin/idm-nmhost.rs:88-99` `maybe_test_panic` 的两个 cfg 版本：
+  `#[cfg(feature = "test-hooks")]` 读 `IDM_NMHOST_TEST_PANIC` 并注入 panic；
+  `#[cfg(not(feature = "test-hooks"))]` 为空操作，默认/发布构建不含开关字符串
 - `crates/idm-ipc/src/bin/idm-nmhost.rs:116` `run_loop`（帧循环 / stdout 仅帧 / 超长关闭；panic 开关按第 N 条消息触发）
 - `crates/idm-ipc/src/bin/idm-nmhost.rs:159` `handle_message`（ping / enqueue / 未知 type / 非法 JSON）
 - `crates/idm-ipc/src/bin/idm-nmhost.rs:170` `handle_enqueue`（头白名单校验 + 丢弃非法头并记日志 + 入队）
@@ -111,12 +122,12 @@
 
 ## 五、测试总数
 
-- 本阶段新增测试：**25 个**（frame 单元 7 + idm-ipc 集成 9 + idm-core 集成 6 + idm-cli 集成 3）
-- 每个新测试单独连续运行 10 次：**250 次运行，全部 PASS**
-- 全量回归 `cargo test --workspace --offline`：**244 passed / 0 failed**（含上述 25 个），`REG_EXIT=0`
+- 本阶段新增测试：**27 个**（frame 单元 7 + idm-nmhost bin 单元 1 + idm-ipc 集成 10 + idm-core 集成 6 + idm-cli 集成 3）
+- 每个新测试单独连续运行 10 次：**270 次运行，全部 PASS**
+- 全量回归 `cargo test --workspace --offline`：**244 passed / 0 failed**（默认 features，`REG_EXIT=0`）
 - 两个崩溃测试（`crash_resume.rs -- --ignored`）：**2 passed / 0 failed**，`CRASH_EXIT=0`
 - **`scripts/phase4a-acceptance.ps1`（本阶段额外新增的 10× 脚本）**：`ACCEPT_EXIT=0`，
-  `SUMMARY: all 25 tests reached 10/10 : PASS`
+  `SUMMARY: all 27 tests reached 10/10 : PASS`
 - **`scripts/verify-workspace.ps1`（仓库原有的工作区验收脚本，任务第九部分所指）**：
   `SCRIPT_EXIT=0`，`SUMMARY: all 16 steps executed; final result: PASS`（16 步全 PASS，
   含 STEP 6 `cargo clippy --workspace --all-targets --locked -- -D warnings` 与
@@ -153,6 +164,15 @@
    `scripts/phase4a-acceptance.ps1`，**不是** `scripts/verify-workspace.ps1`；当时后者在 STEP 6
    clippy 失败（`FAIL (exit=101)`，脚本退出码 1）。修正后两个脚本的结果分别如实记录于第五节，
    不再混用「验收脚本」一词。
+9. **`test-hooks` feature 与 `IDM_NMHOST_TEST_PANIC` 开关隔离是任务原文未要求的额外改动**：
+   原文第五部分第 2 条只要求「panic hook 把 panic 写到日志」，第六部分第 5 项要求用「仅在测试
+   构建里存在」的开关验证 stdout 纯净。初版实现用运行时环境变量无条件编译该开关，导致**发布
+   二进制也包含它**（实测 `cargo build --release` 产物中 `CONTAINS_ENV_NAME=True`）。改为
+   `crates/idm-ipc/Cargo.toml` 定义默认关闭的 `test-hooks` feature 后，只有以
+   `--features test-hooks` 编译的测试构建才含该开关；默认与 release 构建实测
+   `CONTAINS_ENV_NAME=False`、`CONTAINS_PANIC_MSG=False`。代价是两个 panic 测试必须带 feature
+   运行，工作区默认 `cargo test --workspace` 不执行它们（由 `default_build_ignores_panic_env`
+   覆盖默认构建行为），因此 `verify-workspace.ps1` 的 STEP 5 不再覆盖这两个用例。
 
 ## 七、两个 host 同时入队时的运行器单实例行为
 

@@ -360,9 +360,16 @@ fn host_url_validation_cases() -> TestResult {
     child.wait()?;
 
     let log = std::fs::read_to_string(log_path(tmp.path()))?;
+    println!("=== nmhost.log 原文 ===\n{log}=== end of nmhost.log ===");
+    println!("log.contains(\"user\") = {}", log.contains("user"));
+    println!("log.contains(\"pass\") = {}", log.contains("pass"));
     assert!(!log.is_empty(), "应有一条 dropped invalid header 日志");
     assert!(
-        !log.contains("user:pass") && !log.contains("pass@") && !log.contains("user:pass@host"),
+        !log.contains("user")
+            && !log.contains("pass")
+            && !log.contains("user:pass")
+            && !log.contains("pass@")
+            && !log.contains("user:pass@host"),
         "userinfo 不得写入 nmhost.log: {log}"
     );
     Ok(())
@@ -400,8 +407,46 @@ fn host_rejects_oversized_message() -> TestResult {
     Ok(())
 }
 
+// --- 5a. 默认构建：测试开关环境变量必须完全无效 ----------------------------
+
+/// 仅在**未启用** `test-hooks` 的默认/发布构建里编译运行。
+/// 刻意注入 `IDM_NMHOST_TEST_PANIC=1`，host 必须正常回复每一条 ping，
+/// 不 panic、不写 panic 日志、stdout 只有协议帧。
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+fn default_build_ignores_panic_env() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let db = tmp.path().join("nm.db");
+    let mut child = spawn_nmhost(&db, &[("IDM_NMHOST_TEST_PANIC", "1")])?;
+    for _ in 0..4 {
+        send_frame(&mut child, &serde_json::json!({"type": "ping"}))?;
+        let pong = expect_frame(&mut child, "ping response")?;
+        assert_eq!(pong["ok"], serde_json::json!(true), "不得因环境变量 panic");
+        assert!(pong["version"].is_string(), "ping 回复应带 version");
+    }
+    drop(child.stdin.take());
+    let stdout = drain_stdout(&mut child)?;
+    let stderr = drain_stderr(&mut child)?;
+    let status = child.wait()?;
+    assert!(status.success(), "默认构建应正常退出，不得 panic 崩溃");
+    assert_eq!(
+        assert_stdout_is_frames_only(&stdout)?,
+        0,
+        "响应帧已被逐条读走，剩余 stdout 应为空"
+    );
+    let se = String::from_utf8_lossy(&stderr);
+    assert!(!se.contains("panic"), "stderr 不得有 panic 文本: {se}");
+    let log = std::fs::read_to_string(log_path(tmp.path())).unwrap_or_default();
+    assert!(
+        !log.contains("panic"),
+        "nmhost.log 不得有 panic 记录: {log}"
+    );
+    Ok(())
+}
+
 // --- 5. 标准输出只写帧；panic 入日志 --------------------------------------
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn host_stdout_contains_only_frames() -> TestResult {
     let tmp = tempfile::tempdir()?;
@@ -457,6 +502,7 @@ fn assert_stdout_is_frames_only(stdout: &[u8]) -> TestResult<usize> {
 
 // --- 5b. 先正常回复 ping，再触发 panic：stdout 恰好一个完整帧 --------------
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn host_stdout_single_ping_frame_then_panic() -> TestResult {
     let tmp = tempfile::tempdir()?;

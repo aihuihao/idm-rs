@@ -80,6 +80,31 @@ fn install_panic_hook() {
     }));
 }
 
+/// 测试钩子：仅在 `test-hooks` feature 启用时编译。值为 N 时在第 N 条消息触发 panic，
+/// 用于验证「stdout 纯净」与「panic 写入 nmhost.log」。
+///
+/// 默认/发布构建中此函数为空操作，**不读取任何环境变量**、二进制里也不含开关字符串，
+/// 因此外部无法通过环境变量诱导发布版 host 崩溃。
+#[cfg(feature = "test-hooks")]
+fn maybe_test_panic(seen: usize) {
+    static PANIC_AT: OnceLock<Option<usize>> = OnceLock::new();
+    let at = PANIC_AT.get_or_init(|| {
+        std::env::var("IDM_NMHOST_TEST_PANIC")
+            .ok()
+            .map(|v| match v.parse::<usize>() {
+                Ok(n) => n.max(1),
+                Err(_) => 1,
+            })
+    });
+    if *at == Some(seen) {
+        panic!("injected panic for self-test");
+    }
+}
+
+/// 默认/发布构建：空操作，无环境变量读取、无注入点。
+#[cfg(not(feature = "test-hooks"))]
+fn maybe_test_panic(_seen: usize) {}
+
 /// 打开数据库（优先 `IDM_RS_DB`，否则默认路径）。
 async fn open_db() -> Result<std::sync::Arc<Store>, Error> {
     match std::env::var("IDM_RS_DB") {
@@ -98,22 +123,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // 测试开关：值为 N 时在第 N 条消息触发 panic（缺省按 1 处理），用于验证
-    // stdout 纯净 & panic 入日志。仅由集成测试注入环境变量使用。
-    let panic_at: Option<usize> = std::env::var("IDM_NMHOST_TEST_PANIC").ok().map(|v| match v
-        .parse::<usize>()
-    {
-        Ok(n) => n.max(1),
-        Err(_) => 1,
-    });
-    if let Err(e) = run_loop(&db, panic_at).await {
+    if let Err(e) = run_loop(&db).await {
         host_log(&format!("run_loop error: {e}"));
         std::process::exit(1);
     }
 }
 
 /// 主循环：读取帧 → 解析 → 处理 → 写回响应帧。标准输入关闭则退出。
-async fn run_loop(db: &Store, panic_at: Option<usize>) -> Result<(), Error> {
+async fn run_loop(db: &Store) -> Result<(), Error> {
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut seen = 0usize;
@@ -137,9 +154,7 @@ async fn run_loop(db: &Store, panic_at: Option<usize>) -> Result<(), Error> {
             }
         };
         seen += 1;
-        if panic_at == Some(seen) {
-            panic!("injected panic for self-test");
-        }
+        maybe_test_panic(seen);
         match handle_message(&payload, db).await {
             Ok(resp) => {
                 if write_frame(&mut stdout, &resp).await.is_err() {
@@ -325,5 +340,23 @@ fn spawn_runner_if_needed(db_path: &Path) -> RunnerSpawn {
     {
         Ok(_) => RunnerSpawn::Spawned,
         Err(_) => RunnerSpawn::NotFound,
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    /// 打印并断言 `validate_url` 对三个边界输入的实际返回值。
+    /// 以 `--nocapture` 运行可看到原始 `Result<Url, String>` 调试输出。
+    #[test]
+    fn validate_url_returns_for_three_inputs() {
+        let inputs = ["http://:80/", "http://[::1/", "http://user:pass@host/x"];
+        for url in inputs {
+            println!("validate_url({url:?}) = {:?}", validate_url(url));
+        }
+        assert!(validate_url("http://:80/").is_err());
+        assert!(validate_url("http://[::1/").is_err());
+        assert!(validate_url("http://user:pass@host/x").is_ok());
     }
 }
