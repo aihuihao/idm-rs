@@ -87,4 +87,20 @@
 3. 实现 Part 3 请求头透传
 4. 实现 Part 4 运行器
 5. 实现 Part 5 nmhost
+
+## 4b 前置改动（已完成并提交 `4860907`）
+- idm-nmhost 入队前拒绝含 userinfo 的 URL：`"url must not contain credentials"`，不入队
+- 新增 `host_enqueue_rejects_url_credentials`、`url_tests::validate_url_rejects_all_userinfo_forms`
+- `verify-workspace.ps1` 16 步全 PASS / exit 0 后开始 4b
+
+## Phase 4b 已完成（待提交）
+- `idm-cli nm install / uninstall / status`（`mod nm`，纯 reg.exe，只写 HKCU）
+- `extensions/firefox/`：`manifest.json`（MV2、idm-rs@local、恰好 5 权限）、
+  `background.js`（onCreated / ping / Cookie / enqueue / cancel+erase / 去重 / 徽标 / 超时）、`README.md`
+- `crates/idm-cli/tests/phase4b.rs`：7 个测试，`RegGuard` 失败也清理注册表
+- `scripts/phase4b-acceptance.ps1`：5 个纯 PowerShell 静态检查 + 7 个 Rust 测试，各 10 次
+- `scripts/verify-workspace.ps1` STEP 10 保留原检查并新增 extensions/ 下禁止 package.json
+- 12 项各 10/10 全 PASS（ACCEPT_EXIT=0）；verify-workspace.ps1 16/16 PASS（SCRIPT_EXIT=0）；
+  全量回归 253 passed（REG_EXIT=0）；两个崩溃测试 2 passed（CRASH_EXIT=0）
+- 报告 `docs/phase4b-report.md`（MDN 核对、清单/注册表实测内容、实现位置、9 条不一致）
 6. 测试 + 报告 + 提交

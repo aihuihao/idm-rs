@@ -234,9 +234,15 @@ Step-Check -Name "Static check: no forbidden direct deps in crate Cargo.toml" -S
 # ---------------------------------------------------------------------------
 Step-Check -Name "Static check: no apps/ src-tauri/ package.json" -ScriptBlock {
     $bad = @()
+    # Original checks for locations outside extensions/ stay unchanged.
     if (Test-Path apps) { $bad += "apps/" }
     if (Test-Path src-tauri) { $bad += "src-tauri/" }
     if (Test-Path package.json) { $bad += "package.json" }
+    # Phase 4b: extensions/ must keep the same "no package.json" rule.
+    if (Test-Path extensions) {
+        $pkgs = @(Get-ChildItem -Path extensions -Recurse -Force -Filter 'package.json' -ErrorAction SilentlyContinue)
+        foreach ($p in $pkgs) { $bad += $p.FullName }
+    }
     if ($bad.Count -gt 0) {
         Write-Host "  forbidden paths found: $($bad -join ', ')"
         return $false

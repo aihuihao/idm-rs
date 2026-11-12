@@ -571,6 +571,7 @@ version = "0.1.0"
 dependencies = [
  "idm-core",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

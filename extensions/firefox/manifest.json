@@ -1,0 +1,24 @@
+{
+  "manifest_version": 2,
+  "name": "idm-rs Download Manager",
+  "version": "0.1.0",
+  "description": "Hands http/https downloads to the local idm-rs native messaging host.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "idm-rs@local"
+    }
+  },
+  "permissions": [
+    "downloads",
+    "nativeMessaging",
+    "cookies",
+    "storage",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_action": {
+    "default_title": "idm-rs: takeover ON"
+  }
+}
