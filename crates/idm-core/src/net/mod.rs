@@ -7,6 +7,7 @@ pub mod host_limit;
 pub mod probe;
 pub mod ratelimit;
 pub mod retry;
+pub mod url_check;
 
 pub use client::{DownloadConfig, ProxyConfig};
 pub use filename::{infer_filename, resolve_conflict, sanitize_windows_filename};
@@ -16,10 +17,11 @@ pub use host_limit::{
     MAX_PER_HOST_CEILING, host_key,
 };
 pub use probe::{Probe, ProbeResult};
-pub use ratelimit::{BandwidthLimiter, RateLimiter};
+pub use ratelimit::{BandwidthLimiter, RateLimiter, parse_max_speed};
 /// 重导出 `reqwest::Url`，便于上层构造/校验 URL 而无需直接依赖 reqwest。
 pub use reqwest::Url;
 pub use retry::{
     MAX_TOTAL_ATTEMPTS, PROGRESS_RESET_BYTES, XorShift64, backoff_delay, is_retryable,
     is_retryable_status, parse_retry_after,
 };
+pub use url_check::validate_url;

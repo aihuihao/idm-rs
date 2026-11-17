@@ -36,6 +36,47 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
+/// 解析限速值：纯字节数，或带 `K`/`k`（1024）、`M`/`m`（1024*1024）后缀。
+/// 支持小数写法（如 `1.5M`、`0.5K`），使用整数定点运算（不经 f64）：
+/// 拆成整数部分与小数部分，用 `checked_mul`/`checked_add` 计算，溢出即报错。
+/// 小数部分换算成字节后若不能整除，按**向下取整**处理（截断）。
+/// 格式非法、溢出或值为 0 时返回 `None`。
+pub fn parse_max_speed(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (body, mult) = match s.as_bytes().last().copied()? {
+        b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
+        b'M' | b'm' => (&s[..s.len() - 1], 1024 * 1024),
+        _ => (s, 1u64),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (body, None),
+    };
+    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let int_val = int_part.parse::<u64>().ok()?;
+    let mut total = int_val.checked_mul(mult)?;
+    if let Some(frac) = frac_part {
+        if !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if !frac.is_empty() {
+            let frac_val = frac.parse::<u64>().ok()?;
+            let scale = 10u64.checked_pow(frac.len() as u32)?;
+            let frac_bytes = frac_val.checked_mul(mult)?.checked_div(scale)?;
+            total = total.checked_add(frac_bytes)?;
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    Some(total)
+}
+
 /// 桶容量下限：256 KiB。
 const MIN_CAPACITY: u64 = 256 * 1024;
 
@@ -272,6 +313,36 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
     const KIB: u64 = 1024;
+
+    #[test]
+    fn parses_plain_and_suffixed_speeds() {
+        assert_eq!(parse_max_speed("500K"), Some(500 * 1024));
+        assert_eq!(parse_max_speed("3M"), Some(3 * 1024 * 1024));
+        assert_eq!(parse_max_speed("1m"), Some(1024 * 1024));
+        assert_eq!(parse_max_speed("1048576"), Some(1048576));
+        assert_eq!(parse_max_speed("1572864"), Some(1572864));
+        assert_eq!(parse_max_speed("1.5M"), Some(1572864));
+        assert_eq!(parse_max_speed("0.5K"), Some(512));
+        assert_eq!(parse_max_speed("3.5M"), Some(3670016));
+    }
+
+    #[test]
+    fn rejects_invalid_speeds() {
+        for bad in [
+            "",
+            "0",
+            "3G",
+            "-1",
+            "M",
+            "1MB",
+            "abc",
+            ".5K",
+            "1.2.3M",
+            "999999999999999999999M",
+        ] {
+            assert_eq!(parse_max_speed(bad), None, "should reject {bad:?}");
+        }
+    }
 
     #[test]
     fn capacity_is_one_second_quota_with_256kib_floor() {

@@ -824,8 +824,7 @@ mod nm {
 
 #[cfg(windows)]
 mod dl {
-    use std::io::Write;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -834,97 +833,16 @@ mod dl {
     use idm_core::net::client::{DownloadConfig, ProxyConfig};
     use idm_core::net::filename::{resolve_conflict, sanitize_windows_filename};
     use idm_core::net::host_limit::{DEFAULT_MAX_PER_HOST, MAX_PER_HOST_CEILING};
+    use idm_core::net::parse_max_speed;
     use idm_core::net::probe::Probe;
     use idm_core::queue::{DownloadQueue, QueueConfig, QueueEvent, QueueMove};
+    use idm_core::runner::{Runner, RunnerConfig, RunnerStartError};
     use idm_core::store::{NewTask, QueuedTask, Store};
     use idm_core::task::{
         CancelSignal, ChunkState, DownloadContext, DownloadOptions, DownloadOutcome,
         ProgressSnapshot, download_with_store, resume,
     };
     use tokio::sync::watch;
-
-    /// 解析限速值：纯字节数，或带 `K`/`k`（1024）、`M`/`m`（1024*1024）后缀。
-    /// 支持小数写法（如 `1.5M`、`0.5K`），使用整数定点运算（不经 f64）：
-    /// 拆成整数部分与小数部分，用 `checked_mul`/`checked_add` 计算，溢出即报错。
-    /// 小数部分换算成字节后若不能整除，按**向下取整**处理（截断）。
-    /// 格式非法、溢出或值为 0 时返回 `None`（调用方以退出码 2 报错）。
-    fn parse_max_speed(raw: &str) -> Option<u64> {
-        let s = raw.trim();
-        if s.is_empty() {
-            return None;
-        }
-        let (body, mult) = match s.as_bytes().last().copied()? {
-            b'K' | b'k' => (&s[..s.len() - 1], 1024u64),
-            b'M' | b'm' => (&s[..s.len() - 1], 1024 * 1024),
-            _ => (s, 1u64),
-        };
-        // 拆成整数部分与可选的小数部分（只允许一个小数点）。
-        let (int_part, frac_part) = match body.split_once('.') {
-            Some((i, f)) => (i, Some(f)),
-            None => (body, None),
-        };
-        if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let int_val = int_part.parse::<u64>().ok()?;
-        let mut total = int_val.checked_mul(mult)?;
-        if let Some(frac) = frac_part {
-            // 小数部分必须全部是数字（允许为空，如 `1.`）。
-            if !frac.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            if !frac.is_empty() {
-                let frac_val = frac.parse::<u64>().ok()?;
-                let scale = 10u64.checked_pow(frac.len() as u32)?;
-                // 小数 → 字节；不能整除时向下取整（checked_div 截断）。
-                let frac_bytes = frac_val.checked_mul(mult)?.checked_div(scale)?;
-                total = total.checked_add(frac_bytes)?;
-            }
-        }
-        if total == 0 {
-            return None;
-        }
-        Some(total)
-    }
-
-    /// runner.log 容量上限：1 MiB，超过则覆盖重写。
-    const RUNNER_LOG_CAP: u64 = 1_048_576;
-
-    /// 追加一行运行日志到 `runner.log`（info 级别，单文件 1 MiB 覆盖重写）。
-    /// 只记录运行器生命周期事件与任务 id，不写 URL、查询参数或任何请求头值。
-    fn runner_log(path: &Path, msg: &str) {
-        let mut file = match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        if file.metadata().map(|m| m.len()).unwrap_or(0) > RUNNER_LOG_CAP
-            && let Ok(f) = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(path)
-        {
-            file = f;
-        }
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(file, "[{secs}] INFO {msg}");
-    }
-
-    /// 读取 `global-max-speed` 设置并解析为字节率；"0"/未设置/非法均视为不限速。
-    async fn configured_max_speed(store: &Store) -> Option<u64> {
-        match store.get_setting("global-max-speed").await {
-            Ok(Some(v)) if v.trim() == "0" => None,
-            Ok(Some(v)) => parse_max_speed(&v),
-            _ => None,
-        }
-    }
 
     fn print_progress(snap: &ProgressSnapshot) {
         let total = snap.total_size.unwrap_or(0);
@@ -1872,180 +1790,138 @@ mod dl {
             eprintln!("usage error: --proxy and --no-proxy are mutually exclusive");
             return 2;
         }
-        let proxy = if no_proxy {
-            ProxyConfig::Disabled
+        if watch {
+            // Phase 5a-1：常驻运行器逻辑已抽到 idm_core::runner::Runner。
+            // CLI 只负责参数解析、等待退出信号（wait_stopped 或 Ctrl+C，二者先到者）
+            // 与退出码；Runner 模块本身不处理 Ctrl+C，信号监听留在这里。
+            let cfg = RunnerConfig {
+                db_path: store.db_path().to_path_buf(),
+                max_tasks,
+                host_max_connections: max_host_connections,
+                proxy: if no_proxy {
+                    Some(ProxyConfig::Disabled)
+                } else {
+                    proxy_url.map(ProxyConfig::Custom)
+                },
+            };
+            let runner = match Runner::start(Arc::clone(&store), cfg).await {
+                Ok(r) => r,
+                Err(RunnerStartError::AlreadyRunning) => {
+                    eprintln!("already running");
+                    return 3;
+                }
+                Err(RunnerStartError::Other(e)) => {
+                    crate::print_error("runner start failed", &e);
+                    return 1;
+                }
+            };
+            // wait_stopped()（runner.stop 哨兵）与 Ctrl+C，二者先到者触发安全停止。
+            tokio::select! {
+                _ = runner.wait_stopped() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            if let Err(e) = runner.stop().await {
+                crate::print_error("runner stop failed", &e);
+                return 1;
+            }
+            println!("QUEUE WATCH STOPPED");
+            0
         } else {
-            proxy_url.map_or(ProxyConfig::System, ProxyConfig::Custom)
-        };
-        // 单实例锁：在数据目录（数据库所在目录）下创建 runner.lock，独占打开。
-        // Phase 4c：若被占用（可能与 host 的瞬时探测撞车），每 200ms 重试、共 3 秒，
-        // 仍占用才以退出码 3 退出。锁句柄保持到进程退出。
-        let lock_dir = store
-            .db_path()
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let lock_path = lock_dir.join("runner.lock");
-        let mut lock_opt = std::fs::OpenOptions::new();
-        lock_opt.read(true).write(true).create(true).truncate(false);
-        std::os::windows::fs::OpenOptionsExt::share_mode(&mut lock_opt, 0);
-        let lock_deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let acquired = loop {
-            match lock_opt.open(&lock_path) {
-                Ok(f) => break f,
-                Err(_) => {
-                    if std::time::Instant::now() >= lock_deadline {
-                        eprintln!("already running");
-                        return 3;
+            let proxy = if no_proxy {
+                ProxyConfig::Disabled
+            } else {
+                proxy_url.map_or(ProxyConfig::System, ProxyConfig::Custom)
+            };
+            // 单实例锁：在数据目录（数据库所在目录）下创建 runner.lock，独占打开。
+            // Phase 4c：若被占用（可能与 host 的瞬时探测撞车），每 200ms 重试、共 3 秒，
+            // 仍占用才以退出码 3 退出。锁句柄保持到进程退出。
+            let lock_dir = store
+                .db_path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let lock_path = lock_dir.join("runner.lock");
+            let mut lock_opt = std::fs::OpenOptions::new();
+            lock_opt.read(true).write(true).create(true).truncate(false);
+            std::os::windows::fs::OpenOptionsExt::share_mode(&mut lock_opt, 0);
+            let lock_deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let acquired = loop {
+                match lock_opt.open(&lock_path) {
+                    Ok(f) => break f,
+                    Err(_) => {
+                        if std::time::Instant::now() >= lock_deadline {
+                            eprintln!("already running");
+                            return 3;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
                     }
-                    std::thread::sleep(Duration::from_millis(200));
+                }
+            };
+            let _runner_lock = acquired;
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let config = QueueConfig {
+                max_concurrent_tasks: max_tasks,
+                global_max_speed,
+                default_download_config: DownloadConfig {
+                    max_connections_per_host: max_host_connections,
+                    proxy,
+                    ..DownloadConfig::default()
+                },
+                default_strategy: AllocationStrategy::Auto,
+            };
+            let pool = match DiskWriterPool::new(8, 64) {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    crate::print_error("disk writer pool init failed", &e);
+                    return 1;
+                }
+            };
+            let queue = DownloadQueue::new(store.clone(), pool, config);
+            match queue.adopt_queued().await {
+                Ok(_n) => {}
+                Err(e) => {
+                    crate::print_error("adopt failed", &e);
+                    return 1;
                 }
             }
-        };
-        let _runner_lock = acquired;
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let config = QueueConfig {
-            max_concurrent_tasks: max_tasks,
-            global_max_speed,
-            default_download_config: DownloadConfig {
-                max_connections_per_host: max_host_connections,
-                proxy,
-                ..DownloadConfig::default()
-            },
-            default_strategy: AllocationStrategy::Auto,
-        };
-        let pool = match DiskWriterPool::new(8, 64) {
-            Ok(p) => Arc::new(p),
-            Err(e) => {
-                crate::print_error("disk writer pool init failed", &e);
-                return 1;
-            }
-        };
-        let queue = DownloadQueue::new(store.clone(), pool, config);
-        match queue.adopt_queued().await {
-            Ok(_n) => {}
-            Err(e) => {
-                crate::print_error("adopt failed", &e);
-                return 1;
-            }
-        }
-        let q2 = queue.clone();
-        let stop_ctrl = stop.clone();
-        let ctrl_c_task = tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            stop_ctrl.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = q2.shutdown().await;
-        });
-        // Phase 3c：恢复 CLI 对单个任务进度的访问。订阅事件维护活动任务 id 集合，
-        // 每秒通过 `DownloadQueue::progress(task_id)` 读取每个活动任务的最新快照。
-        let q_progress = queue.clone();
-        let progress_task = tokio::spawn(async move {
-            let mut events = q_progress.subscribe_events();
-            let mut active = std::collections::HashSet::<i64>::new();
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    ev = events.recv() => match ev {
-                        Ok(QueueEvent::TaskStarted { id }) => { active.insert(id); }
-                        Ok(QueueEvent::TaskCompleted { id })
-                        | Ok(QueueEvent::TaskPaused { id })
-                        | Ok(QueueEvent::TaskFailed { id }) => { active.remove(&id); }
-                        Err(_) => break,
-                        _ => {}
-                    },
-                    _ = ticker.tick() => {
-                        let ids: Vec<i64> = active.iter().copied().collect();
-                        for id in ids {
-                            if let Some(snap) = q_progress.progress(id).await {
-                                println!(
-                                    "TASK PROGRESS id={id} downloaded={} total={:?} speed={:.0} B/s",
-                                    snap.downloaded, snap.total_size, snap.speed
-                                );
+            let q2 = queue.clone();
+            let stop_ctrl = stop.clone();
+            let ctrl_c_task = tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                stop_ctrl.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = q2.shutdown().await;
+            });
+            // Phase 3c：恢复 CLI 对单个任务进度的访问。订阅事件维护活动任务 id 集合，
+            // 每秒通过 `DownloadQueue::progress(task_id)` 读取每个活动任务的最新快照。
+            let q_progress = queue.clone();
+            let progress_task = tokio::spawn(async move {
+                let mut events = q_progress.subscribe_events();
+                let mut active = std::collections::HashSet::<i64>::new();
+                let mut ticker = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        ev = events.recv() => match ev {
+                            Ok(QueueEvent::TaskStarted { id }) => { active.insert(id); }
+                            Ok(QueueEvent::TaskCompleted { id })
+                            | Ok(QueueEvent::TaskPaused { id })
+                            | Ok(QueueEvent::TaskFailed { id }) => { active.remove(&id); }
+                            Err(_) => break,
+                            _ => {}
+                        },
+                        _ = ticker.tick() => {
+                            let ids: Vec<i64> = active.iter().copied().collect();
+                            for id in ids {
+                                if let Some(snap) = q_progress.progress(id).await {
+                                    println!(
+                                        "TASK PROGRESS id={id} downloaded={} total={:?} speed={:.0} B/s",
+                                        snap.downloaded, snap.total_size, snap.speed
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
-        progress_task.abort();
-        if watch {
-            // Phase 4c 常驻模式：写 runner.log（生命周期 + 任务开始/结束），每秒调度，
-            // 每 5 秒重读 global-max-speed，检测 runner.stop 哨兵文件后安全停止。
-            let log_path = lock_dir.join("runner.log");
-            let stop_path = lock_dir.join("runner.stop");
-            runner_log(&log_path, "runner started");
-
-            // 订阅队列事件，记录任务开始/结束（只写 id，不写 URL/请求头）。
-            let q_log = queue.clone();
-            let log_p = log_path.clone();
-            let log_task = tokio::spawn(async move {
-                let mut events = q_log.subscribe_events();
-                loop {
-                    match events.recv().await {
-                        Ok(QueueEvent::TaskStarted { id }) => {
-                            runner_log(&log_p, &format!("task {id} started"));
-                        }
-                        Ok(QueueEvent::TaskCompleted { id }) => {
-                            runner_log(&log_p, &format!("task {id} completed"));
-                        }
-                        Ok(QueueEvent::TaskPaused { id }) => {
-                            runner_log(&log_p, &format!("task {id} paused"));
-                        }
-                        Ok(QueueEvent::TaskFailed { id }) => {
-                            runner_log(&log_p, &format!("task {id} failed"));
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
             });
-
-            // 启动时读取限速设置。
-            let mut current_speed = configured_max_speed(&store).await;
-            queue.set_global_max_speed(current_speed);
-            let mut last_speed_check = std::time::Instant::now();
-
-            loop {
-                // Ctrl+C 或 runner.stop 都触发安全停止。
-                let stop_requested =
-                    stop.load(std::sync::atomic::Ordering::Relaxed) || stop_path.exists();
-                if stop_requested {
-                    runner_log(&log_path, "runner stopping");
-                    let _ = queue.shutdown().await;
-                    // 删除哨兵文件（Ctrl+C 场景可能不存在）。
-                    let _ = std::fs::remove_file(&stop_path);
-                    break;
-                }
-                // 每 5 秒重读限速设置，变化则更新限速器。
-                if last_speed_check.elapsed() >= Duration::from_secs(5) {
-                    last_speed_check = std::time::Instant::now();
-                    let new_speed = configured_max_speed(&store).await;
-                    if new_speed != current_speed {
-                        current_speed = new_speed;
-                        queue.set_global_max_speed(current_speed);
-                        runner_log(
-                            &log_path,
-                            &format!(
-                                "global-max-speed changed to {}",
-                                current_speed.map_or("unlimited".to_string(), |v| v.to_string())
-                            ),
-                        );
-                    }
-                }
-                if let Err(e) = queue.adopt_queued().await {
-                    crate::print_error("adopt failed", &e);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            log_task.abort();
-            // Abort the Ctrl+C listener: it holds a DownloadQueue clone forever,
-            // which can keep the store channel alive and stall `store.shutdown()`
-            // when the runner stops via runner.stop (not via Ctrl+C).
-            ctrl_c_task.abort();
-            runner_log(&log_path, "runner stopped");
-            println!("QUEUE WATCH STOPPED");
-            0
-        } else {
+            progress_task.abort();
             let result = match queue.wait_for_idle().await {
                 Ok(s) => {
                     let secs = s.total_elapsed.as_secs_f64();
@@ -2210,7 +2086,7 @@ mod dl {
         use idm_core::store::Store;
         use idm_core::task::progress::ChunkProgress;
 
-        use super::{ChunkState, ProgressSnapshot, format_chunk_summary, parse_max_speed};
+        use super::{ChunkState, ProgressSnapshot, format_chunk_summary};
 
         /// Phase 3a：`--proxy` 与 `--no-proxy` 同时传入必须以退出码 2 拒绝。
         #[tokio::test]
@@ -2296,37 +2172,6 @@ mod dl {
             assert!(text.contains("source=initial"), "{text}");
             assert!(text.contains("source=split_from_0"), "{text}");
             assert!(text.contains("source=takeover_from_0"), "{text}");
-        }
-
-        #[test]
-        fn parses_plain_and_suffixed_speeds() {
-            assert_eq!(parse_max_speed("500K"), Some(500 * 1024));
-            assert_eq!(parse_max_speed("3M"), Some(3 * 1024 * 1024));
-            assert_eq!(parse_max_speed("1m"), Some(1024 * 1024));
-            assert_eq!(parse_max_speed("1048576"), Some(1048576));
-            assert_eq!(parse_max_speed("1572864"), Some(1572864));
-            // 小数 K/M 字面量：整数定点解析。
-            assert_eq!(parse_max_speed("1.5M"), Some(1572864));
-            assert_eq!(parse_max_speed("0.5K"), Some(512));
-            assert_eq!(parse_max_speed("3.5M"), Some(3670016));
-        }
-
-        #[test]
-        fn rejects_invalid_speeds() {
-            for bad in [
-                "",
-                "0",
-                "3G",
-                "-1",
-                "M",
-                "1MB",
-                "abc",
-                ".5K",
-                "1.2.3M",
-                "999999999999999999999M",
-            ] {
-                assert_eq!(parse_max_speed(bad), None, "should reject {bad:?}");
-            }
         }
     }
 }
@@ -2489,7 +2334,13 @@ async fn main() {
             }
         };
         // 启动时自动执行一次启动恢复（9.4）。
-        if let Err(e) = store.recover().await {
+        // Phase 5a-1：仅 `queue run --watch` 跳过这里的恢复——它的 recover 已搬进
+        // Runner::start，且在拿到 runner.lock 之后才执行；其余所有子命令（包括不带
+        // --watch 的 `queue run`）保持原样，仍在这里恢复。
+        let is_watch_run = sub == "queue"
+            && args.get(2).map(String::as_str) == Some("run")
+            && args.iter().skip(3).any(|a| a == "--watch");
+        if !is_watch_run && let Err(e) = store.recover().await {
             crate::print_error("startup recovery failed", &e);
             std::process::exit(1);
         }
