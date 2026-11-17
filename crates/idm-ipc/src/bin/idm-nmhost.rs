@@ -7,15 +7,13 @@
 //! `nmhost.log`（追加，单文件超过 1 MiB 则覆盖重写）。panic hook 把 panic 写进日志，
 //! 绝不写标准输出。
 //!
-//! 本二进制仅做**校验与入队**，不做下载；下载由独立的常驻队列运行器
-//!（`idm-cli queue run --watch`）在后台执行。两者只通过 SQLite 队列通信。
+//! 本二进制仅做**校验与入队**，不启动任何进程、不做下载；下载由独立的常驻
+//! 队列运行器（`idm-cli queue run --watch`）执行。两者只通过 SQLite 队列与
+//! `runner.lock` 通信：运行器未运行时拒绝入队，浏览器保留自己的下载。
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 
 use idm_core::error::Error;
@@ -28,9 +26,6 @@ use serde_json::{Value, json};
 
 /// 日志文件容量上限：1 MiB。超过则在打开时覆盖重写。
 const LOG_CAP: u64 = 1_048_576;
-/// 进程创建标志（Windows）：脱离父进程控制台、不创建窗口。
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 当前使用的数据库文件路径（与 `idm-cli` 解析规则一致：优先 `IDM_RS_DB` 环境变量）。
 fn current_db_path() -> PathBuf {
@@ -181,8 +176,20 @@ async fn handle_message(payload: &[u8], db: &Store) -> Result<Value, String> {
     }
 }
 
-/// 处理 `enqueue`：校验不可信输入，校验/规范化请求头，入队，并视情况拉起运行器。
+/// 处理 `enqueue`：校验不可信输入，检查运行器，URL 去重，校验/规范化请求头，入队。
+///
+/// 日志纪律：每次 enqueue 写一行到 `nmhost.log`，只含“结果 / task id / 运行器状态 /
+/// 是否重复”，绝不写 URL 与请求头的值。
 async fn handle_enqueue(v: &Value, db: &Store) -> Result<Value, String> {
+    // 先查运行器：未运行直接拒绝，绝不入队（浏览器保留自己的下载）。
+    let running = runner_is_running(db.db_path());
+    if !running {
+        host_log(
+            "enqueue result=rejected reason=runner_not_running task=- duplicate=false runner=stopped",
+        );
+        return Err("runner_not_running".to_string());
+    }
+
     let url = v
         .get("url")
         .and_then(|u| u.as_str())
@@ -191,6 +198,22 @@ async fn handle_enqueue(v: &Value, db: &Store) -> Result<Value, String> {
     // URL 校验：用 idm_core 重导出的 reqwest::Url 做严格解析。
     // 错误信息一律不含 URL 本身，避免 userinfo 等凭据泄入日志/回复。
     let _ = validate_url(&url)?;
+
+    // 同一 URL 已有活动任务（Queued/Probing/Downloading）时不重复入队。
+    match db.find_active_by_url(&url).await {
+        Ok(Some(existing)) => {
+            host_log(&format!(
+                "enqueue result=duplicate task={existing} duplicate=true runner=running"
+            ));
+            return Ok(json!({"ok": true, "taskId": existing, "duplicate": true}));
+        }
+        Err(e) => {
+            host_log("enqueue result=error reason=dedup_failed runner=running");
+            return Err(format!("dedup failed: {e}"));
+        }
+        Ok(None) => {}
+    }
+
     // 文件名：先取最后一个路径分隔符后的部分，再做 Windows 合法化；空则不指定。
     let file_name = match v.get("filename").and_then(|f| f.as_str()) {
         Some(f) if !f.is_empty() => {
@@ -236,18 +259,17 @@ async fn handle_enqueue(v: &Value, db: &Store) -> Result<Value, String> {
     };
     match db.enqueue_task(task, Some(headers)).await {
         Ok(id) => {
-            // 入队成功后尝试拉起常驻运行器（单实例）。
-            let mut resp = json!({"ok": true, "taskId": id});
-            match spawn_runner_if_needed(db.db_path()) {
-                RunnerSpawn::Spawned | RunnerSpawn::AlreadyRunning => {}
-                RunnerSpawn::NotFound => {
-                    // 找不到 idm-cli.exe：入队仍然成功，在回复里附加提示。
-                    resp["runner"] = json!("not_started");
-                }
-            }
-            Ok(resp)
+            host_log(&format!(
+                "enqueue result=accepted task={id} duplicate=false runner=running"
+            ));
+            Ok(json!({"ok": true, "taskId": id}))
         }
-        Err(e) => Err(format!("enqueue failed: {e}")),
+        Err(e) => {
+            host_log(
+                "enqueue result=error reason=enqueue_failed task=- duplicate=false runner=running",
+            );
+            Err(format!("enqueue failed: {e}"))
+        }
     }
 }
 
@@ -295,58 +317,20 @@ fn default_download_dir() -> String {
     }
 }
 
-/// 运行器拉起结果。
-enum RunnerSpawn {
-    /// 已成功拉起。
-    Spawned,
-    /// 运行器已在运行（runner.lock 被占用）。
-    AlreadyRunning,
-    /// 找不到 idm-cli.exe，未拉起。
-    NotFound,
-}
-
-/// 入队成功后尝试拉起常驻运行器：独占打开 `runner.lock`，拿到锁说明无运行器，
-/// 关闭锁后启动同目录的 `idm-cli.exe queue run --watch --db <同一数据库>`；拿不到锁说明
-/// 运行器已在运行，不做任何事。
-fn spawn_runner_if_needed(db_path: &Path) -> RunnerSpawn {
+/// 判断常驻运行器是否在运行：以**只读、不创建**的方式打开 `runner.lock`。
+///
+/// - 文件不存在，或能以只读方式打开（打开后立即关闭）→ 未运行；
+/// - 共享冲突（Windows 错误码 32，`ERROR_SHARING_VIOLATION`）→ 运行器正独占持有锁 → 运行中；
+/// - 其他 IO 错误一律按“未运行”处理（宁可拒绝入队，也不误判为运行中而静默丢任务）。
+fn runner_is_running(db_path: &Path) -> bool {
     let lock_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let lock_path = lock_dir.join("runner.lock");
-    // 独占打开（share_mode(0)）；成功说明当前无运行器持有锁。临时 File 在语句结束即关闭，
-    // 以便随后启动的 cli 能重新独占。
-    let got_lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .share_mode(0)
-        .open(&lock_path)
-        .is_ok();
-    if !got_lock {
-        return RunnerSpawn::AlreadyRunning;
-    }
-    // 找同目录的 idm-cli.exe。
-    let host_exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return RunnerSpawn::NotFound,
-    };
-    let cli = match host_exe.parent() {
-        Some(p) => p.join("idm-cli.exe"),
-        None => return RunnerSpawn::NotFound,
-    };
-    if !cli.exists() {
-        return RunnerSpawn::NotFound;
-    }
-    let db_str = db_path.to_string_lossy().into_owned();
-    match Command::new(&cli)
-        .args(["queue", "run", "--watch", "--db", &db_str])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-        .spawn()
-    {
-        Ok(_) => RunnerSpawn::Spawned,
-        Err(_) => RunnerSpawn::NotFound,
+    match OpenOptions::new().read(true).open(&lock_path) {
+        Ok(f) => {
+            drop(f);
+            false
+        }
+        Err(e) => e.raw_os_error() == Some(32),
     }
 }
 

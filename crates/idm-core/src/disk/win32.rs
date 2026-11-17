@@ -13,12 +13,17 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{FALSE, HANDLE, SetLastError};
+use windows_sys::Win32::Foundation::{
+    FALSE, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, SetLastError,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_SPARSE_FILE, FILE_STANDARD_INFO, FileAllocationInfo,
     FileStandardInfo, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetFileAttributesW,
     GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, MOVEFILE_COPY_ALLOWED,
     MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
@@ -261,6 +266,34 @@ fn volume_info(path: &Path) -> Result<(String, u32)> {
 /// 查询卷的文件系统类型名（用于判断是否为 NTFS）。
 pub(crate) fn get_volume_filesystem(path: &Path) -> Result<String> {
     Ok(volume_info(path)?.0)
+}
+
+/// 把当前进程的 stdin/stdout/stderr 句柄标记为**不可继承**。
+///
+/// Windows 上 `CreateProcessW` 在 `bInheritHandles=TRUE` 时会把父进程所有可继承句柄
+/// 复制给子进程（Rust std 的 `Command::spawn()` 内部即如此）。即使为孙进程设置
+/// `Stdio::null()`，它仍会继承本进程从父 shell 得到的 stdout/stderr 管道句柄，导致
+/// 捕获该管道的调用方（如 PowerShell `2>&1 | Out-String`）一直等到孙进程退出才返回。
+/// 在派生常驻运行器之前清除这三个标准句柄的 `HANDLE_FLAG_INHERIT`，即可切断继承链。
+///
+/// 返回 `Err` 仅表示某句柄设置失败；调用方可以选择忽略（失败不影响功能，只影响继承语义）。
+pub fn set_std_handles_non_inheritable() -> io::Result<()> {
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` 不接受参数，返回的是有效的标准句柄或
+        // INVALID_HANDLE_VALUE / null；`SetHandleInformation` 只修改该句柄的标志，
+        // 不会解引用它，也不会关闭它。传入的 dwMask/dwFlags 是有效位标志。
+        let handle = unsafe { GetStdHandle(which) };
+        if handle.is_null() || handle == usize::MAX as HANDLE {
+            continue;
+        }
+        // SAFETY: `handle` 上一步已确认非 null / 非 INVALID_HANDLE_VALUE；
+        // `HANDLE_FLAG_INHERIT` 作为 mask、0 作为 flags 是合法的清除继承位操作。
+        let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        if ok == FALSE {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// 查询卷是否支持稀疏文件（`FILE_SUPPORTS_SPARSE_FILES` 能力位）。

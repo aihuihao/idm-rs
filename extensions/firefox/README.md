@@ -21,15 +21,24 @@ Firefox 自己下载；开关关闭时也一样放行。
 
 ## 加载步骤（临时加载，不需要签名）
 
+安装顺序固定为 **nm install → runner install → runner start → 载入扩展**：
+
 1. 构建 release 版 `idm-cli.exe` 与 `idm-nmhost.exe`，并确保两者在同一目录。
 2. 执行 `idm-cli nm install --extension-id idm-rs@local`
    （不要加 `--host-name`）。可用 `idm-cli nm status` 检查：
    `manifest_exists: true`、`host_path_exists: true`、`registry_exists: true`、
    `allowed_extensions: idm-rs@local`。
-3. **重启 Firefox**（注册表项只在启动时读取）。
-4. 地址栏打开 `about:debugging#/runtime/this-firefox` → 「临时载入附加组件」
+3. 执行 `idm-cli runner install`：写入开机启动项（HKCU Run），使独立常驻的
+   下载运行器随 Windows 登录自动启动。
+4. 执行 `idm-cli runner start`：立即启动运行器。`idm-cli runner status` 应显示
+   `autostart_registered: true`、`runner_running: true`。
+   **运行器未启动时 host 会拒绝入队**，下载仍由 Firefox 自己完成。
+5. **重启 Firefox**（注册表项只在启动时读取）。
+6. 地址栏打开 `about:debugging#/runtime/this-firefox` → 「临时载入附加组件」
    (Load Temporary Add-on) → 选择本目录下的 `manifest.json`。
-5. 工具栏出现 `idm-rs` 按钮，徽标 `ON`（绿）表示接管开启。
+7. 工具栏出现 `idm-rs` 按钮，徽标 `ON`（绿）表示接管开启。
+
+> 运行器不属于 Firefox 的进程树，浏览器退出不会影响它；任务由它独立下载。
 
 按钮点击可在 ON / OFF 之间切换，状态保存在 `storage.local`。
 徽标 `!`（红）表示最近一次接管失败；此时 Firefox 的原始下载**未被取消**。
@@ -66,8 +75,12 @@ Firefox 自己下载；开关关闭时也一样放行。
   成功接管一次会立刻清除失败状态。
 - 同一 URL 在 10 秒内重复触发会被去重；接管失败时会清掉去重记录，
   因此 30 秒退避结束后用户重试不会被去重挡住。
-- 确认 `idm-nmhost.exe` 存在且能被启动；确认后台常驻运行器已运行
-  （`idm-cli queue run --watch`），否则任务只会入队不会开始下载。
+- 若工具栏标题显示「运行器未启动：请执行 idm-cli runner start」，说明常驻
+  运行器没有运行：host 拒绝了入队（`runner_not_running`），本次下载由 Firefox
+  保留。执行 `idm-cli runner start` 后再试；`idm-cli runner status` 显示
+  `runner_running: true` 即就绪。
+- 确认 `idm-nmhost.exe` 存在；运行器日志在数据目录的 `runner.log`（生命周期与
+  任务开始/结束，不含 Cookie 与完整 URL）。
 - 只有 `http` / `https` 会被接管；其它 scheme 按设计放行。
 
 **会不会丢下载？**

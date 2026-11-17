@@ -9,16 +9,17 @@
 //!      非法 JSON/未知 type/含换行请求头）
 //!   5. 标准输出只写帧；panic 写入 nmhost.log（测试开关）
 //!   6. 文件名 sanitize（对具体结果值断言）
-//!   13. 连续入队两个任务只拉起一个运行器进程
+//!   14. 运行器未运行时拒绝入队；持锁模拟运行中时成功；同 URL 去重
 //!
 //! 说明：所有辅助函数一律返回 `TestResult` 并用 `?` 传播错误，不使用
 //! `unwrap()`/`expect()`，以便通过 `clippy -D warnings`（`clippy.toml` 的
 //! `allow-unwrap-in-tests` 只豁免测试函数体，不豁免辅助函数）。
 
 use std::io::{Read, Write};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
 
 use idm_core::store::{Store, TaskRecord};
 
@@ -28,13 +29,50 @@ fn io_missing(what: &str) -> std::io::Error {
     std::io::Error::other(what)
 }
 
+/// 全局持有各测试创建的 `runner.lock` 独占句柄，模拟“运行器在运行”。
+/// host 现在以只读方式探测锁：只要锁被独占持有，enqueue 就会被接受。
+static HELD_RUNNER_LOCKS: OnceLock<Mutex<Vec<std::fs::File>>> = OnceLock::new();
+
+/// 在 `db_path` 所在目录独占持有 `runner.lock`，并保持句柄直到进程退出。
+fn hold_runner_lock(db_path: &Path) -> TestResult {
+    let dir = db_path
+        .parent()
+        .ok_or_else(|| io_missing("db path has no parent"))?;
+    let lock = dir.join("runner.lock");
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(lock)?;
+    let store = HELD_RUNNER_LOCKS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = store.lock().map_err(|_| io_missing("lock poisoned"))?;
+    guard.push(f);
+    Ok(())
+}
+
 /// 启动 nmhost 子进程，数据库指向 `db_path`；可选注入测试开关。
 ///
-/// 关键：先把 host 复制到数据库目录下的干净子目录再启动。这样 host 同目录里
-/// **没有** `idm-cli.exe`，入队走 `runner: "not_started"` 分支，不会拉起真实的
-/// 常驻运行器进程（否则会残留 watch 进程并继承本测试的 stdout 管道句柄）。
-/// 「拉起运行器」的行为由 `host_spawns_runner_once` 用伪 cli 单独验证。
+/// 默认在数据库目录模拟持锁的运行器，使 enqueue 成功（Phase 4c 起 host 未运行
+/// 时拒绝入队）。host 复制到数据库目录下的干净子目录，确保不启动任何子进程。
 fn spawn_nmhost(db_path: &Path, extra_env: &[(&str, &str)]) -> TestResult<Child> {
+    spawn_nmhost_inner(db_path, extra_env, true)
+}
+
+/// 不模拟运行器（runner.lock 不存在）地启动 host，用于验证拒绝入队。
+fn spawn_nmhost_no_lock(db_path: &Path) -> TestResult<Child> {
+    spawn_nmhost_inner(db_path, &[], false)
+}
+
+fn spawn_nmhost_inner(
+    db_path: &Path,
+    extra_env: &[(&str, &str)],
+    hold_lock: bool,
+) -> TestResult<Child> {
+    if hold_lock {
+        hold_runner_lock(db_path)?;
+    }
     let host_dir = db_path
         .parent()
         .ok_or_else(|| io_missing("db path has no parent"))?
@@ -688,146 +726,93 @@ fn filename_is_sanitized() -> TestResult {
     Ok(())
 }
 
-// --- 13. 连续入队两个任务只拉起一个运行器 ---------------------------------
+// --- 14. 运行器生命周期门禁 -----------------------------------------------
 
-/// 用 rustc 现场编译一个极简的伪 `idm-cli.exe`：
-/// 独占打开 `runner.lock` 后，把自身 PID 追加到 `IDM_FAKE_CLI_SPAWN_LOG` 指定的
-/// 进程启动日志，然后长眠，模拟真实运行器「持锁 → 阻止第二个实例被拉起」。
-///
-/// 日志行在**拿到锁之后**才写：测试等到日志出现第一行，即代表运行器已持有锁，
-/// 此刻再发第二个 enqueue 才能确定性地验证「不会重复拉起」。
-fn build_fake_cli(dest_dir: &Path) -> TestResult<PathBuf> {
-    let src = dest_dir.join("fake_cli_src.rs");
-    std::fs::write(
-        &src,
-        r#"
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::os::windows::fs::OpenOptionsExt;
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut db: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--db" && i + 1 < args.len() {
-            db = Some(args[i + 1].clone());
-        }
-        i += 1;
-    }
-    if let Some(db) = db {
-        let p = std::path::Path::new(&db);
-        let lock = p.parent().unwrap_or(std::path::Path::new(".")).join("runner.lock");
-        // 独占打开：拿不到锁（说明已有运行器）则直接退出，不写日志不长眠。
-        let _f = match OpenOptions::new()
-            .read(true).write(true).create(true).share_mode(0).open(&lock)
-        {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        if let Ok(log) = std::env::var("IDM_FAKE_CLI_SPAWN_LOG") {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log) {
-                let _ = writeln!(f, "{}", std::process::id());
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(120));
-    }
-}
-"#,
-    )?;
-    let exe = dest_dir.join("idm-cli.exe");
-    let src_s = src
-        .to_str()
-        .ok_or_else(|| io_missing("src path not utf-8"))?;
-    let exe_s = exe
-        .to_str()
-        .ok_or_else(|| io_missing("exe path not utf-8"))?;
-    let out = Command::new("rustc")
-        .args([src_s, "-O", "-o", exe_s])
-        .output()?;
-    assert!(
-        out.status.success(),
-        "rustc 编译伪 idm-cli 失败: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(exe)
-}
-
-/// 轮询直到 spawn-log 至少出现 `want` 行，或超时。返回实际行数。
-fn wait_spawn_log(path: &Path, want: usize, timeout: Duration) -> usize {
-    let start = Instant::now();
-    loop {
-        let n = std::fs::read_to_string(path)
-            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
-        if n >= want || start.elapsed() >= timeout {
-            return n;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
+/// 运行器未运行（runner.lock 不存在）时 enqueue 必须被拒绝，且数据库无新任务。
 #[test]
-fn host_spawns_runner_once() -> TestResult {
+fn host_rejects_enqueue_when_runner_not_running() -> TestResult {
     let tmp = tempfile::tempdir()?;
-    // 运行目录：把 idm-nmhost 复制到这里，并放入伪 idm-cli.exe（同目录，host 才能找到）。
-    let run_dir = tmp.path().join("bin");
-    std::fs::create_dir_all(&run_dir)?;
-    let nmhost_src = Path::new(env!("CARGO_BIN_EXE_idm-nmhost"));
-    let nmhost_dst = run_dir.join("idm-nmhost.exe");
-    std::fs::copy(nmhost_src, &nmhost_dst)?;
-    build_fake_cli(&run_dir)?;
-
     let db = tmp.path().join("nm.db");
-    let spawn_log = tmp.path().join("spawn.log");
-    let mut child = Command::new(&nmhost_dst)
-        .env("IDM_RS_DB", &db)
-        .env("IDM_FAKE_CLI_SPAWN_LOG", &spawn_log)
-        .current_dir(&run_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = spawn_nmhost_no_lock(&db)?;
 
-    // 第一个入队：应拉起一个运行器。
     send_frame(
         &mut child,
-        &serde_json::json!({"type": "enqueue", "url": "http://example.com/t1.bin"}),
+        &serde_json::json!({"type": "enqueue", "url": "http://example.com/no-runner.bin"}),
+    )?;
+    let r = expect_frame(&mut child, "未运行时的 enqueue 响应")?;
+    assert_eq!(r["ok"], serde_json::json!(false), "应拒绝: {r}");
+    assert_eq!(
+        r["error"],
+        serde_json::json!("runner_not_running"),
+        "错误码应为 runner_not_running: {r}"
+    );
+
+    // 宿主存活且数据库无任务。
+    send_frame(&mut child, &serde_json::json!({"type": "ping"}))?;
+    let pong = expect_frame(&mut child, "宿主应存活")?;
+    assert_eq!(pong["ok"], serde_json::json!(true));
+    let tasks = query_queued(&db)?;
+    assert!(tasks.is_empty(), "拒绝入队后数据库不应有新任务");
+
+    child.kill()?;
+    // nmhost.log 应记录拒绝，且不含 URL。
+    let log = std::fs::read_to_string(log_path(tmp.path()))?;
+    assert!(
+        log.contains("runner_not_running"),
+        "日志应记录拒绝原因: {log}"
+    );
+    assert!(!log.contains("example.com"), "日志不得包含 URL: {log}");
+    Ok(())
+}
+
+/// 模拟运行器持锁后入队成功；同 URL 再次入队返回 duplicate:true 且无新行。
+#[test]
+fn host_enqueue_with_lock_and_dedup() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let db = tmp.path().join("nm.db");
+    // spawn_nmhost 默认持锁（模拟运行器在运行）。
+    let mut child = spawn_nmhost(&db, &[])?;
+
+    let url = "http://example.com/dedup.bin";
+    send_frame(
+        &mut child,
+        &serde_json::json!({"type": "enqueue", "url": url, "filename": "dedup.bin"}),
     )?;
     let r1 = expect_frame(&mut child, "第一次 enqueue 响应")?;
-    assert_eq!(r1["ok"], serde_json::json!(true), "第一次入队应成功: {r1}");
+    assert_eq!(r1["ok"], serde_json::json!(true), "持锁时应成功: {r1}");
+    let id1 = r1["taskId"].as_i64().ok_or_else(|| io_missing("taskId"))?;
 
-    // 等运行器真正拿到锁并写下启动日志，消除「第二个 enqueue 抢在拉起之前」的竞争。
-    let n = wait_spawn_log(&spawn_log, 1, Duration::from_secs(15));
-    assert_eq!(n, 1, "第一次入队应恰好拉起 1 个运行器（日志行数 {n}）");
-
-    // 第二个入队：运行器已持锁，不应再拉起。
+    // 同一 URL 再次入队 → duplicate:true，id 相同。
     send_frame(
         &mut child,
-        &serde_json::json!({"type": "enqueue", "url": "http://example.com/t2.bin"}),
+        &serde_json::json!({"type": "enqueue", "url": url, "filename": "dedup.bin"}),
     )?;
-    let r2 = expect_frame(&mut child, "第二次 enqueue 响应")?;
-    assert_eq!(r2["ok"], serde_json::json!(true), "第二次入队应成功: {r2}");
-    send_frame(&mut child, &serde_json::json!({"type": "ping"}))?;
-    let pong = expect_frame(&mut child, "host 应存活")?;
-    assert_eq!(pong["ok"], serde_json::json!(true));
-    drop(child.stdin.take());
-    child.wait()?;
+    let r2 = expect_frame(&mut child, "重复 enqueue 响应")?;
+    assert_eq!(r2["ok"], serde_json::json!(true));
+    assert_eq!(r2["duplicate"], serde_json::json!(true), "应标记重复: {r2}");
+    assert_eq!(r2["taskId"], serde_json::json!(id1), "重复应返回原任务 id");
 
-    // 连一个 ping 之后仍只应有一条启动记录。
-    let final_count = wait_spawn_log(&spawn_log, 2, Duration::from_millis(300));
-    assert_eq!(
-        final_count, 1,
-        "连续入队只应拉起一个运行器进程（实际 {final_count}）"
-    );
+    // 另一个 URL → 新任务，非重复。
+    send_frame(
+        &mut child,
+        &serde_json::json!({"type": "enqueue", "url": "http://example.com/other.bin"}),
+    )?;
+    let r3 = expect_frame(&mut child, "不同 URL enqueue 响应")?;
+    assert_eq!(r3["ok"], serde_json::json!(true));
+    assert_ne!(r3["duplicate"], serde_json::json!(true));
+    let id3 = r3["taskId"].as_i64().ok_or_else(|| io_missing("taskId"))?;
+    assert_ne!(id3, id1);
 
-    // 清理伪运行器进程，避免残留影响后续测试。
-    let log = std::fs::read_to_string(&spawn_log)?;
-    for line in log.lines().filter(|l| !l.trim().is_empty()) {
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .output()?;
-        }
-    }
+    child.kill()?;
+
+    // 数据库恰好 2 行（同 URL 未新增）。
+    let tasks = query_queued(&db)?;
+    assert_eq!(tasks.len(), 2, "去重后数据库应恰好 2 个任务");
+
+    // nmhost.log 记录结果，不含 URL 与请求头值。
+    let log = std::fs::read_to_string(log_path(tmp.path()))?;
+    assert!(log.contains("result=accepted"), "日志应记录接受: {log}");
+    assert!(log.contains("result=duplicate"), "日志应记录重复: {log}");
+    assert!(!log.contains("example.com"), "日志不得包含 URL: {log}");
     Ok(())
 }

@@ -143,7 +143,7 @@
 
 ## 12. 浏览器接管（Phase 4 确立）
 - 通信：只使用 Native Messaging（Firefox 清单的 allowed_extensions 限定扩展 ID）。不监听任何本地网络端口。
-- idm-nmhost 只做校验和入队，不做下载；下载由独立的常驻队列运行器执行。两者只通过 SQLite 队列通信。
+- idm-nmhost 只做校验和入队，不启动任何进程。下载由独立常驻的队列运行器执行（开机启动，不属于浏览器的进程树）。两者只通过 SQLite 队列和 runner.lock 通信；运行器未运行时 host 拒绝入队，浏览器保留自己的下载。
 - 浏览器传来的一切数据都不可信：限制长度、限制 scheme、请求头白名单（Referer / Cookie / User-Agent）、文件名只取安全的文件名部分。
 - Cookie 只在任务存续期间保存在 task_headers 表，任务完成或删除时清除；日志和错误信息中不得出现 Cookie 的值。
 - idm-nmhost 的标准输出只能写协议帧。

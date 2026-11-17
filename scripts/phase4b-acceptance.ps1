@@ -210,6 +210,16 @@ function Test-NoForbiddenJsConstructs {
     return $true
 }
 
+# Phase 4c: the native messaging host must never spawn a child process.
+# Scoped to the single host source file (tests / CLI reg.exe calls are unrelated).
+function Test-NmhostHasNoCommandNew {
+    $p = Join-Path $repoRoot 'crates\idm-ipc\src\bin\idm-nmhost.rs'
+    if (-not (Test-Path $p)) { return $false }
+    $text = Get-Content -Encoding UTF8 -Raw $p
+    if ($text -match 'Command\s*::\s*new') { return $false }
+    return $true
+}
+
 $staticTests = @(
     [pscustomobject]@{ Id = 4; Name = 'static_manifest_json_is_valid'; Fn = { Test-ManifestJson } }
     [pscustomobject]@{ Id = 4; Name = 'static_permissions_are_exactly_five'; Fn = { Test-Permissions } }
@@ -225,6 +235,8 @@ $staticTests = @(
     [pscustomobject]@{ Id = 3; Name = 'ps_test_failure_branch_deletes_recent'; Fn = { Test-FailureBranchDeletesRecent } }
     [pscustomobject]@{ Id = 3; Name = 'ps_test_backoff_constant_30s'; Fn = { Test-BackoffConstantIsThirtySeconds } }
     [pscustomobject]@{ Id = 3; Name = 'ps_test_no_forbidden_js_constructs'; Fn = { Test-NoForbiddenJsConstructs } }
+    # Phase 4c addition: host must not spawn child processes
+    [pscustomobject]@{ Id = 3; Name = 'static_nmhost_has_no_command_new'; Fn = { Test-NmhostHasNoCommandNew } }
 )
 
 # --- New Rust tests (registration commands) ----------------------------------

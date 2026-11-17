@@ -437,6 +437,11 @@ enum Command {
     },
     /// Phase 3b：按 `queue_order ASC, id ASC` 列出所有 `Queued` 任务。
     ListQueued(Reply<Vec<TaskRecord>>),
+    /// Phase 4c：按 URL 查找处于活动状态（Queued/Probing/Downloading）的任务 id。
+    FindActiveByUrl {
+        url: String,
+        reply: Reply<Option<i64>>,
+    },
     /// Phase 3b：将 `Paused`/`Failed`/`Finalizing` 任务改回 `Queued`。
     RequeueTask {
         id: i64,
@@ -684,6 +689,14 @@ impl Store {
         self.call(Command::ListQueued).await
     }
 
+    /// 按 URL 返回首个处于活动状态（`Queued`/`Probing`/`Downloading`）的任务 id。
+    /// 用于入队去重；无匹配时返回 `None`。
+    pub async fn find_active_by_url(&self, url: &str) -> Result<Option<i64>> {
+        let url = url.to_string();
+        self.call(|reply| Command::FindActiveByUrl { url, reply })
+            .await
+    }
+
     /// 将 `Paused`/`Failed`/`Finalizing` 任务改回 `Queued`；其他状态返回非法参数错误。
     /// `to_front = true` 时排到队首，否则保持/置于合适位置。
     pub async fn requeue_task(&self, id: i64, to_front: bool) -> Result<()> {
@@ -829,6 +842,9 @@ fn handle_command(conn: &mut Connection, cmd: Command, fail: &AtomicBool) {
         }
         Command::ListQueued(reply) => {
             let _ = reply.send(list_queued_tasks(conn));
+        }
+        Command::FindActiveByUrl { url, reply } => {
+            let _ = reply.send(find_active_by_url(conn, &url));
         }
         Command::RequeueTask {
             id,
@@ -1253,6 +1269,18 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     )
     .map_err(db_err)?;
     Ok(())
+}
+
+/// 返回首个处于活动状态（Queued/Probing/Downloading）的同 URL 任务 id。
+fn find_active_by_url(conn: &Connection, url: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM tasks WHERE url=?1 \
+         AND state IN ('Queued','Probing','Downloading') ORDER BY id ASC LIMIT 1",
+        params![url],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(db_err)
 }
 
 fn list_queued_tasks(conn: &Connection) -> Result<Vec<TaskRecord>> {

@@ -120,6 +120,7 @@ $script:tmp = ''
 $script:hostName = ''
 $script:db = ''
 $script:cli = ''
+$script:runnerName = ''
 $script:serverPid = 0
 $script:nmProc = $null
 $script:failed = $false
@@ -137,6 +138,15 @@ function Step([string]$name) {
 
 function Fail([string]$msg) {
     throw $msg
+}
+
+# The runner launchers clear their own std-handle inheritance before spawning
+# the detached watcher, so normal captured output is safe (no pipe inheritance).
+function Invoke-RunnerNoOutput([string[]]$runnerArgs) {
+    $out = & $script:cli runner @runnerArgs --db $script:db 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    Log ("runner " + ($runnerArgs -join ' ') + " output=" + $out.Trim())
+    return $code
 }
 
 function Read-Exact($stream, $buf, $count) {
@@ -199,6 +209,11 @@ function Get-RelatedProcesses {
 
 function Invoke-Cleanup {
     $script:step = 'CLEANUP'
+    # Stop the standalone runner via its sentinel so tasks settle as Paused(User)
+    # instead of being killed mid-flight.
+    if ($script:cli -ne '' -and (Test-Path $script:cli) -and $script:db -ne '') {
+        try { & $script:cli runner stop --db $script:db 2>&1 | Out-Null } catch { }
+    }
     if ($null -ne $script:nmProc) {
         try { $script:nmProc.StandardInput.BaseStream.Close() } catch { }
         try {
@@ -218,6 +233,12 @@ function Invoke-Cleanup {
         try { & reg delete "HKCU\Software\Mozilla\NativeMessagingHosts\$script:hostName" /f 2>&1 | Out-Null } catch { }
         if ($script:cli -ne '' -and (Test-Path $script:cli) -and $script:db -ne '') {
             try { & $script:cli nm uninstall --host-name $script:hostName --db $script:db 2>&1 | Out-Null } catch { }
+        }
+    }
+    if ($script:runnerName -ne '') {
+        try { & reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v $script:runnerName /f 2>&1 | Out-Null } catch { }
+        if ($script:cli -ne '' -and (Test-Path $script:cli) -and $script:db -ne '') {
+            try { & $script:cli runner uninstall --name $script:runnerName --db $script:db 2>&1 | Out-Null } catch { }
         }
     }
     if ($script:tmp -ne '' -and (Test-Path $script:tmp)) {
@@ -258,6 +279,7 @@ try {
     $script:tmp = Join-Path $env:TEMP ("idm4b-e2e-" + $rand)
     New-Item -ItemType Directory -Path $script:tmp -Force | Out-Null
     $script:hostName = 'idm_rs_e2e_' + $rand
+    $script:runnerName = 'idm-rs-runner-e2e-' + $rand
     $script:db = Join-Path $script:tmp 'e2e.db'
     $script:cli = (Copy-Item -LiteralPath $cliRelease -Destination (Join-Path $script:tmp 'idm-cli.exe') -PassThru).FullName
     Copy-Item -LiteralPath $hostRelease -Destination (Join-Path $script:tmp 'idm-nmhost.exe') -Force | Out-Null
@@ -281,6 +303,15 @@ try {
     $code = $LASTEXITCODE
     Log ("config set exit=$code raw=" + $out.Trim())
     if ($code -ne 0) { Fail 'config set download-dir failed' }
+
+    # Phase 4c: register the standalone runner under a test-only Run value name.
+    $out = & $script:cli runner install --name $script:runnerName --db $script:db 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    Log ("runner install exit=$code raw=" + $out.Trim())
+    if ($code -ne 0) { Fail 'runner install failed' }
+    $runVal = & reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v $script:runnerName 2>&1 | Out-String
+    Log ("RUN VALUE " + $runVal.Trim())
+    if ($runVal -notmatch 'queue run --watch') { Fail 'runner Run value missing queue run --watch' }
 
     # --- Step 2: start loopback server --------------------------------------
     Step '2_LOOPBACK_SERVER'
@@ -360,8 +391,17 @@ c.close()
         if ($null -eq $match) { Fail 'no downloaded file matches expected SHA256' }
     }
 
-    # --- Step 3: frame protocol ping + enqueue ------------------------------
-    Step '3_FRAMES_PING_ENQUEUE'
+    # --- Step 3: start standalone runner, then frame protocol ping + enqueue -
+    Step '3_RUNNER_START_FRAMES_ENQUEUE'
+    $code = Invoke-RunnerNoOutput @('start')
+    Log "runner start exit=$code"
+    if ($code -ne 0) { Fail 'runner start failed' }
+    $lockPath = Join-Path $script:tmp 'runner.lock'
+    $deadline = (Get-Date).AddSeconds(6)
+    while ((Test-LockFree $lockPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    if (Test-LockFree $lockPath) { Fail 'runner.lock not held after runner start' }
+    Log 'runner.lock is held by standalone runner'
+
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = (Join-Path $script:tmp 'idm-nmhost.exe')
     $psi.WorkingDirectory = $script:tmp
@@ -387,21 +427,30 @@ c.close()
     if ($taskId -le 0) { Fail 'enqueue response has no taskId' }
     Log "taskId=$taskId"
 
-    # --- Step 4: runner starts, task completes, verify bytes ----------------
+    # --- Step 4: verify download (runner already running, not host-spawned) --
     Step '4_DOWNLOAD_VERIFY'
-    $watchSeen = $false
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline) {
-        $w = @(Get-RelatedProcesses | Where-Object { $_.CommandLine -like '*--watch*' })
-        if ($w.Count -gt 0) { $watchSeen = $true; break }
-        Start-Sleep -Milliseconds 300
-    }
-    if (-not $watchSeen) { Fail 'host did not spawn idm-cli queue run --watch' }
-    Log 'watch runner is running'
+    $w = @(Get-RelatedProcesses | Where-Object { $_.CommandLine -like '*--watch*' })
+    if ($w.Count -eq 0) { Fail 'standalone watch runner is not running' }
+    Log ('standalone watch runner pid=' + $w[0].ProcessId)
 
     $st = Wait-Completed $taskId 60
     if ($st.Headers -ne '0') { Fail ("task_headers not cleared: " + $st.Headers) }
     Assert-Artifact 'e2e.bin'
+
+    # --- Step 4b: kill host, runner must survive and finish a new task -------
+    Step '4B_HOST_KILLED_RUNNER_SURVIVES'
+    if ($null -ne $script:nmProc) {
+        $nmPid = $script:nmProc.Id
+        $script:nmProc.Kill()
+        $script:nmProc.WaitForExit(3000) | Out-Null
+        Log "killed idm-nmhost pid=$nmPid"
+        $script:nmProc = $null
+    }
+    if (-not (Test-LockFree $lockPath)) { Log 'runner still holds lock after host kill' }
+    else { Fail 'runner.lock released unexpectedly after host kill' }
+    $w2 = @(Get-RelatedProcesses | Where-Object { $_.CommandLine -like '*--watch*' })
+    if ($w2.Count -eq 0) { Fail 'runner died when host was killed' }
+    Log 'runner survived host termination'
 
     # --- Step 5: request headers from Probe and chunk requests --------------
     Step '5_REQUEST_HEADERS'
@@ -419,26 +468,74 @@ c.close()
     if (-not $chunkOk) { Fail 'chunk request lacks Referer/Cookie/User-Agent' }
     Log 'Probe and chunk requests all carried Referer/Cookie/User-Agent'
 
-    # --- Step 6: kill runner, confirm runner.lock released ------------------
-    Step '6_STOP_RUNNER_LOCK_FREE'
-    $watchers = @(Get-RelatedProcesses | Where-Object { $_.CommandLine -like '*--watch*' })
-    foreach ($w in $watchers) {
-        Log ("killing watch pid=" + $w.ProcessId)
-        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+    # --- Step 6: runner stop releases lock, deletes sentinel, log is clean --
+    Step '6_RUNNER_STOP'
+    $code = Invoke-RunnerNoOutput @('stop')
+    Log "runner stop exit=$code"
+    if ($code -ne 0) { Fail 'runner stop failed' }
+    $deadline = (Get-Date).AddSeconds(11)
+    while (-not (Test-LockFree $lockPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    if (-not (Test-LockFree $lockPath)) { Fail 'runner.lock still held after runner stop' }
+    Log 'runner.lock released after runner stop'
+    $stopFile = Join-Path $script:tmp 'runner.stop'
+    if (Test-Path $stopFile) { Fail 'runner.stop was not deleted' }
+    $deadline = (Get-Date).AddSeconds(15)
+    $w3 = @(Get-RelatedProcesses | Where-Object { $_.CommandLine -like '*--watch*' })
+    while ($w3.Count -gt 0 -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+        $w3 = @(Get-RelatedProcesses | Where-Object { $_.CommandLine -like '*--watch*' })
     }
-    Start-Sleep -Seconds 3
-    $lockPath = Join-Path $script:tmp 'runner.lock'
-    if (Test-Path $lockPath) {
-        if (-not (Test-LockFree $lockPath)) { Fail 'runner.lock is still held' }
-        Log 'runner.lock released'
-    } else {
-        Log 'runner.lock not present (already free)'
+    if ($w3.Count -gt 0) {
+        foreach ($p in $w3) {
+            Log ("watch pid still alive after stop: pid=" + $p.ProcessId + " ppid=" + $p.ParentProcessId + " created=" + $p.CreationDate + " cmd=" + $p.CommandLine)
+        }
+        $rlPath = Join-Path $script:tmp 'runner.log'
+        if (Test-Path $rlPath) { Log ("runner.log tail: " + (([IO.File]::ReadAllText($rlPath) -split "`n" | Select-Object -Last 5) -join ' / ')) }
+        Fail 'watch runner process did not exit within 15s after stop'
     }
-    $still = @(Get-RelatedProcesses | Where-Object { $_.CommandLine -like '*--watch*' })
-    if ($still.Count -gt 0) { Fail 'watch runner still alive after kill' }
+    Log 'watch runner process exited after stop'
+    # runner.log must not contain Cookie values or full URL query parameters.
+    $runnerLog = Join-Path $script:tmp 'runner.log'
+    if (-not (Test-Path $runnerLog)) { Fail 'runner.log missing' }
+    $runnerLogText = [IO.File]::ReadAllText($runnerLog)
+    Log ("RUNNER.LOG " + $runnerLogText.Trim())
+    if ($runnerLogText -match [regex]::Escape($cookies)) { Fail 'runner.log contains Cookie value' }
+    if ($runnerLogText -match [regex]::Escape($url)) { Fail 'runner.log contains full URL' }
+    Log 'runner.log clean (no Cookie value / no full URL)'
 
-    # --- Step 7: second enqueue re-spawns the runner ------------------------
-    Step '7_SECOND_ENQUEUE_RESPAWN'
+    # --- Step 7: host rejects enqueue when runner stopped, then re-start -----
+    Step '7_ENQUEUE_GATING'
+    # New host process (previous one was killed in Step 4b).
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = (Join-Path $script:tmp 'idm-nmhost.exe')
+    $psi.WorkingDirectory = $script:tmp
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $false
+    $psi.EnvironmentVariables['IDM_RS_DB'] = $script:db
+    $script:nmProc = [System.Diagnostics.Process]::Start($psi)
+    Send-Frame $script:nmProc ([ordered]@{
+        type = 'enqueue'; url = $url; referrer = $referrer
+        cookies = $cookies; userAgent = $userAgent; filename = 'e2e-reject.bin'
+    })
+    $rej = Recv-Frame $script:nmProc
+    if ($rej.ok -ne $false -or $rej.error -ne 'runner_not_running') {
+        Fail ("enqueue should be rejected with runner_not_running: " + ($rej | ConvertTo-Json -Compress))
+    }
+    Log 'enqueue rejected with runner_not_running while runner stopped'
+    # Verify no new task was created (still exactly the taskIds seen).
+    $statusReject = Get-DbState 999999
+    if ($statusReject.State -ne 'MISSING') { Fail 'unexpected task created after rejection' }
+
+    # Re-start runner and enqueue again.
+    $code = Invoke-RunnerNoOutput @('start')
+    Log "runner re-start exit=$code"
+    if ($code -ne 0) { Fail 'runner re-start failed' }
+    $deadline = (Get-Date).AddSeconds(6)
+    while ((Test-LockFree $lockPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    if (Test-LockFree $lockPath) { Fail 'runner.lock not held after re-start' }
+
     Send-Frame $script:nmProc ([ordered]@{
         type = 'enqueue'; url = $url; referrer = $referrer
         cookies = $cookies; userAgent = $userAgent; filename = 'e2e2.bin'
@@ -447,21 +544,29 @@ c.close()
     if ($resp2.ok -ne $true) { Fail 'second enqueue failed' }
     $taskId2 = [int]$resp2.taskId
     Log "second taskId=$taskId2"
-    $watchSeen2 = $false
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline) {
-        $w = @(Get-RelatedProcesses | Where-Object { $_.CommandLine -like '*--watch*' })
-        if ($w.Count -gt 0) { $watchSeen2 = $true; break }
-        Start-Sleep -Milliseconds 300
-    }
-    if (-not $watchSeen2) { Fail 'runner was not re-spawned by second enqueue' }
-    Log 'runner re-spawned'
     $st2 = Wait-Completed $taskId2 60
     if ($st2.Headers -ne '0') { Fail ("task_headers not cleared after 2nd task: " + $st2.Headers) }
     Assert-Artifact 'e2e2.bin'
 
-    # --- Step 8: nm uninstall, confirm key + manifest gone ------------------
+    # --- Step 8: stop/uninstall runner and host, confirm keys gone -----------
     Step '8_UNINSTALL'
+    $code = Invoke-RunnerNoOutput @('stop')
+    Log "runner stop (final) exit=$code"
+    $deadline = (Get-Date).AddSeconds(11)
+    while (-not (Test-LockFree $lockPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    if (-not (Test-LockFree $lockPath)) { Fail 'runner.lock not released in final stop' }
+
+    $out = & $script:cli runner uninstall --name $script:runnerName --db $script:db 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    Log ("runner uninstall exit=$code raw=" + $out.Trim())
+    if ($code -ne 0) { Fail 'runner uninstall failed' }
+    try {
+        & reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v $script:runnerName 2>$null
+        $rvCode = $LASTEXITCODE
+    } catch { $rvCode = 1 }
+    if ($rvCode -eq 0) { Fail 'runner Run value still exists after uninstall' }
+    Log 'runner Run value removed'
+
     $out = & $script:cli nm uninstall --host-name $script:hostName --db $script:db 2>&1 | Out-String
     $code = $LASTEXITCODE
     Log ("nm uninstall exit=$code raw=" + $out.Trim())

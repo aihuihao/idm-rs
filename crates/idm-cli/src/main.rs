@@ -260,6 +260,291 @@ mod bench {
     }
 }
 
+// --- Phase 4c: standalone runner lifecycle management -----------------------
+
+/// `idm-cli runner install|uninstall|status|start|stop`：管理独立常驻队列运行器。
+///
+/// 运行器不属于浏览器进程树：开机启动项写入 HKCU Run，start 用脱离标志拉起，
+/// stop 通过数据目录的 `runner.stop` 哨兵文件请求安全停止。只用 `reg.exe` 写 HKCU。
+#[cfg(windows)]
+mod runner {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use std::time::{Duration, Instant};
+
+    const DEFAULT_NAME: &str = "idm-rs-runner";
+    const REG_RUN: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+    // Windows 进程创建标志。
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    /// Windows `ERROR_ACCESS_DENIED`(5)：作业对象拒绝 breakaway。
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    /// Windows `ERROR_SHARING_VIOLATION`(32)：锁被另一个进程独占持有。
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    fn usage() -> &'static str {
+        "usage: idm-cli runner <install|uninstall|status|start|stop> [--name NAME] [--db PATH]"
+    }
+
+    pub fn run(args: &[String]) -> i32 {
+        let sub = args.first().map(String::as_str).unwrap_or("");
+        let code = match sub {
+            "install" => install(&args[1..]),
+            "uninstall" => uninstall(&args[1..]),
+            "status" => status(&args[1..]),
+            "start" => start(&args[1..]),
+            "stop" => stop(&args[1..]),
+            _ => {
+                eprintln!("unknown runner subcommand: {sub}\n{}", usage());
+                return 2;
+            }
+        };
+        match code {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("runner {sub} failed: {e}");
+                1
+            }
+        }
+    }
+
+    struct Opts {
+        name: String,
+        db: PathBuf,
+    }
+
+    fn parse(args: &[String]) -> Result<Opts, String> {
+        let mut name = DEFAULT_NAME.to_string();
+        let mut db: Option<PathBuf> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--name" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("missing value for --name".to_string());
+                    }
+                    name = args[i].clone();
+                }
+                "--db" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("missing value for --db".to_string());
+                    }
+                    db = Some(PathBuf::from(&args[i]));
+                }
+                other => return Err(format!("unknown argument: {other}\n{}", usage())),
+            }
+            i += 1;
+        }
+        validate_name(&name)?;
+        let db_path = absolute(&match db {
+            Some(p) => p,
+            None => match std::env::var_os("IDM_RS_DB") {
+                Some(v) if !v.is_empty() => PathBuf::from(v),
+                _ => idm_core::store::default_db_path().map_err(|e| e.to_string())?,
+            },
+        })?;
+        Ok(Opts { name, db: db_path })
+    }
+
+    /// 值名只允许字母数字、`-`、`_`，防止注入 reg.exe 参数。
+    fn validate_name(s: &str) -> Result<(), String> {
+        if s.is_empty() {
+            return Err("value name must not be empty".to_string());
+        }
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err("value name may contain only letters, digits, '-' and '_'".to_string());
+        }
+        Ok(())
+    }
+
+    fn absolute(p: &Path) -> Result<PathBuf, String> {
+        if p.is_absolute() {
+            Ok(p.to_path_buf())
+        } else {
+            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            Ok(cwd.join(p))
+        }
+    }
+
+    fn reg(args: &[&str]) -> Result<Output, String> {
+        Command::new("reg")
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())
+    }
+
+    fn lock_path(db: &Path) -> PathBuf {
+        db.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("runner.lock")
+    }
+
+    fn stop_path(db: &Path) -> PathBuf {
+        db.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("runner.stop")
+    }
+
+    fn current_exe() -> Result<PathBuf, String> {
+        absolute(&std::env::current_exe().map_err(|e| e.to_string())?)
+    }
+
+    /// 以独占方式打开 `runner.lock` 判断运行器是否在运行。
+    /// 能独占打开（后立即关闭）= 未运行；共享冲突(32) = 运行中。
+    fn runner_running(db: &Path) -> bool {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .share_mode(0)
+            .open(lock_path(db))
+        {
+            Ok(f) => {
+                drop(f);
+                false
+            }
+            Err(e) => e.raw_os_error() == Some(ERROR_SHARING_VIOLATION),
+        }
+    }
+
+    /// 开机启动项的值：`"<idm-cli 绝对路径>" queue run --watch --db "<db 绝对路径>"`。
+    fn run_value(exe: &Path, db: &Path) -> String {
+        format!(
+            "\"{}\" queue run --watch --db \"{}\"",
+            exe.display(),
+            db.display()
+        )
+    }
+
+    fn install(args: &[String]) -> Result<i32, String> {
+        let opts = parse(args)?;
+        let exe = current_exe()?;
+        let value = run_value(&exe, &opts.db);
+        let out = reg(&[
+            "add", REG_RUN, "/v", &opts.name, "/t", "REG_SZ", "/d", &value, "/f",
+        ])?;
+        if !out.status.success() {
+            return Err(format!(
+                "reg add failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        println!("runner autostart installed: {} = {}", opts.name, value);
+        Ok(0)
+    }
+
+    fn uninstall(args: &[String]) -> Result<i32, String> {
+        let opts = parse(args)?;
+        let out = reg(&["delete", REG_RUN, "/v", &opts.name, "/f"])?;
+        // 值本来就不存在时 reg 返回非零，但卸载语义上是幂等成功。
+        println!("runner autostart uninstalled: {}", opts.name);
+        let _ = out;
+        Ok(0)
+    }
+
+    fn status(args: &[String]) -> Result<i32, String> {
+        let opts = parse(args)?;
+        let out = reg(&["query", REG_RUN, "/v", &opts.name])?;
+        let registered = out.status.success();
+        println!("value_name: {}", opts.name);
+        println!("registry_key: {REG_RUN}");
+        println!("autostart_registered: {registered}");
+        if registered {
+            println!(
+                "registry_value: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        let lock = lock_path(&opts.db);
+        println!("runner_lock: {}", lock.display());
+        println!("runner_running: {}", runner_running(&opts.db));
+        Ok(0)
+    }
+
+    /// 用指定标志拉起运行器。返回 spawn 的 IO 结果。
+    fn spawn_with_flags(exe: &Path, db: &Path, breakaway: bool) -> std::io::Result<()> {
+        let mut flags = DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        if breakaway {
+            flags |= CREATE_BREAKAWAY_FROM_JOB;
+        }
+        let db_str = db.to_string_lossy().into_owned();
+        Command::new(exe)
+            .args(["queue", "run", "--watch", "--db", &db_str])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+            .map(|_| ())
+    }
+
+    fn start(args: &[String]) -> Result<i32, String> {
+        let opts = parse(args)?;
+        if runner_running(&opts.db) {
+            println!("runner already running");
+            return Ok(0);
+        }
+        // 切断继承链：把本进程的 stdin/stdout/stderr 标记为不可继承，
+        // 否则分离的运行器会继承启动它的 shell/测试框架的捕获管道，
+        // 导致 `Command::output()` / `2>&1 | Out-String` 一直等待到运行器退出。
+        if let Err(e) = idm_core::disk::win32::set_std_handles_non_inheritable() {
+            return Err(format!("failed to clear std handle inheritance: {e}"));
+        }
+        let exe = current_exe()?;
+        // 先尝试带 CREATE_BREAKAWAY_FROM_JOB 脱离浏览器作业对象；若被拒绝(5)去掉重试。
+        match spawn_with_flags(&exe, &opts.db, true) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                spawn_with_flags(&exe, &opts.db, false)
+                    .map_err(|e| format!("spawn without breakaway failed: {e}"))?;
+            }
+            Err(e) => return Err(format!("spawn failed: {e}")),
+        }
+        // 3 秒内确认锁被占用。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if runner_running(&opts.db) {
+                println!("runner started");
+                return Ok(0);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err("runner did not acquire runner.lock within 3s".to_string())
+    }
+
+    fn stop(args: &[String]) -> Result<i32, String> {
+        let opts = parse(args)?;
+        if !runner_running(&opts.db) {
+            println!("runner not running");
+            let _ = std::fs::remove_file(stop_path(&opts.db));
+            return Ok(0);
+        }
+        let sp = stop_path(&opts.db);
+        std::fs::write(&sp, b"stop").map_err(|e| format!("write runner.stop failed: {e}"))?;
+        println!("runner.stop written: {}", sp.display());
+        // 最多 10 秒等待锁释放。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !runner_running(&opts.db) {
+                println!("runner stopped");
+                return Ok(0);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Err("runner did not release runner.lock within 10s".to_string())
+    }
+}
+
 // --- Phase 4b: Firefox Native Messaging host registration -------------------
 
 /// `idm-cli nm install|uninstall|status`：注册 / 注销 / 查询 Native Messaging host。
@@ -484,6 +769,7 @@ mod nm {
         println!("installed native messaging host '{}'", opts.host);
         println!("manifest: {}", manifest.display());
         println!("registry: {key}");
+        println!("next: run 'idm-cli runner install' then 'idm-cli runner start'");
         Ok(0)
     }
 
@@ -538,7 +824,8 @@ mod nm {
 
 #[cfg(windows)]
 mod dl {
-    use std::path::PathBuf;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -598,6 +885,45 @@ mod dl {
             return None;
         }
         Some(total)
+    }
+
+    /// runner.log 容量上限：1 MiB，超过则覆盖重写。
+    const RUNNER_LOG_CAP: u64 = 1_048_576;
+
+    /// 追加一行运行日志到 `runner.log`（info 级别，单文件 1 MiB 覆盖重写）。
+    /// 只记录运行器生命周期事件与任务 id，不写 URL、查询参数或任何请求头值。
+    fn runner_log(path: &Path, msg: &str) {
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if file.metadata().map(|m| m.len()).unwrap_or(0) > RUNNER_LOG_CAP
+            && let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+        {
+            file = f;
+        }
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[{secs}] INFO {msg}");
+    }
+
+    /// 读取 `global-max-speed` 设置并解析为字节率；"0"/未设置/非法均视为不限速。
+    async fn configured_max_speed(store: &Store) -> Option<u64> {
+        match store.get_setting("global-max-speed").await {
+            Ok(Some(v)) if v.trim() == "0" => None,
+            Ok(Some(v)) => parse_max_speed(&v),
+            _ => None,
+        }
     }
 
     fn print_progress(snap: &ProgressSnapshot) {
@@ -1551,8 +1877,9 @@ mod dl {
         } else {
             proxy_url.map_or(ProxyConfig::System, ProxyConfig::Custom)
         };
-        // 单实例锁：在数据目录（数据库所在目录）下创建 runner.lock，独占打开；
-        // 已有实例持有时打印 "already running" 并以退出码 3 退出。锁句柄保持到进程退出。
+        // 单实例锁：在数据目录（数据库所在目录）下创建 runner.lock，独占打开。
+        // Phase 4c：若被占用（可能与 host 的瞬时探测撞车），每 200ms 重试、共 3 秒，
+        // 仍占用才以退出码 3 退出。锁句柄保持到进程退出。
         let lock_dir = store
             .db_path()
             .parent()
@@ -1561,13 +1888,20 @@ mod dl {
         let mut lock_opt = std::fs::OpenOptions::new();
         lock_opt.read(true).write(true).create(true).truncate(false);
         std::os::windows::fs::OpenOptionsExt::share_mode(&mut lock_opt, 0);
-        let _runner_lock = match lock_opt.open(&lock_path) {
-            Ok(f) => Some(f),
-            Err(_) => {
-                eprintln!("already running");
-                return 3;
+        let lock_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let acquired = loop {
+            match lock_opt.open(&lock_path) {
+                Ok(f) => break f,
+                Err(_) => {
+                    if std::time::Instant::now() >= lock_deadline {
+                        eprintln!("already running");
+                        return 3;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
         };
+        let _runner_lock = acquired;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let config = QueueConfig {
             max_concurrent_tasks: max_tasks,
@@ -1596,7 +1930,7 @@ mod dl {
         }
         let q2 = queue.clone();
         let stop_ctrl = stop.clone();
-        tokio::spawn(async move {
+        let ctrl_c_task = tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             stop_ctrl.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = q2.shutdown().await;
@@ -1634,11 +1968,68 @@ mod dl {
         });
         progress_task.abort();
         if watch {
-            // 常驻模式：队列空闲后不退出，每秒检查一次数据库中新增的 Queued 任务并调度。
-            // Ctrl+C 会触发 stop 标志并安全停止所有活动任务后退出。
+            // Phase 4c 常驻模式：写 runner.log（生命周期 + 任务开始/结束），每秒调度，
+            // 每 5 秒重读 global-max-speed，检测 runner.stop 哨兵文件后安全停止。
+            let log_path = lock_dir.join("runner.log");
+            let stop_path = lock_dir.join("runner.stop");
+            runner_log(&log_path, "runner started");
+
+            // 订阅队列事件，记录任务开始/结束（只写 id，不写 URL/请求头）。
+            let q_log = queue.clone();
+            let log_p = log_path.clone();
+            let log_task = tokio::spawn(async move {
+                let mut events = q_log.subscribe_events();
+                loop {
+                    match events.recv().await {
+                        Ok(QueueEvent::TaskStarted { id }) => {
+                            runner_log(&log_p, &format!("task {id} started"));
+                        }
+                        Ok(QueueEvent::TaskCompleted { id }) => {
+                            runner_log(&log_p, &format!("task {id} completed"));
+                        }
+                        Ok(QueueEvent::TaskPaused { id }) => {
+                            runner_log(&log_p, &format!("task {id} paused"));
+                        }
+                        Ok(QueueEvent::TaskFailed { id }) => {
+                            runner_log(&log_p, &format!("task {id} failed"));
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // 启动时读取限速设置。
+            let mut current_speed = configured_max_speed(&store).await;
+            queue.set_global_max_speed(current_speed);
+            let mut last_speed_check = std::time::Instant::now();
+
             loop {
-                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Ctrl+C 或 runner.stop 都触发安全停止。
+                let stop_requested =
+                    stop.load(std::sync::atomic::Ordering::Relaxed) || stop_path.exists();
+                if stop_requested {
+                    runner_log(&log_path, "runner stopping");
+                    let _ = queue.shutdown().await;
+                    // 删除哨兵文件（Ctrl+C 场景可能不存在）。
+                    let _ = std::fs::remove_file(&stop_path);
                     break;
+                }
+                // 每 5 秒重读限速设置，变化则更新限速器。
+                if last_speed_check.elapsed() >= Duration::from_secs(5) {
+                    last_speed_check = std::time::Instant::now();
+                    let new_speed = configured_max_speed(&store).await;
+                    if new_speed != current_speed {
+                        current_speed = new_speed;
+                        queue.set_global_max_speed(current_speed);
+                        runner_log(
+                            &log_path,
+                            &format!(
+                                "global-max-speed changed to {}",
+                                current_speed.map_or("unlimited".to_string(), |v| v.to_string())
+                            ),
+                        );
+                    }
                 }
                 if let Err(e) = queue.adopt_queued().await {
                     crate::print_error("adopt failed", &e);
@@ -1646,10 +2037,16 @@ mod dl {
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
+            log_task.abort();
+            // Abort the Ctrl+C listener: it holds a DownloadQueue clone forever,
+            // which can keep the store channel alive and stall `store.shutdown()`
+            // when the runner stops via runner.stop (not via Ctrl+C).
+            ctrl_c_task.abort();
+            runner_log(&log_path, "runner stopped");
             println!("QUEUE WATCH STOPPED");
             0
         } else {
-            match queue.wait_for_idle().await {
+            let result = match queue.wait_for_idle().await {
                 Ok(s) => {
                     let secs = s.total_elapsed.as_secs_f64();
                     println!(
@@ -1662,7 +2059,9 @@ mod dl {
                     crate::print_error("queue run failed", &e);
                     1
                 }
-            }
+            };
+            ctrl_c_task.abort();
+            result
         }
     }
 
@@ -1681,16 +2080,31 @@ mod dl {
                 }
                 let key = &args[1];
                 let value = &args[2];
-                if key != "download-dir" {
-                    eprintln!("unknown config key: {key} (only 'download-dir' is supported)");
-                    return 2;
-                }
-                let p = std::path::Path::new(value);
-                if !p.exists()
-                    && let Err(e) = std::fs::create_dir_all(p)
-                {
-                    eprintln!("cannot create download-dir {value}: {e}");
-                    return 1;
+                match key.as_str() {
+                    "download-dir" => {
+                        let p = std::path::Path::new(value);
+                        if !p.exists()
+                            && let Err(e) = std::fs::create_dir_all(p)
+                        {
+                            eprintln!("cannot create download-dir {value}: {e}");
+                            return 1;
+                        }
+                    }
+                    "global-max-speed" => {
+                        // 支持 K/M 后缀；"0" 表示不限速（合法）。
+                        if value.trim() == "0" {
+                            // 合法：不限速。
+                        } else if parse_max_speed(value).is_none() {
+                            eprintln!("invalid global-max-speed: {value}");
+                            return 2;
+                        }
+                    }
+                    _ => {
+                        eprintln!(
+                            "unknown config key: {key} (only 'download-dir' and 'global-max-speed' are supported)"
+                        );
+                        return 2;
+                    }
                 }
                 if let Err(e) = store.set_setting(key, value).await {
                     crate::print_error("config set failed", &e);
@@ -2038,6 +2452,18 @@ async fn main() {
         #[cfg(not(windows))]
         {
             eprintln!("nm is only supported on Windows");
+            std::process::exit(2);
+        }
+    }
+    // 运行器生命周期命令：start/stop 需要拉起或停止子进程，但不打开数据库本身。
+    if sub == "runner" {
+        #[cfg(windows)]
+        {
+            std::process::exit(runner::run(&args[2..]));
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("runner is only supported on Windows");
             std::process::exit(2);
         }
     }

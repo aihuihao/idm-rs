@@ -14,6 +14,7 @@ const FAIL_BACKOFF_MS = 30000;
 let enabled = true;
 let lastFailed = false;
 let lastFailAt = 0;
+let runnerNotRunning = false;
 const recent = new Map();
 
 function badge() {
@@ -25,11 +26,16 @@ function badge() {
 async function paint() {
     const b = badge();
     const state = enabled ? "ON" : "OFF";
-    const suffix = lastFailed ? " (last handoff failed)" : "";
+    let title = "idm-rs: takeover " + state;
+    if (runnerNotRunning) {
+        title = "运行器未启动：请执行 idm-cli runner start";
+    } else if (lastFailed) {
+        title += " (last handoff failed)";
+    }
     try {
         await browser.browserAction.setBadgeText({ text: b.text });
         await browser.browserAction.setBadgeBackgroundColor({ color: b.color });
-        await browser.browserAction.setTitle({ title: "idm-rs: takeover " + state + suffix });
+        await browser.browserAction.setTitle({ title: title });
     } catch (e) {
         // Badge failures must never affect a download.
     }
@@ -118,7 +124,12 @@ async function handoff(item) {
             ENQUEUE_TIMEOUT_MS
         );
         const accepted = !!(reply && reply.ok === true);
-        if (!accepted) throw new Error("enqueue rejected");
+        if (!accepted) {
+            if (reply && reply.error === "runner_not_running") {
+                runnerNotRunning = true;
+            }
+            throw new Error("enqueue rejected");
+        }
 
         await browser.downloads.cancel(item.id);
         // Best effort: Firefox may have deleted the file already. A failure here
@@ -132,6 +143,7 @@ async function handoff(item) {
         // A successful handoff clears the failure state and its backoff window.
         lastFailAt = 0;
         lastFailed = false;
+        runnerNotRunning = false;
         await paint();
     } catch (e) {
         // Never cancel on failure (missing host, rejection, or timeout).
@@ -152,6 +164,7 @@ browser.downloads.onCreated.addListener((item) => {
 browser.browserAction.onClicked.addListener(async () => {
     enabled = !enabled;
     lastFailed = false;
+    runnerNotRunning = false;
     try {
         await browser.storage.local.set({ idmRsEnabled: enabled });
     } catch (e) {
