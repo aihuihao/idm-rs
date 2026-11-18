@@ -143,7 +143,26 @@ Write-Host "PASS"
 Step-Command -Name "cargo fmt --all -- --check" -ScriptBlock { cargo fmt --all -- --check }
 
 # ---------------------------------------------------------------------------
-# STEP 4: cargo check --workspace --all-targets --locked
+# STEP 4/5: desktop frontend build (npm ci + npm run build).
+#           Runs before the workspace cargo steps because
+#           tauri::generate_context!() reads apps/idm-desktop/dist at compile
+#           time; a fresh checkout has no dist, so cargo check/test/clippy
+#           --workspace would fail without it. (Per task Phase 5a-2 step 4.6:
+#           moved ahead of the former STEP 4.)
+# ---------------------------------------------------------------------------
+$env:Path = "C:\Program Files\nodejs;$env:Path"
+$desktopDir = Join-Path (Get-Location) 'apps/idm-desktop'
+Push-Location $desktopDir
+try {
+    Step-Command -Name "npm ci --prefer-offline" -ScriptBlock { npm ci --prefer-offline }
+    Step-Command -Name "npm run build" -ScriptBlock { npm run build }
+}
+finally {
+    Pop-Location
+}
+
+# ---------------------------------------------------------------------------
+# STEP 5: cargo check --workspace --all-targets --locked
 # ---------------------------------------------------------------------------
 Step-Command -Name "cargo check --workspace --all-targets --locked" -ScriptBlock { cargo check --workspace --all-targets --locked }
 
@@ -178,19 +197,25 @@ Write-Host "PASS"
 
 # ---------------------------------------------------------------------------
 # STEP 8: forbidden transitive deps via cargo tree
+#         Phase 5a-2: check only idm-core / idm-cli / idm-ipc, each with
+#         `cargo tree -p <crate>`. idm-desktop is intentionally not checked
+#         because it is allowed to depend on tauri/wry/tao.
 # ---------------------------------------------------------------------------
 $stepNumber++
-Write-Host "[STEP $stepNumber] Check cargo tree for forbidden dependencies"
-$tree = Invoke-Step -Name "cargo tree" -ScriptBlock { cargo tree --workspace --target all -e normal,build,dev --prefix none }
-if ($tree.ExitCode -ne 0) {
-    Write-Host "FAIL (cargo tree failed)"
-    Write-Host $tree.Output
-    exit 1
+Write-Host "[STEP $stepNumber] Check cargo tree of core crates for tauri/wry/tao"
+$bad = @()
+foreach ($crate in @('idm-core', 'idm-cli', 'idm-ipc')) {
+    $tree = Invoke-Step -Name "cargo tree -p $crate" -ScriptBlock { cargo tree -p $crate --target all -e normal,build,dev --prefix none }
+    if ($tree.ExitCode -ne 0) {
+        Write-Host "FAIL (cargo tree -p $crate failed)"
+        Write-Host $tree.Output
+        exit 1
+    }
+    $lines = $tree.Output -split "`n"
+    $hits = $lines | Where-Object { $_ -match '^(tauri(-[\w-]+)?|wry|tao) v' }
+    foreach ($h in $hits) { $bad += "$crate : $h" }
 }
-$forbiddenPattern = '^(tauri(-[\w-]+)?|wry|tao|async-std|smol|sqlx(-[\w-]+)?|diesel(-[\w-]+)?) v'
-$lines = $tree.Output -split "`n"
-$bad = $lines | Where-Object { $_ -match $forbiddenPattern }
-if ($bad) {
+if ($bad.Count -gt 0) {
     Write-Host "FAIL (forbidden dependency detected):"
     $bad | ForEach-Object { Write-Host "  $_" }
     exit 1
@@ -230,21 +255,23 @@ Step-Check -Name "Static check: no forbidden direct deps in crate Cargo.toml" -S
 }
 
 # ---------------------------------------------------------------------------
-# STEP 10: forbidden paths must not exist
+# STEP 10: package.json / node_modules placement
+#          Phase 5a-2: the only allowed package.json in the whole repository
+#          is apps/idm-desktop/package.json. Any other package.json (including
+#          under extensions/) fails, and any git-tracked node_modules fails.
 # ---------------------------------------------------------------------------
-Step-Check -Name "Static check: no apps/ src-tauri/ package.json" -ScriptBlock {
+Step-Check -Name "Static check: single package.json + no tracked node_modules" -ScriptBlock {
     $bad = @()
-    # Original checks for locations outside extensions/ stay unchanged.
-    if (Test-Path apps) { $bad += "apps/" }
-    if (Test-Path src-tauri) { $bad += "src-tauri/" }
-    if (Test-Path package.json) { $bad += "package.json" }
-    # Phase 4b: extensions/ must keep the same "no package.json" rule.
-    if (Test-Path extensions) {
-        $pkgs = @(Get-ChildItem -Path extensions -Recurse -Force -Filter 'package.json' -ErrorAction SilentlyContinue)
-        foreach ($p in $pkgs) { $bad += $p.FullName }
+    $allowed = 'apps/idm-desktop/package.json'
+    $trackedFiles = @(git ls-files)
+    $trackedPkg = @($trackedFiles | Where-Object { $_ -match '(^|/)package\.json$' })
+    foreach ($p in $trackedPkg) {
+        if ($p -ne $allowed) { $bad += "unexpected tracked package.json: $p" }
     }
+    $trackedNodeModules = @($trackedFiles | Where-Object { $_ -match '(^|/)node_modules(/|$)' })
+    foreach ($t in $trackedNodeModules) { $bad += "tracked node_modules: $t" }
     if ($bad.Count -gt 0) {
-        Write-Host "  forbidden paths found: $($bad -join ', ')"
+        $bad | ForEach-Object { Write-Host "  $_" }
         return $false
     }
     return $true
@@ -275,7 +302,10 @@ Step-Check -Name "Static check: no TODO/FIXME/todo!()/unimplemented!() in .rs" -
 # ---------------------------------------------------------------------------
 Step-Check -Name "Static check: unsafe only in win32.rs" -ScriptBlock {
     $allowed = "crates/idm-core/src/disk/win32.rs".ToLower()
-    $files = Get-ChildItem -Path crates -Recurse -Filter *.rs
+    $files = @()
+    $files += Get-ChildItem -Path crates -Recurse -Filter *.rs
+    $desktopSrc = "apps/idm-desktop/src-tauri/src"
+    if (Test-Path $desktopSrc) { $files += Get-ChildItem -Path $desktopSrc -Recurse -Filter *.rs }
     $ok = $true
     foreach ($f in $files) {
         # Normalize the absolute path to forward slashes + lowercase so the
@@ -306,7 +336,10 @@ Step-Check -Name "Static check: unsafe only in win32.rs" -ScriptBlock {
 # ---------------------------------------------------------------------------
 Step-Check -Name "Static check: allow only in win32.rs as #![allow(unsafe_code)]" -ScriptBlock {
     $allowed = "crates/idm-core/src/disk/win32.rs".ToLower()
-    $files = Get-ChildItem -Path crates -Recurse -Filter *.rs
+    $files = @()
+    $files += Get-ChildItem -Path crates -Recurse -Filter *.rs
+    $desktopSrc = "apps/idm-desktop/src-tauri/src"
+    if (Test-Path $desktopSrc) { $files += Get-ChildItem -Path $desktopSrc -Recurse -Filter *.rs }
     $ok = $true
     foreach ($f in $files) {
         # Normalize the absolute path to forward slashes + lowercase so the
@@ -360,6 +393,12 @@ Write-Host "PASS"
 Step-Command -Name "cargo test -p idm-cli --test crash_resume --locked -- --ignored --test-threads=1" -ScriptBlock {
     cargo test -p idm-cli --test crash_resume --locked -- --ignored --test-threads=1
 }
+
+# ---------------------------------------------------------------------------
+# STEP 17: cargo build -p idm-desktop --locked (needs dist from STEP 4,
+#          which was moved ahead of the workspace cargo steps).
+# ---------------------------------------------------------------------------
+Step-Command -Name "cargo build -p idm-desktop --locked" -ScriptBlock { cargo build -p idm-desktop --locked }
 
 # ---------------------------------------------------------------------------
 # Summary

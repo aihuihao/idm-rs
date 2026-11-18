@@ -1,3 +1,5 @@
 /target/
 *.log
 /.codebuddy/
+apps/idm-desktop/node_modules
+apps/idm-desktop/dist

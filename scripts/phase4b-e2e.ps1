@@ -24,6 +24,24 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Native Messaging frames are raw binary: a 4-byte little-endian length followed
+# by UTF-8 JSON. When the console code page is 65001, [Console]::InputEncoding
+# defaults to a BOM-emitting UTF8Encoding, and .NET Process.StandardInput writes
+# that BOM (EF BB BF) into the child's stdin on first use. The host then reads
+# EF BB BF 0F as its length prefix and rejects it as "message too large".
+# Firefox never sends a BOM, so the host is correct to reject it; the test
+# harness must switch to a BOM-free UTF-8 encoding while a host is running and
+# restore the original value afterwards.
+$script:origInputEncoding = [Console]::InputEncoding
+function Set-HostStdinEncodingNoBom {
+    [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+}
+function Restore-ConsoleInputEncoding {
+    if ($null -ne $script:origInputEncoding) {
+        [Console]::InputEncoding = $script:origInputEncoding
+    }
+}
+
 # ---------------------------------------------------------------------------
 # SERVER MODE: deterministic 3 MiB loopback file with Range support.
 # Records one line per request with header *presence* flags (never values).
@@ -220,6 +238,9 @@ function Invoke-Cleanup {
             if (-not $script:nmProc.WaitForExit(3000)) { $script:nmProc.Kill() }
         } catch { }
     }
+    # All host processes are done; restore the console input encoding captured
+    # at startup so the harness leaves no global state changed behind.
+    Restore-ConsoleInputEncoding
     if ($script:serverPid -ne 0) {
         try { Stop-Process -Id $script:serverPid -Force -ErrorAction SilentlyContinue } catch { }
     }
@@ -410,6 +431,7 @@ c.close()
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $false
     $psi.EnvironmentVariables['IDM_RS_DB'] = $script:db
+    Set-HostStdinEncodingNoBom
     $script:nmProc = [System.Diagnostics.Process]::Start($psi)
 
     Send-Frame $script:nmProc ([ordered]@{ type = 'ping' })
@@ -514,6 +536,7 @@ c.close()
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $false
     $psi.EnvironmentVariables['IDM_RS_DB'] = $script:db
+    Set-HostStdinEncodingNoBom
     $script:nmProc = [System.Diagnostics.Process]::Start($psi)
     Send-Frame $script:nmProc ([ordered]@{
         type = 'enqueue'; url = $url; referrer = $referrer
