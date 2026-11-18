@@ -143,23 +143,36 @@ Write-Host "PASS"
 Step-Command -Name "cargo fmt --all -- --check" -ScriptBlock { cargo fmt --all -- --check }
 
 # ---------------------------------------------------------------------------
-# STEP 4/5: desktop frontend build (npm ci + npm run build).
+# STEP 4/5: desktop frontend build + lockfile guard.
 #           Runs before the workspace cargo steps because
 #           tauri::generate_context!() reads apps/idm-desktop/dist at compile
 #           time; a fresh checkout has no dist, so cargo check/test/clippy
 #           --workspace would fail without it. (Per task Phase 5a-2 step 4.6:
 #           moved ahead of the former STEP 4.)
+#
+#           STEP 4 avoids bulk-delete of an existing node_modules (which trips
+#           the safe-delete guard at >500 files): when node_modules is absent
+#           run `npm ci`; when present run `npm install` (no bulk delete).
+#           Either way package-lock.json must remain unchanged (git diff guard).
 # ---------------------------------------------------------------------------
 $env:Path = "C:\Program Files\nodejs;$env:Path"
 $desktopDir = Join-Path (Get-Location) 'apps/idm-desktop'
 Push-Location $desktopDir
 try {
-    Step-Command -Name "npm ci --prefer-offline" -ScriptBlock { npm ci --prefer-offline }
+    $nodeModulesDir = Join-Path $desktopDir 'node_modules'
+    if (Test-Path $nodeModulesDir) {
+        Step-Command -Name "npm install --prefer-offline --no-audit --no-fund" -ScriptBlock { npm install --prefer-offline --no-audit --no-fund }
+    }
+    else {
+        Step-Command -Name "npm ci --prefer-offline" -ScriptBlock { npm ci --prefer-offline }
+    }
     Step-Command -Name "npm run build" -ScriptBlock { npm run build }
 }
 finally {
     Pop-Location
 }
+# git pathspec is relative to the repo root, so run this after leaving $desktopDir.
+Step-Command -Name "git diff --exit-code apps/idm-desktop/package-lock.json" -ScriptBlock { git diff --exit-code apps/idm-desktop/package-lock.json }
 
 # ---------------------------------------------------------------------------
 # STEP 5: cargo check --workspace --all-targets --locked

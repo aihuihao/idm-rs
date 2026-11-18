@@ -3,11 +3,12 @@
 use crate::net::Url;
 
 /// 校验 URL：总长 ≤ 8 KiB、不含空白字符/控制字符、scheme 只能是 http/https、
-/// `host_str()` 必须非空、不得携带 userinfo（用户名或密码）。
-/// 内网单标签主机名（如 `nas`）合法。
+/// `host_str()` 必须非空、authority 不得为空（`http:///x`）、不得携带 userinfo
+/// （用户名或密码）。内网单标签主机名（如 `nas`）合法。
 ///
-/// 使用 `crate::net::Url`（reqwest/url crate）而非手写字符串切分，可正确拒绝
-/// `http://a b/`、`http://:80/`、`http://[::1/` 等畸形 authority。
+/// 使用 `crate::net::Url`（reqwest/url crate）做解析，可正确拒绝
+/// `http://a b/`、`http://:80/`、`http://[::1/` 等畸形 authority；
+/// `http:///x` 因 url crate 会规范化出 host，额外在解析前按原串拦截。
 /// 错误信息一律是固定字符串、不含 URL 本身，凭据既不会入库也不会进入日志。
 pub fn validate_url(url: &str) -> Result<Url, String> {
     if url.len() > 8 * 1024 {
@@ -15,6 +16,14 @@ pub fn validate_url(url: &str) -> Result<Url, String> {
     }
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("url contains whitespace or control characters".to_string());
+    }
+    // url crate 会把 `http:///x` 规范化成 `http://x/` 并给出非空 host，
+    // 但这类输入的 authority 在原串中为空，必须在解析前拒绝（host 入口也受益）。
+    if url
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.starts_with('/'))
+    {
+        return Err("url must have a host".to_string());
     }
     let parsed =
         Url::parse(url).map_err(|_| "url must be a valid http(s) URL with a host".to_string())?;
@@ -68,5 +77,18 @@ mod url_tests {
         // 无 userinfo 的内网主机名 / 普通 URL 仍允许。
         assert!(validate_url("http://nas/file.zip").is_ok());
         assert!(validate_url("http://example.com/x").is_ok());
+    }
+
+    /// authority 为空的 URL（url crate 会规范化出 host）也必须被拒绝。
+    #[test]
+    fn validate_url_rejects_empty_authority() {
+        assert_eq!(
+            validate_url("http:///x").err().as_deref(),
+            Some("url must have a host")
+        );
+        assert_eq!(
+            validate_url("https:///path").err().as_deref(),
+            Some("url must have a host")
+        );
     }
 }

@@ -20,7 +20,7 @@ use idm_core::error::Error;
 use idm_core::net::client::validate_extra_headers;
 use idm_core::net::filename::sanitize_windows_filename;
 use idm_core::net::validate_url;
-use idm_core::store::{QueuedTask, Store, default_db_path};
+use idm_core::store::{QueuedTask, Store, default_db_path, default_download_dir};
 use idm_ipc::frame::{ReadFrame, read_frame, write_frame};
 use serde_json::{Value, json};
 
@@ -270,18 +270,6 @@ async fn handle_enqueue(v: &Value, db: &Store) -> Result<Value, String> {
             );
             Err(format!("enqueue failed: {e}"))
         }
-    }
-}
-
-/// 默认下载目录：`%USERPROFILE%\Downloads\idm-rs`。
-fn default_download_dir() -> String {
-    match std::env::var("USERPROFILE") {
-        Ok(p) => PathBuf::from(p)
-            .join("Downloads")
-            .join("idm-rs")
-            .to_string_lossy()
-            .into_owned(),
-        Err(_) => PathBuf::from(".").to_string_lossy().into_owned(),
     }
 }
 

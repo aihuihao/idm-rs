@@ -725,6 +725,19 @@ pub fn default_db_path() -> Result<PathBuf> {
     Ok(base.join("idm-rs").join("idm.db"))
 }
 
+/// 默认下载目录：`%USERPROFILE%\Downloads\idm-rs`。
+/// 从 idm-nmhost 原样上移，供 host 与桌面服务层共用。
+pub fn default_download_dir() -> String {
+    match std::env::var("USERPROFILE") {
+        Ok(p) => PathBuf::from(p)
+            .join("Downloads")
+            .join("idm-rs")
+            .to_string_lossy()
+            .into_owned(),
+        Err(_) => PathBuf::from(".").to_string_lossy().into_owned(),
+    }
+}
+
 fn open_connection(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path).map_err(db_err)?;
     conn.pragma_update(None, "journal_mode", "WAL")

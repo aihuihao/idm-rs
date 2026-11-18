@@ -32,3 +32,23 @@
 - 最终回归：e2e ×3 全 PASS（exit 0,0,0；ping version=0.1.0、ALL ASSERTIONS PASSED）；verify-workspace 从全新环境跑通 19 步全 PASS、退出码 0（STEP 14/15 扩展后仍 PASS）。fmt/clippy/test 此前已 PASS（Rust 代码此后未改）。
 - 环境备注：npm ci 删除残留 node_modules（509 文件 > 护栏阈值 500）时被 safe-delete 护栏拦截一次；用 Python rmtree 清理后 npm ci 与 verify 均正常。非代码问题。
 - 步骤 6（提交）：只暂存 `docs apps scripts Cargo.toml Cargo.lock .gitignore`，提交 `phase5a-2: desktop scaffold`（hash 878fcfb）。未 push、未打 tag。
+
+# Phase 5a-3 进度记录
+
+- 步骤 0（前置）：裸 `node -v` = v26.13.1（未补路径，PATH 已修复，满足规则 1）。初始 git status 不干净：`apps/idm-desktop/src-tauri/Cargo.toml` 有 Tauri CLI 自动规范化改动（tauri/tauri-build 加 `features = []`，语义等价）。用户裁决保留并单独提交：提交前 `cargo check -p idm-desktop --locked` PASS、Cargo.lock 无变化；提交 `chore: tauri cli normalizes Cargo.toml`（hash be26add）。提交后 git status 干净。任务原文已保存为 docs/prompts/phase5a-3.md。
+- 步骤 1（顺手清理）：`.gitignore` 加入 `apps/idm-desktop/src-tauri/gen/schemas`；`git rm -r --cached` 移出索引 4 个自动生成文件（acl-manifests.json、capabilities.json、desktop-schema.json、windows-schema.json），本地文件保留。完成。
+- 步骤 2-3 前置调研：确认 `DownloadQueue::set_max_concurrent_tasks(n)`（1..=16，运行中可改、调小不中断在跑任务）与 `set_global_max_speed(Option<u64>)` 均为公开 API，故第 3 步 max-tasks 阻塞分支不触发。Store 无 pause/resume/remove，需组合 DownloadQueue 的 pause/resume_queued + Store 的 get_task/delete_task；list_tasks 摘要不含 url，需按 id 补 get_task 生成脱敏 url_display；速度取自 queue.progress(id).speed。
+- 步骤 2（工程结构）：Cargo.toml 增 `idm-core`（path）与 `tokio`（workspace，features rt-multi-thread/macros/sync/time/net/io-util）；新建 lib.rs 导出 service/throttle，二者不引用 tauri；main.rs 保留启动职责。离线 `cargo check -p idm-desktop --lib` PASS。Cargo.lock 仅在 idm-desktop 依赖列表新增 idm-core/tokio 两行，无包版本变化。
+- 步骤 3（service 模块）：按指定接口实现 ServiceError（Display+Serialize 为字符串）、TaskView、Settings、DesktopService 全部方法；URL 校验用 validate_url、脱敏用 Url 解析只留 scheme://host[:port]/path；global-max-speed/max-tasks 修改后立即调用队列接口生效；观察模式写操作返回 ReadOnly。`cargo check -p idm-desktop --lib --offline` PASS。
+- 步骤 4（throttle 模块）：实现 Throttle，相同内容或间隔不足不发、否则记录并推送。`cargo check` PASS。
+- 步骤 5（Tauri 薄包装）：main.rs 用默认 DB 路径（IDM_RS_DB 覆盖）open service，失败 stderr+非0 退出；commands.rs 注册 8 个同名命令（shutdown 除外）+ is_read_only，仅转发；后台每 250ms list_tasks→JSON→Throttle(250ms)→emit `tasks-updated`（因 tauri emit 要求 Clone，发序列化 JSON 字符串）；退出 RunEvent::Exit 时 shutdown；capabilities 保持 core:default。`cargo check -p idm-desktop --all-targets --offline` PASS。
+- 步骤 6（测试）：tests/desktop_service.rs 放 11 个测试，复用 idm-core support（仅依赖 tokio，已声明）、用 std 自建临时目录（不新增依赖）。两处修正：① validate_url 会把 `http:///x` 规范化放行，add_task 补充 authority 非空检查使其返回 InvalidInput；② remove 测试改为独立慢速服务器(32KiB/s)确保暂停时任务仍活动。修正与本文不一致，记入报告。11 个测试各单独连续运行 10 次全部 PASS（PASS=10 FAIL=0）。
+- 步骤 7（验证前半）：`cargo fmt --all` 应用后 `--check` PASS；`cargo clippy --workspace --all-targets --locked -- -D warnings` PASS。verify-workspace 与 e2e 待跑。
+- 步骤 7 阻塞点（verify STEP 4）：`scripts/verify-workspace.ps1` 跑到 STEP 4 `npm ci --prefer-offline` 返回 FAIL(exit=1)。诊断：手动 `npm ci` 在 node_modules 为空时成功（added 53 packages）；在 node_modules 完整（509 文件）时报错 `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] count=509 threshold=500`，确认为安全护栏拦截删除 node_modules（与 Phase 5a-2 同类）。按任务规则 4 及第 7.3 条，立即停下报告，未用 Python rmtree 等换方式绕过。e2e 未跑。未提交。
+- 用户后续裁决：护栏由用户手动删除 node_modules 处理；要求本轮再改四处并重跑。以下为补充改动记录。
+- 补充 1（verify STEP 4）：改为 node_modules 不存在时 `npm ci --prefer-offline`、存在时 `npm install --prefer-offline --no-audit --no-fund`，两种情况都不触发批量删除；新增 `git diff --exit-code apps/idm-desktop/package-lock.json` 守卫（放在 Pop-Location 之后，因 pathspec 相对仓库根）。锁文件有变化即 FAIL。
+- 补充 2（默认下载目录）：把 idm-nmhost 的 `default_download_dir()`（`%USERPROFILE%\Downloads\idm-rs`）原样上移到 `idm_core::store` 公开导出；host 改调用它并删除本地定义；DesktopService::read_settings 未设置 download-dir 时改用它，删除 current_dir_string。新增桌面测试 `default_download_dir_when_unset`。
+- 补充 3（http:///x）：检查从 DesktopService::add_task 移到 `idm_core::net::validate_url`（解析前按原串拦截 authority 为空），add_task 只调用 validate_url；url_check.rs 新增 `validate_url_rejects_empty_authority` 用例并更新文档注释。
+- 补充 4（10 次验证）：invalid_url_rejected、default_download_dir_when_unset 及 url_check 的 3 个测试各单独连续 10 次，全部 PASS=10 FAIL=0。`cargo check --workspace --all-targets --locked` PASS。
+- 补充 5（整体验证）：`cargo fmt --all -- --check` PASS；`cargo clippy --workspace --all-targets --locked -- -D warnings` PASS。verify-workspace.ps1 全 20 步 PASS（退出码 0）：第 1 次 node_modules 不存在走 npm ci 分支，第 2 次已存在走 npm install 分支，两次 `git diff --exit-code apps/idm-desktop/package-lock.json` 均 exit 0、锁文件无变化，均未触发批量删除护栏。`scripts/phase4b-e2e.ps1` 运行 1 次 PASS（ALL ASSERTIONS PASSED，0 残留进程，退出码 0）。
+- 步骤 8（提交）：待提交 `phase5a-3: desktop service layer`。注意提交范围除原文列出的 docs/apps/scripts/Cargo.toml/Cargo.lock/.gitignore 外，还含本轮用户明确要求的 crates/idm-core（validate_url 修复 + default_download_dir）与 crates/idm-ipc（host 改用公开函数）。
