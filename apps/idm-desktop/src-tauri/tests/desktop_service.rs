@@ -602,3 +602,65 @@ async fn shutdown_pauses_active_task() -> TestResult {
     srv.shutdown();
     Ok(())
 }
+
+// --- 12：删除正在下载的任务（Phase 5a-4 第 1 步）-------------------------
+
+#[tokio::test]
+async fn remove_active_task() -> TestResult {
+    let tmp = TempDir::new()?;
+    let size = 256 * KIB;
+    let slow_srv = start(ServerConfig {
+        size,
+        speed: Some(SpeedPolicy(Arc::new(|_, _| Some(16 * KIB)))),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let fast_srv = start(ServerConfig {
+        size,
+        ..ServerConfig::default()
+    })
+    .await?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db.clone()).await?;
+    let id = svc.add_task(slow_srv.url("/active.bin"), Some(1)).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.downloaded > 0),
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    svc.remove_task(id, true).await?;
+
+    assert!(
+        svc.list_tasks().await?.iter().all(|t| t.id != id),
+        "删除后任务应从列表消失"
+    );
+    assert!(
+        !download.join("active.bin.idm-part").exists(),
+        "删除活动任务应移除 .idm-part"
+    );
+    assert!(
+        !download.join("active.bin").exists(),
+        "delete_file=true 应移除最终文件"
+    );
+
+    // 删除活动任务后，再添加新任务仍能正常下载完成。
+    let id2 = svc.add_task(fast_srv.url("/after.bin"), Some(1)).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id2 && t.state == "Completed"),
+        Duration::from_secs(30),
+    )
+    .await?;
+    verify_bytes(&download.join("after.bin"), size)?;
+
+    slow_srv.shutdown();
+    fast_srv.shutdown();
+    svc.shutdown().await?;
+    Ok(())
+}

@@ -5,7 +5,7 @@ use tauri::State;
 use idm_desktop::service::{DesktopService, ServiceError, Settings, TaskView};
 
 pub(crate) struct AppState {
-    pub(crate) service: tokio::sync::Mutex<Option<DesktopService>>,
+    pub(crate) service: std::sync::Arc<tokio::sync::Mutex<Option<DesktopService>>>,
 }
 
 fn closed() -> ServiceError {

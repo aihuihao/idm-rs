@@ -4,12 +4,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::watch;
 
 use idm_core::disk::AllocationStrategy;
 use idm_core::net::{ProxyConfig, Url, parse_max_speed, validate_url};
 use idm_core::queue::{DownloadQueue, EnqueueRequest};
 use idm_core::runner::{Runner, RunnerConfig, RunnerStartError};
-use idm_core::store::{PauseReasonDb, Store, default_download_dir};
+use idm_core::store::{PauseReasonDb, Store, TaskStateDb, default_download_dir};
 
 const DEFAULT_MAX_TASKS: usize = 3;
 const DEFAULT_CONNECTIONS: usize = 8;
@@ -272,6 +275,24 @@ impl DesktopService {
             return Err(ServiceError::ReadOnly);
         }
         let record = self.store.get_task(id).await.map_err(internal)?;
+        // 活动/排队中的任务先经队列停下：pause 对活动任务会取消并等待收尾，
+        // 对排队任务直接置 Paused(User)。已终态任务 pause 会返回 Err，忽略即可。
+        if let Some(queue) = self.runner.as_ref().map(Runner::queue) {
+            if matches!(
+                record.state,
+                TaskStateDb::Queued
+                    | TaskStateDb::Downloading
+                    | TaskStateDb::Probing
+                    | TaskStateDb::Finalizing
+            ) {
+                let _ = queue.pause(id).await;
+            }
+            // pause 返回后活动任务已收尾；再轮询确认它确实退出活动表（带超时）。
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while queue.progress(id).await.is_some() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
         let part_path = self.store.delete_task(id).await.map_err(internal)?;
         if delete_file {
             if let Some(part) = part_path {
@@ -338,6 +359,21 @@ impl DesktopService {
             .set_max_concurrent_tasks(s.max_tasks)
             .map_err(internal)?;
         Ok(())
+    }
+
+    /// 等待运行器停止：运行器模式等待 Runner 的停止信号；
+    /// 观察模式（无 Runner）永不返回。
+    pub async fn wait_stopped(&self) {
+        match &self.runner {
+            Some(runner) => runner.wait_stopped().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// 返回运行器停止信号的接收端副本（运行器模式），供后台任务独立等待。
+    /// 观察模式返回 None。
+    pub fn stopped_receiver(&self) -> Option<watch::Receiver<bool>> {
+        self.runner.as_ref().map(Runner::stopped_receiver)
     }
 
     /// 安全停止：运行器模式下由 Runner::stop 取消活动任务为 Paused(User) 并释放锁。

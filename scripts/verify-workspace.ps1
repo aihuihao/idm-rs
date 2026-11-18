@@ -414,6 +414,63 @@ Step-Command -Name "cargo test -p idm-cli --test crash_resume --locked -- --igno
 Step-Command -Name "cargo build -p idm-desktop --locked" -ScriptBlock { cargo build -p idm-desktop --locked }
 
 # ---------------------------------------------------------------------------
+# STEP 18 (Phase 5a-4): frontend must not contain dangerous patterns
+#   (v-html / innerHTML / eval( / new Function) in .vue and .ts files.
+# ---------------------------------------------------------------------------
+Step-Check -Name "static: frontend has no dangerous patterns" -ScriptBlock {
+    $root = Join-Path (Get-Location) 'apps/idm-desktop/src'
+    $files = @(Get-ChildItem -Path $root -Recurse -File | Where-Object { $_.Extension -in '.vue', '.ts' })
+    $patterns = @('v-html', 'innerHTML', 'eval\(', 'new Function')
+    foreach ($file in $files) {
+        foreach ($pattern in $patterns) {
+            $hit = Select-String -Path $file.FullName -Pattern $pattern -SimpleMatch:$false -Quiet
+            if ($hit) {
+                Write-Host "  forbidden pattern '$pattern' in $($file.FullName)"
+                return $false
+            }
+        }
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+# STEP 19 (Phase 5a-4): tauri.conf.json CSP starts with "default-src 'self'".
+# ---------------------------------------------------------------------------
+Step-Check -Name "static: tauri CSP starts with default-src 'self'" -ScriptBlock {
+    $confPath = Join-Path (Get-Location) 'apps/idm-desktop/src-tauri/tauri.conf.json'
+    $conf = Get-Content -Raw $confPath | ConvertFrom-Json
+    $csp = $conf.app.security.csp
+    if ($null -eq $csp) {
+        Write-Host "  csp is missing"
+        return $false
+    }
+    if (-not $csp.StartsWith("default-src 'self'")) {
+        Write-Host "  csp does not start with default-src 'self': $csp"
+        return $false
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+# STEP 20 (Phase 5a-4): every capabilities json grants only core:default.
+# ---------------------------------------------------------------------------
+Step-Check -Name "static: capabilities grant only core:default" -ScriptBlock {
+    $capDir = Join-Path (Get-Location) 'apps/idm-desktop/src-tauri/capabilities'
+    $files = @(Get-ChildItem -Path $capDir -File -Filter '*.json')
+    foreach ($file in $files) {
+        $json = Get-Content -Raw $file.FullName | ConvertFrom-Json
+        $perms = @($json.permissions)
+        foreach ($perm in $perms) {
+            if ($perm -ne 'core:default') {
+                Write-Host "  unexpected permission '$perm' in $($file.Name)"
+                return $false
+            }
+        }
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Host "=============================================="

@@ -246,6 +246,11 @@ impl Runner {
         &self.queue
     }
 
+    /// 返回停止信号的接收端副本，供调用方在不持有 Runner 引用的情况下等待停机。
+    pub fn stopped_receiver(&self) -> watch::Receiver<bool> {
+        self.stopped_rx.clone()
+    }
+
     /// 等待直到运行器因 `runner.stop` 文件（或主动 stop）而停止。
     pub async fn wait_stopped(&self) {
         let mut rx = self.stopped_rx.clone();

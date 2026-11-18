@@ -52,3 +52,13 @@
 - 补充 4（10 次验证）：invalid_url_rejected、default_download_dir_when_unset 及 url_check 的 3 个测试各单独连续 10 次，全部 PASS=10 FAIL=0。`cargo check --workspace --all-targets --locked` PASS。
 - 补充 5（整体验证）：`cargo fmt --all -- --check` PASS；`cargo clippy --workspace --all-targets --locked -- -D warnings` PASS。verify-workspace.ps1 全 20 步 PASS（退出码 0）：第 1 次 node_modules 不存在走 npm ci 分支，第 2 次已存在走 npm install 分支，两次 `git diff --exit-code apps/idm-desktop/package-lock.json` 均 exit 0、锁文件无变化，均未触发批量删除护栏。`scripts/phase4b-e2e.ps1` 运行 1 次 PASS（ALL ASSERTIONS PASSED，0 残留进程，退出码 0）。
 - 步骤 8（提交）：已提交 `phase5a-3: desktop service layer`（hash 325b9c4），工作区干净。提交范围除原文列出的 docs/apps/scripts/Cargo.toml/Cargo.lock/.gitignore 外，还含本轮用户明确要求的 crates/idm-core（validate_url 修复 + default_download_dir）与 crates/idm-ipc（host 改用公开函数）。未 push、未打 tag、未 amend。
+
+# Phase 5a-4 进度记录
+
+- 步骤 0（保存任务原文 + git status 检查）：完成。git status 干净（HEAD af84872），任务原文已保存为 docs/prompts/phase5a-4.md。
+- 步骤 1（删除活动任务）：remove_task 在删除前对活动/排队任务调用 `DownloadQueue::pause`（活动任务取消并等待收尾、排队任务置 Paused(User)），再轮询 `queue.progress(id)` 确认退出活动表（5s 超时）后才删记录与文件。新增 remove_active_task 测试，单次运行 PASS。
+- 步骤 2（运行器停止退出）：给 idm-core 的 Runner 增加 `stopped_receiver()` getter；DesktopService 新增 `wait_stopped(&self)`（观察模式 pending 永不返回）与 `stopped_receiver()`；main.rs 后台等待停止信号→shutdown→exit。
+- 步骤 3（托盘与窗口）：tauri 开启 tray-icon feature（Cargo.lock 未变化，新增包 0）；托盘用默认应用图标、tooltip `idm-rs`、左键切换窗口、右键菜单「显示主窗口/退出」、退出走 shutdown；关闭按钮只隐藏窗口；capabilities 保持 core:default。AppState.service 改为 Arc 以便共享。离线 `cargo check -p idm-desktop --all-targets` PASS。
+- 步骤 4（前端界面）：App.vue 全部中文——观察模式黄色横幅（禁用所有操作）、添加栏（错误红字/成功清空）、任务表格 7 列（大小/速度自动换算、进度条、ETA、中文状态、操作按钮按状态可用）、自定义删除确认框（含"同时删除已下载的文件"复选框默认不勾）、可折叠设置面板（保存失败红字）、启动 list_tasks + 监听 tasks-updated（JSON.parse 字符串）。纯 CSS。`npm run build`（vue-tsc --noEmit && vite build）PASS。
+- 步骤 5（静态检查）：verify-workspace.ps1 新增三道静态检查（实际编号 STEP 21/22/23，因脚本 stepNumber 动态累加）——前端禁用模式扫描、CSP 以 default-src 'self' 开头、capabilities 权限仅 core:default，各自独立成步。
+- 步骤 6（验证）：remove_active_task 单独连续 10 次 PASS=10 FAIL=0；13 个桌面测试（原 12 + 新增 1）全部各运行 1 次 PASS。`cargo fmt --all -- --check` PASS；`cargo clippy --workspace --all-targets --locked -- -D warnings` PASS；Cargo.lock 无变化（tray-icon 等包已在 lock 中，新增包 0）。verify-workspace.ps1 全 23 步 PASS（退出码 0，含 3 道静态检查）；phase4b-e2e.ps1 运行 1 次 PASS（ALL ASSERTIONS PASSED，0 残留，退出码 0）。
