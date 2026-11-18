@@ -471,6 +471,39 @@ Step-Check -Name "static: capabilities grant only core:default" -ScriptBlock {
 }
 
 # ---------------------------------------------------------------------------
+# STEP 21 (phase5a-4-fix): invoke() argument objects must use camelCase keys.
+#   Tauri 2 converts Rust snake_case command params to camelCase, so a JS key
+#   with an underscore is silently rejected. Scan only the { ... } argument
+#   object on lines that call invoke(); command names and nested payload fields
+#   (e.g. Settings.download_dir) are not command params and are left alone.
+# ---------------------------------------------------------------------------
+Step-Check -Name "static: invoke args use camelCase (no snake_case keys)" -ScriptBlock {
+    $root = Join-Path (Get-Location) 'apps/idm-desktop/src'
+    $files = @(Get-ChildItem -Path $root -Recurse -File | Where-Object { $_.Extension -in '.vue', '.ts' })
+    $bad = @()
+    foreach ($file in $files) {
+        $lineNo = 0
+        foreach ($line in (Get-Content $file.FullName)) {
+            $lineNo++
+            if ($line -match 'invoke') {
+                $braceIdx = $line.IndexOf('{')
+                if ($braceIdx -ge 0) {
+                    $argPart = $line.Substring($braceIdx)
+                    if ($argPart -match '\b[a-zA-Z_][a-zA-Z0-9_]*_[a-zA-Z0-9_]*\s*:') {
+                        $bad += "$($file.Name):$lineNo key='$($Matches[0])'"
+                    }
+                }
+            }
+        }
+    }
+    if ($bad.Count -gt 0) {
+        $bad | ForEach-Object { Write-Host "  snake_case invoke arg $_" }
+        return $false
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Host "=============================================="

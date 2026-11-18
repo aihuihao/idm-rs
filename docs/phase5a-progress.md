@@ -62,3 +62,9 @@
 - 步骤 4（前端界面）：App.vue 全部中文——观察模式黄色横幅（禁用所有操作）、添加栏（错误红字/成功清空）、任务表格 7 列（大小/速度自动换算、进度条、ETA、中文状态、操作按钮按状态可用）、自定义删除确认框（含"同时删除已下载的文件"复选框默认不勾）、可折叠设置面板（保存失败红字）、启动 list_tasks + 监听 tasks-updated（JSON.parse 字符串）。纯 CSS。`npm run build`（vue-tsc --noEmit && vite build）PASS。
 - 步骤 5（静态检查）：verify-workspace.ps1 新增三道静态检查（实际编号 STEP 21/22/23，因脚本 stepNumber 动态累加）——前端禁用模式扫描、CSP 以 default-src 'self' 开头、capabilities 权限仅 core:default，各自独立成步。
 - 步骤 6（验证）：remove_active_task 单独连续 10 次 PASS=10 FAIL=0；13 个桌面测试（原 12 + 新增 1）全部各运行 1 次 PASS。`cargo fmt --all -- --check` PASS；`cargo clippy --workspace --all-targets --locked -- -D warnings` PASS；Cargo.lock 无变化（tray-icon 等包已在 lock 中，新增包 0）。verify-workspace.ps1 全 23 步 PASS（退出码 0，含 3 道静态检查）；phase4b-e2e.ps1 运行 1 次 PASS（ALL ASSERTIONS PASSED，0 残留，退出码 0）。
+
+# phase5a-4-fix 进度记录
+
+- 修复（invoke 参数驼峰）：用户手动验收发现点删除报错 `command remove_task missing required key deleteFile`——Tauri 2 默认把 Rust snake_case 参数转为 camelCase，前端传的 `delete_file` 不匹配。App.vue:283 改为 `deleteFile`。逐一核对全部 invoke：list_tasks/is_read_only/get_settings 无参数；add_task={url,connections}；pause_task/resume_task={id}；remove_task={id,deleteFile}；set_settings={settings}——均符合驼峰约定。
+- 静态检查（invoke 参数键名）：verify-workspace.ps1 新增 STEP 21 "static: invoke args use camelCase (no snake_case keys)"，扫描 .vue/.ts 中含 invoke 行的 `{...}` 参数对象，出现带下划线键名即 FAIL；修复前单独运行该逻辑确认检出 `App.vue:283 key='delete_file:'`，修复后应 PASS。
+- 待办问题（本次不修，留到 5b 统一）：同名文件改名存在两种格式。经全仓库搜索，仓库内只有一套改名逻辑：① `crates/idm-core/src/net/filename.rs:60 resolve_conflict()`，用 `split_ext()`（rfind('.')）产生 `bash-5.2.tar (1).gz`（序号在最后一个点前，带空格）。② 另一路并非仓库内算法，而是 Firefox 扩展 `extensions/firefox/background.js:112-119` 把浏览器已唯一化的 `item.filename`（形如 `bash-5.2(1).tar.gz`）透传，经 `crates/idm-ipc/src/bin/idm-nmhost.rs:217-224` 仅做 sanitize_windows_filename（保留其中 `(1)`），再由 resolve_conflict 在未占用时原样返回。5b 需在 host filename 入口统一规范化。

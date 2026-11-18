@@ -280,7 +280,7 @@ async function onConfirmRemove(): Promise<void> {
   if (!target) return;
   confirmError.value = '';
   try {
-    await invoke('remove_task', { id: target.id, delete_file: deleteFile.value });
+    await invoke('remove_task', { id: target.id, deleteFile: deleteFile.value });
     confirmTarget.value = null;
     await refreshTasks();
   } catch (err) {
