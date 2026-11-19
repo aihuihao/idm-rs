@@ -211,6 +211,35 @@ fn runner_install_uninstall_status() -> TestResult {
     Ok(())
 }
 
+/// Phase 5b-1：autostart 迁移到 idm-core 后，CLI 的 runner install/uninstall 行为不变。
+#[test]
+fn runner_install_still_works() -> TestResult {
+    let f = fixture()?;
+    let name = unique_value_name()?;
+    let _guard = RunGuard::new(name.clone());
+
+    let installed = runner(&f, &["install", "--name", &name])?;
+    assert!(
+        installed.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let q = reg_query_value(&name)?;
+    assert!(q.status.success(), "install 后 Run 值应存在");
+    let val = String::from_utf8_lossy(&q.stdout);
+    assert!(
+        val.contains("queue run --watch"),
+        "值应含 queue run --watch: {val}"
+    );
+    assert!(val.contains("idm-cli.exe"), "值应含 cli 路径: {val}");
+
+    let uninstalled = runner(&f, &["uninstall", "--name", &name])?;
+    assert!(uninstalled.status.success());
+    let q2 = reg_query_value(&name)?;
+    assert!(!q2.status.success(), "uninstall 后 Run 值应不存在");
+    Ok(())
+}
+
 // --- 2. runner start / stop ------------------------------------------------
 
 #[test]

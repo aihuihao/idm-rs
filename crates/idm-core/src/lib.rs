@@ -31,6 +31,10 @@ pub mod queue;
 #[cfg(windows)]
 pub mod runner;
 
+/// 开机启动项管理（Phase 5b-1，从 CLI 的 runner 模块上移）。
+#[cfg(windows)]
+pub mod autostart;
+
 /// SQLite 状态持久化：独立线程持有连接、迁移、检查点与启动恢复。
 pub mod store;
 

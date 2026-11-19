@@ -268,14 +268,14 @@ mod bench {
 /// stop 通过数据目录的 `runner.stop` 哨兵文件请求安全停止。只用 `reg.exe` 写 HKCU。
 #[cfg(windows)]
 mod runner {
+    use idm_core::autostart;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     const DEFAULT_NAME: &str = "idm-rs-runner";
-    const REG_RUN: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
     // Windows 进程创建标志。
     const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -353,18 +353,9 @@ mod runner {
         Ok(Opts { name, db: db_path })
     }
 
-    /// 值名只允许字母数字、`-`、`_`，防止注入 reg.exe 参数。
+    /// 值名校验委托给 idm-core::autostart，防止注入 reg.exe 参数。
     fn validate_name(s: &str) -> Result<(), String> {
-        if s.is_empty() {
-            return Err("value name must not be empty".to_string());
-        }
-        if !s
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err("value name may contain only letters, digits, '-' and '_'".to_string());
-        }
-        Ok(())
+        autostart::validate_name(s)
     }
 
     fn absolute(p: &Path) -> Result<PathBuf, String> {
@@ -374,13 +365,6 @@ mod runner {
             let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
             Ok(cwd.join(p))
         }
-    }
-
-    fn reg(args: &[&str]) -> Result<Output, String> {
-        Command::new("reg")
-            .args(args)
-            .output()
-            .map_err(|e| e.to_string())
     }
 
     fn lock_path(db: &Path) -> PathBuf {
@@ -430,40 +414,27 @@ mod runner {
         let opts = parse(args)?;
         let exe = current_exe()?;
         let value = run_value(&exe, &opts.db);
-        let out = reg(&[
-            "add", REG_RUN, "/v", &opts.name, "/t", "REG_SZ", "/d", &value, "/f",
-        ])?;
-        if !out.status.success() {
-            return Err(format!(
-                "reg add failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
+        autostart::install(&opts.name, &value)?;
         println!("runner autostart installed: {} = {}", opts.name, value);
         Ok(0)
     }
 
     fn uninstall(args: &[String]) -> Result<i32, String> {
         let opts = parse(args)?;
-        let out = reg(&["delete", REG_RUN, "/v", &opts.name, "/f"])?;
-        // 值本来就不存在时 reg 返回非零，但卸载语义上是幂等成功。
+        autostart::uninstall(&opts.name)?;
         println!("runner autostart uninstalled: {}", opts.name);
-        let _ = out;
         Ok(0)
     }
 
     fn status(args: &[String]) -> Result<i32, String> {
         let opts = parse(args)?;
-        let out = reg(&["query", REG_RUN, "/v", &opts.name])?;
-        let registered = out.status.success();
+        let raw = autostart::raw_query(&opts.name);
+        let registered = raw.is_some();
         println!("value_name: {}", opts.name);
-        println!("registry_key: {REG_RUN}");
+        println!("registry_key: {}", autostart::REG_RUN);
         println!("autostart_registered: {registered}");
         if registered {
-            println!(
-                "registry_value: {}",
-                String::from_utf8_lossy(&out.stdout).trim()
-            );
+            println!("registry_value: {}", raw.unwrap_or_default());
         }
         let lock = lock_path(&opts.db);
         println!("runner_lock: {}", lock.display());

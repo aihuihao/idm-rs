@@ -63,6 +63,20 @@ pub(crate) async fn remove_task(
 }
 
 #[tauri::command]
+pub(crate) async fn reveal_task(id: i64, state: State<'_, AppState>) -> Result<(), ServiceError> {
+    let guard = state.service.lock().await;
+    let service = guard.as_ref().ok_or_else(closed)?;
+    service.reveal_task(id).await
+}
+
+#[tauri::command]
+pub(crate) async fn clear_completed(state: State<'_, AppState>) -> Result<usize, ServiceError> {
+    let guard = state.service.lock().await;
+    let service = guard.as_ref().ok_or_else(closed)?;
+    service.clear_completed().await
+}
+
+#[tauri::command]
 pub(crate) async fn get_settings(state: State<'_, AppState>) -> Result<Settings, ServiceError> {
     let guard = state.service.lock().await;
     let service = guard.as_ref().ok_or_else(closed)?;

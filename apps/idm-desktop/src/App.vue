@@ -6,7 +6,10 @@
       后台运行器正在运行，界面为只读。请先执行 idm-cli runner stop 后重启本程序。
     </div>
 
-    <div v-if="fatalError" class="error-banner">{{ fatalError }}</div>
+    <div v-if="fatalError" class="error-banner">
+      <span>{{ fatalError }}</span>
+      <button class="error-close" @click="dismissFatalError">×</button>
+    </div>
 
     <section class="add-bar">
       <input
@@ -19,6 +22,10 @@
       <button :disabled="readOnly || !urlInput.trim()" @click="onAdd">添加</button>
       <div v-if="addError" class="error-text">{{ addError }}</div>
     </section>
+
+    <div class="clear-bar">
+      <button :disabled="readOnly" @click="confirmClearCompleted = true">清除已完成</button>
+    </div>
 
     <table class="tasks">
       <thead>
@@ -58,6 +65,10 @@
               @click="onResume(task.id)"
             >继续</button>
             <button :disabled="readOnly" @click="askRemove(task)">删除</button>
+            <button
+              :disabled="task.state !== 'Completed'"
+              @click="onReveal(task.id)"
+            >打开文件夹</button>
           </td>
         </tr>
         <tr v-if="tasks.length === 0">
@@ -77,6 +88,17 @@
         <div class="dialog-ops">
           <button :disabled="readOnly" @click="confirmTarget = null">取消</button>
           <button :disabled="readOnly" @click="onConfirmRemove">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="confirmClearCompleted" class="overlay">
+      <div class="dialog">
+        <p>确定清除所有已完成的任务记录吗？已下载的文件不会被删除。</p>
+        <div v-if="clearError" class="error-text">{{ clearError }}</div>
+        <div class="dialog-ops">
+          <button :disabled="readOnly" @click="confirmClearCompleted = false">取消</button>
+          <button :disabled="readOnly" @click="onClearCompleted">确定</button>
         </div>
       </div>
     </div>
@@ -114,6 +136,12 @@
             max="32"
           />
         </div>
+        <div class="field">
+          <label class="checkbox">
+            <input v-model="settings.autostart" :disabled="readOnly" type="checkbox" />
+            开机自动启动（以托盘方式启动）
+          </label>
+        </div>
         <button :disabled="readOnly" @click="onSaveSettings">保存</button>
         <div v-if="settingsError" class="error-text">{{ settingsError }}</div>
       </div>
@@ -143,6 +171,7 @@ interface Settings {
   global_max_speed: number;
   max_tasks: number;
   default_connections: number;
+  autostart: boolean;
 }
 
 const readOnly = ref(false);
@@ -156,14 +185,39 @@ const settings = ref<Settings>({
   global_max_speed: 0,
   max_tasks: 3,
   default_connections: 8,
+  autostart: false,
 });
 const speedKb = ref(0);
 const settingsError = ref('');
 const confirmTarget = ref<TaskView | null>(null);
 const deleteFile = ref(false);
 const confirmError = ref('');
+const confirmClearCompleted = ref(false);
+const clearError = ref('');
 
 let unlisten: (() => void) | null = null;
+let fatalTimer: ReturnType<typeof setTimeout> | null = null;
+
+function dismissFatalError(): void {
+  if (fatalTimer !== null) {
+    clearTimeout(fatalTimer);
+    fatalTimer = null;
+  }
+  fatalError.value = '';
+}
+
+function showFatalError(message: string): void {
+  dismissFatalError();
+  fatalError.value = message;
+  fatalTimer = setTimeout(() => {
+    fatalTimer = null;
+    fatalError.value = '';
+  }, 8000);
+}
+
+function isStaleTaskError(message: string): boolean {
+  return message.includes('neither active nor queued') || message.includes('不在活动或排队');
+}
 
 function errText(err: unknown): string {
   if (typeof err === 'string') return err;
@@ -234,7 +288,7 @@ async function refreshTasks(): Promise<void> {
   try {
     tasks.value = await invoke<TaskView[]>('list_tasks');
   } catch (err) {
-    fatalError.value = errText(err);
+    showFatalError(errText(err));
   }
 }
 
@@ -254,19 +308,27 @@ async function onAdd(): Promise<void> {
 async function onPause(id: number): Promise<void> {
   try {
     await invoke('pause_task', { id });
-    await refreshTasks();
   } catch (err) {
-    fatalError.value = errText(err);
+    const message = errText(err);
+    if (!isStaleTaskError(message)) {
+      showFatalError(message);
+      return;
+    }
   }
+  await refreshTasks();
 }
 
 async function onResume(id: number): Promise<void> {
   try {
     await invoke('resume_task', { id });
-    await refreshTasks();
   } catch (err) {
-    fatalError.value = errText(err);
+    const message = errText(err);
+    if (!isStaleTaskError(message)) {
+      showFatalError(message);
+      return;
+    }
   }
+  await refreshTasks();
 }
 
 function askRemove(task: TaskView): void {
@@ -288,6 +350,25 @@ async function onConfirmRemove(): Promise<void> {
   }
 }
 
+async function onReveal(id: number): Promise<void> {
+  try {
+    await invoke('reveal_task', { id });
+  } catch (err) {
+    showFatalError(errText(err));
+  }
+}
+
+async function onClearCompleted(): Promise<void> {
+  clearError.value = '';
+  try {
+    await invoke('clear_completed');
+    confirmClearCompleted.value = false;
+    await refreshTasks();
+  } catch (err) {
+    clearError.value = errText(err);
+  }
+}
+
 async function onSaveSettings(): Promise<void> {
   settingsError.value = '';
   const payload: Settings = {
@@ -295,6 +376,7 @@ async function onSaveSettings(): Promise<void> {
     global_max_speed: Math.max(0, Math.round(speedKb.value)) * 1024,
     max_tasks: settings.value.max_tasks,
     default_connections: settings.value.default_connections,
+    autostart: settings.value.autostart,
   };
   try {
     await invoke('set_settings', { settings: payload });
@@ -322,7 +404,7 @@ onMounted(async () => {
       }
     });
   } catch (err) {
-    fatalError.value = errText(err);
+    showFatalError(errText(err));
   }
 });
 
@@ -331,6 +413,7 @@ onUnmounted(() => {
     unlisten();
     unlisten = null;
   }
+  dismissFatalError();
 });
 </script>
 
@@ -364,6 +447,18 @@ h1 {
   padding: 10px;
   border-radius: 4px;
   margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.error-close {
+  border: none;
+  background: transparent;
+  color: #c00;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
 }
 .add-bar {
   display: flex;
@@ -379,6 +474,9 @@ h1 {
 }
 .add-bar .error-text {
   flex-basis: 100%;
+}
+.clear-bar {
+  margin-bottom: 8px;
 }
 button {
   padding: 5px 12px;

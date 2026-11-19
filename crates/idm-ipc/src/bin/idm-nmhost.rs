@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 
 use idm_core::error::Error;
 use idm_core::net::client::validate_extra_headers;
-use idm_core::net::filename::sanitize_windows_filename;
+use idm_core::net::filename::{sanitize_windows_filename, strip_browser_dup_suffix};
 use idm_core::net::validate_url;
 use idm_core::store::{QueuedTask, Store, default_db_path, default_download_dir};
 use idm_ipc::frame::{ReadFrame, read_frame, write_frame};
@@ -214,11 +214,11 @@ async fn handle_enqueue(v: &Value, db: &Store) -> Result<Value, String> {
         Ok(None) => {}
     }
 
-    // 文件名：先取最后一个路径分隔符后的部分，再做 Windows 合法化；空则不指定。
+    // 文件名：取路径最后一段 → 去掉浏览器重复下载编号 → Windows 合法化；空则不指定。
     let file_name = match v.get("filename").and_then(|f| f.as_str()) {
         Some(f) if !f.is_empty() => {
             let base = f.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(f);
-            Some(sanitize_windows_filename(base))
+            Some(sanitize_windows_filename(&strip_browser_dup_suffix(base)))
         }
         _ => None,
     };

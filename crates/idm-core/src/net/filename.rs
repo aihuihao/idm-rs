@@ -54,6 +54,7 @@ pub fn sanitize_windows_filename(raw: &str) -> String {
 }
 
 /// 在 `dir` 下解析不冲突的目标文件名：`name` 不存在直接返回，否则依次 `name (1).ext`。
+/// 复合扩展名（`.tar.gz` 等）作为整体，序号插在其之前：`bash-5.2 (1).tar.gz`。
 ///
 /// 判断占用时，`name` 本身或其对应的临时文件 `name.idm-part` 任一存在都视为已占用——
 /// 否则两个任务会同时下载到同一个 `.idm-part`，最终重命名时互相覆盖。
@@ -96,12 +97,44 @@ fn url_path_segment(url: &Url) -> Option<String> {
         .map(percent_decode)
 }
 
-/// 拆分为（主名，扩展名含点）。没有扩展名时扩展名为空串。
+/// 需要作为整体识别的复合扩展名（不区分大小写）。
+const COMPOUND_EXTS: [&str; 4] = [".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst"];
+
+/// 拆分为（主名，扩展名含点）。复合扩展名（`.tar.gz` 等）作为整体，
+/// 其余按最后一个点拆分。没有扩展名时扩展名为空串。
 fn split_ext(name: &str) -> (&str, &str) {
+    let lower = name.to_ascii_lowercase();
+    for ext in COMPOUND_EXTS {
+        if let Some(pos) = lower.rfind(ext)
+            && pos > 0
+        {
+            return (&name[..pos], &name[pos..]);
+        }
+    }
     match name.rfind('.') {
         Some(pos) if pos > 0 => (&name[..pos], &name[pos..]),
         _ => (name, ""),
     }
+}
+
+/// 去掉紧贴扩展名之前的浏览器重复下载编号 `(数字)` 或 ` (数字)`。
+/// 只对纯数字编号生效；主名被去掉后为空（如 `(1).zip`）则保持原样。
+pub fn strip_browser_dup_suffix(name: &str) -> String {
+    let (stem, ext) = split_ext(name);
+    let trimmed = stem.trim_end();
+    let open = match trimmed.rfind('(') {
+        Some(pos) if trimmed.ends_with(')') => pos,
+        _ => return name.to_string(),
+    };
+    let digits = &trimmed[open + 1..trimmed.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return name.to_string();
+    }
+    let base = trimmed[..open].trim_end();
+    if base.is_empty() {
+        return name.to_string();
+    }
+    format!("{base}{ext}")
 }
 
 /// 主名是否为 Windows 保留名（大小写不敏感）。
@@ -185,5 +218,47 @@ mod tests {
         let _ = std::fs::File::create(&first).unwrap();
         let second = resolve_conflict(dir, "f.bin");
         assert_eq!(second, dir.join("f (2).bin"));
+    }
+
+    #[test]
+    fn resolve_conflict_compound_ext() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path();
+        let _ = std::fs::File::create(dir.join("bash-5.2.tar.gz"))?;
+        assert_eq!(
+            resolve_conflict(dir, "bash-5.2.tar.gz"),
+            dir.join("bash-5.2 (1).tar.gz")
+        );
+        for (src, expected) in [
+            ("x.tar.xz", "x (1).tar.xz"),
+            ("x.tar.bz2", "x (1).tar.bz2"),
+            ("x.tar.zst", "x (1).tar.zst"),
+            ("x.TAR.GZ", "x (1).TAR.GZ"),
+        ] {
+            let _ = std::fs::File::create(dir.join(src))?;
+            assert_eq!(resolve_conflict(dir, src), dir.join(expected), "src={src}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn strip_browser_dup_suffix_cases() {
+        let cases: &[(&str, &str)] = &[
+            ("bash-5.2(1).tar.gz", "bash-5.2.tar.gz"),
+            ("bash-5.2 (1).tar.gz", "bash-5.2.tar.gz"),
+            ("a (2).zip", "a.zip"),
+            ("a(3).zip", "a.zip"),
+            ("a(1)", "a"),
+            ("a (1)", "a"),
+            ("report(v2).pdf", "report(v2).pdf"),
+            ("(1).zip", "(1).zip"),
+            ("a (x).zip", "a (x).zip"),
+            ("x.TAR.GZ", "x.TAR.GZ"),
+            ("x(1).TAR.GZ", "x.TAR.GZ"),
+            ("plain.txt", "plain.txt"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_browser_dup_suffix(input), *expected, "input={input}");
+        }
     }
 }

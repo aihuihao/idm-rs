@@ -59,6 +59,8 @@ fn run() -> Result<(), String> {
             commands::pause_task,
             commands::resume_task,
             commands::remove_task,
+            commands::reveal_task,
+            commands::clear_completed,
             commands::get_settings,
             commands::set_settings,
         ])
@@ -114,6 +116,13 @@ fn run() -> Result<(), String> {
                 })
                 .build(app)?;
             app.manage(tray);
+
+            // --minimized：开机自启时不显示主窗口，只保留托盘图标。
+            if std::env::args().any(|arg| arg == "--minimized")
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.hide();
+            }
 
             // --- 后台每 250ms 推送任务列表 ---
             let handle = app.handle().clone();

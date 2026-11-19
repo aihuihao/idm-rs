@@ -112,6 +112,7 @@ fn default_settings(download_dir: &Path) -> Settings {
         global_max_speed: 0,
         max_tasks: 3,
         default_connections: 8,
+        autostart: false,
     }
 }
 
@@ -661,6 +662,193 @@ async fn remove_active_task() -> TestResult {
 
     slow_srv.shutdown();
     fast_srv.shutdown();
+    svc.shutdown().await?;
+    Ok(())
+}
+
+// --- 13：reveal_args 纯函数（空格/中文/引号）-----------------------------
+
+#[test]
+fn reveal_args_builds_select_argument() -> TestResult {
+    use idm_desktop::service::reveal_args;
+
+    let spaced = PathBuf::from("D:\\my downloads\\a b.bin");
+    assert_eq!(
+        reveal_args(&spaced)?,
+        "/select,\"D:\\my downloads\\a b.bin\""
+    );
+    let chinese = PathBuf::from("D:\\下载\\文件 一.bin");
+    assert_eq!(reveal_args(&chinese)?, "/select,\"D:\\下载\\文件 一.bin\"");
+    let quoted = PathBuf::from("D:\\a\"b.bin");
+    match reveal_args(&quoted) {
+        Err(ServiceError::InvalidInput(_)) => {}
+        other => {
+            return Err(format!("expected InvalidInput for quoted path, got {other:?}").into());
+        }
+    }
+    Ok(())
+}
+
+// --- 14：清除已完成只删记录不删文件 -------------------------------------
+
+#[tokio::test]
+async fn clear_completed_removes_only_completed() -> TestResult {
+    let tmp = TempDir::new()?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+
+    let completed_file = download.join("done.bin");
+    std::fs::write(&completed_file, b"already downloaded")?;
+
+    {
+        let store = Store::open(&db)?;
+        let id_done = store
+            .create_task(idm_core::store::NewTask {
+                url: "http://example.com/done.bin".to_string(),
+                dir: download.to_string_lossy().into_owned(),
+                strategy: "Auto".to_string(),
+                connections: 1,
+            })
+            .await?;
+        store.set_final_name(id_done, "done.bin").await?;
+        store
+            .update_state(id_done, TaskStateDb::Completed, None, None)
+            .await?;
+        let id_paused = store
+            .create_task(idm_core::store::NewTask {
+                url: "http://example.com/paused.bin".to_string(),
+                dir: download.to_string_lossy().into_owned(),
+                strategy: "Auto".to_string(),
+                connections: 1,
+            })
+            .await?;
+        store
+            .update_state(id_paused, TaskStateDb::Paused, None, None)
+            .await?;
+        store.shutdown().await?;
+    }
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db.clone()).await?;
+    let removed = svc.clear_completed().await?;
+    assert_eq!(removed, 1, "只应删除 1 条已完成任务");
+
+    let views = svc.list_tasks().await?;
+    assert_eq!(views.len(), 1, "只剩已暂停任务");
+    assert_eq!(views[0].state, "Paused");
+    assert!(completed_file.exists(), "清除记录不得删除已下载文件");
+
+    svc.shutdown().await?;
+    Ok(())
+}
+
+// --- 15：开机启动开关（随机测试值名 + Drop 守卫）------------------------
+
+struct RunValueGuard {
+    names: Vec<String>,
+}
+
+impl RunValueGuard {
+    fn cleanup(&self) {
+        for name in &self.names {
+            let _ = std::process::Command::new("reg")
+                .args([
+                    "delete",
+                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                    "/v",
+                    name,
+                    "/f",
+                ])
+                .output();
+        }
+    }
+}
+
+impl Drop for RunValueGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+fn unique_run_name(prefix: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    format!("{prefix}-{}-{nanos}-{n}", std::process::id())
+}
+
+fn reg_query(name: &str) -> bool {
+    std::process::Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            name,
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn autostart_toggle() -> TestResult {
+    let desktop_name = unique_run_name("idm-desktop-test");
+    let runner_name = unique_run_name("idm-runner-test");
+    let guard = RunValueGuard {
+        names: vec![desktop_name.clone(), runner_name.clone()],
+    };
+    guard.cleanup();
+
+    let tmp = TempDir::new()?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    // 预置旧的 CLI runner 值，验证开启桌面启动时会删除它。
+    let seeded = std::process::Command::new("reg")
+        .args([
+            "add",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "/v",
+            &runner_name,
+            "/t",
+            "REG_SZ",
+            "/d",
+            "old-runner-value",
+            "/f",
+        ])
+        .output()?;
+    if !seeded.status.success() {
+        return Err("failed to seed runner test value".into());
+    }
+    assert!(reg_query(&runner_name), "预置 runner 值应存在");
+
+    let svc = DesktopService::open_with_autostart_names(
+        db.clone(),
+        desktop_name.clone(),
+        runner_name.clone(),
+    )
+    .await?;
+
+    let mut settings = default_settings(&download);
+    settings.autostart = true;
+    svc.set_settings(settings.clone()).await?;
+    assert!(reg_query(&desktop_name), "开启后应写入桌面启动值");
+    assert!(!reg_query(&runner_name), "开启后应删除旧 runner 值");
+    assert!(
+        svc.get_settings().await?.autostart,
+        "get_settings 应反映已开启"
+    );
+
+    settings.autostart = false;
+    svc.set_settings(settings).await?;
+    assert!(!reg_query(&desktop_name), "关闭后应删除桌面启动值");
+
     svc.shutdown().await?;
     Ok(())
 }
