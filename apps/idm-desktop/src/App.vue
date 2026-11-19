@@ -57,7 +57,8 @@
         </button>
       </aside>
 
-      <div class="content">
+      <div class="content" ref="contentEl">
+        <div class="table-wrap" ref="tableWrapEl">
         <table class="tasks">
           <colgroup>
             <col class="col-icon" />
@@ -113,15 +114,28 @@
             </tr>
           </tbody>
         </table>
+        </div>
 
-        <section v-if="selectedIds.size === 1" class="detail" :class="{ collapsed: detailCollapsed }">
-          <div class="detail-head" @click="detailCollapsed = !detailCollapsed">
+        <div
+          v-if="selectedIds.size === 1 && !detailCollapsed"
+          class="splitter"
+          @mousedown="startDrag($event)"
+        ></div>
+
+        <section
+          v-if="selectedIds.size === 1"
+          ref="detailPanelEl"
+          class="detail"
+          :class="{ collapsed: detailCollapsed }"
+          :style="detailHeightStyle"
+        >
+          <div class="detail-head" ref="detailHeadEl" @click="detailCollapsed = !detailCollapsed">
             <span>任务详情 — {{ singleSelected?.file_name || singleSelected?.url_display }}</span>
             <button class="fold-btn" @click.stop="detailCollapsed = !detailCollapsed">
               {{ detailCollapsed ? '展开' : '折叠' }}
             </button>
           </div>
-          <div v-if="!detailCollapsed" class="detail-body">
+          <div v-if="!detailCollapsed" ref="detailBodyEl" class="detail-body">
             <template v-if="detail && detail.total_size != null && detail.chunks.length > 0">
               <div class="detail-meta">
                 总大小 {{ formatSize(detail.total_size) }}　连接数 {{ detail.connections }}
@@ -136,20 +150,22 @@
                   <div class="seg-fill" :class="chunkClass(c)" :style="{ width: chunkPct(c) + '%' }"></div>
                 </div>
               </div>
-              <table class="chunks">
-                <thead>
-                  <tr><th>编号</th><th>范围</th><th class="num">已下载/总量</th><th class="num">速度</th><th>状态</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="c in detail.chunks" :key="c.index">
-                    <td>{{ c.index }}</td>
-                    <td>{{ formatSize(c.start) }} - {{ formatSize(c.end + 1) }}</td>
-                    <td class="num">{{ formatSize(c.downloaded) }}/{{ formatSize(c.end + 1 - c.start) }}</td>
-                    <td class="num">{{ formatSpeed(c.speed_bps) }}</td>
-                    <td>{{ chunkStateText(c.state) }}</td>
-                  </tr>
-                </tbody>
-              </table>
+              <div class="chunk-table-wrap" ref="chunkTableWrapEl">
+                <table class="chunks">
+                  <thead>
+                    <tr><th>编号</th><th>范围</th><th class="num">已下载/总量</th><th class="num">速度</th><th>状态</th></tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="c in detail.chunks" :key="c.index">
+                      <td>{{ c.index }}</td>
+                      <td class="range">{{ formatBytes(c.start) }} - {{ formatBytes(c.end + 1) }}</td>
+                      <td class="num">{{ formatBytes(c.downloaded) }}/{{ formatBytes(c.end + 1 - c.start) }}</td>
+                      <td class="num">{{ chunkSpeedText(c) }}</td>
+                      <td>{{ chunkStateText(c.state) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </template>
             <div v-else class="detail-empty">该任务为单连接下载，无分段信息</div>
           </div>
@@ -264,7 +280,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
@@ -377,9 +393,26 @@ const contextMenu = ref({ visible: false, x: 0, y: 0, taskId: 0 });
 const detail = ref<TaskDetail | null>(null);
 const detailCollapsed = ref(false);
 
+const contentEl = ref<HTMLElement | null>(null);
+const detailPanelEl = ref<HTMLElement | null>(null);
+const detailHeadEl = ref<HTMLElement | null>(null);
+const detailBodyEl = ref<HTMLElement | null>(null);
+const chunkTableWrapEl = ref<HTMLElement | null>(null);
+const detailHeightStyle = ref<Record<string, string>>({});
+const MIN_DETAIL_HEIGHT = 120;
+const HEADER_PLUS_FIVE_ROWS = 6 * 28; // 表头 + 5 行数据，约 168px
+
 let unlisten: (() => void) | null = null;
 let fatalTimer: ReturnType<typeof setTimeout> | null = null;
 let detailTimer: ReturnType<typeof setInterval> | null = null;
+
+// 用户拖动后的固定高度（null 表示按内容自动计算）。
+let pinnedDetailHeight: number | null = null;
+
+// 每个分块的最近采样 { t, downloaded }，键为 "index:start"。
+interface ChunkSample { t: number; downloaded: number }
+const chunkSamples = new Map<string, ChunkSample[]>();
+const chunkSpeeds = new Map<string, number>();
 
 const filteredTasks = computed(() =>
   tasks.value.filter((t) => statusMatch(t) && (filterKind.value === 'all' || t.kind === filterKind.value)),
@@ -445,6 +478,15 @@ function isStaleTaskError(message: string): boolean {
 
 function formatSize(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined) return '未知';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
+  return `${value.toFixed(1)} ${units[index]}`;
+}
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  if (bytes < 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
   let value = bytes;
   let index = 0;
@@ -643,17 +685,152 @@ async function onSaveOptions(): Promise<void> {
 function stopDetailTimer(): void {
   if (detailTimer !== null) { clearInterval(detailTimer); detailTimer = null; }
 }
+
+const DETAIL_STORAGE_KEY = 'idm-rs.detailHeight';
+function loadPinnedHeight(): number | null {
+  try {
+    const raw = localStorage.getItem(DETAIL_STORAGE_KEY);
+    if (raw === null) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+function savePinnedHeight(value: number): void {
+  try {
+    localStorage.setItem(DETAIL_STORAGE_KEY, String(value));
+  } catch {
+    // localStorage 不可用时静默忽略
+  }
+}
+
+function chunkKey(c: ChunkView): string {
+  return `${c.index}:${c.start}`;
+}
+function recordChunkSamples(task: TaskDetail): void {
+  const now = Date.now();
+  const activeKeys = new Set<string>();
+  for (const c of task.chunks) {
+    const key = chunkKey(c);
+    activeKeys.add(key);
+    let samples = chunkSamples.get(key) ?? [];
+    const prev = samples.length > 0 ? samples[samples.length - 1] : null;
+    // 增量为负说明分块被拆分/范围变化，丢弃历史重新计算。
+    if (prev !== null && c.downloaded < prev.downloaded) samples = [];
+    samples.push({ t: now, downloaded: c.downloaded });
+    // 只保留最近约 2 秒的样本。
+    const cutoff = now - 2000;
+    while (samples.length > 1 && samples[0].t < cutoff) samples.shift();
+    chunkSamples.set(key, samples);
+  }
+  // 清掉不再存在的分块样本。
+  for (const key of Array.from(chunkSamples.keys())) {
+    if (!activeKeys.has(key)) chunkSamples.delete(key);
+  }
+  computeChunkSpeeds(task);
+}
+function computeChunkSpeeds(task: TaskDetail): void {
+  chunkSpeeds.clear();
+  for (const c of task.chunks) {
+    if (c.speed_bps > 0) {
+      chunkSpeeds.set(chunkKey(c), c.speed_bps);
+      continue;
+    }
+    const samples = chunkSamples.get(chunkKey(c)) ?? [];
+    if (samples.length < 2) {
+      chunkSpeeds.set(chunkKey(c), 0);
+      continue;
+    }
+    const first = samples[0];
+    const last = samples[samples.length - 1];
+    const seconds = (last.t - first.t) / 1000;
+    const delta = last.downloaded - first.downloaded;
+    chunkSpeeds.set(chunkKey(c), seconds > 0 && delta >= 0 ? delta / seconds : 0);
+  }
+}
+function chunkSpeedText(c: ChunkView): string {
+  if (c.state !== 'active') return '—';
+  return formatSpeed(chunkSpeeds.get(chunkKey(c)) ?? 0);
+}
+function clearChunkSamples(): void {
+  chunkSamples.clear();
+  chunkSpeeds.clear();
+}
+
 async function loadDetail(id: number): Promise<void> {
   try {
-    detail.value = await invoke<TaskDetail>('task_detail', { id });
+    const data = await invoke<TaskDetail>('task_detail', { id });
+    detail.value = data;
+    recordChunkSamples(data);
+    await nextTick();
+    updateDetailHeight();
   } catch {
     detail.value = null;
   }
 }
+
+function updateDetailHeight(): void {
+  // 折叠或未选中任务：不设置高度，表格占满。
+  if (selectedIds.value.size !== 1 || detailCollapsed.value) {
+    detailHeightStyle.value = {};
+    return;
+  }
+  const content = contentEl.value;
+  if (content === null) return;
+  const available = content.clientHeight;
+  // 上限：表格至少保留「表头+5行」，再扣掉分隔线与内容间距。
+  const upper = available - HEADER_PLUS_FIVE_ROWS - 5 - 8;
+  // 自动高度：标题栏 + 详情元信息/分段条 + 连接表全部行，刚好放下不出滚动条。
+  const head = detailHeadEl.value;
+  const tableWrap = chunkTableWrapEl.value;
+  const headHeight = head?.offsetHeight ?? 0;
+  // detail-meta 约 20px、segbar 16px + 8px 下边距、detail-body 上下 padding 16px。
+  const fixedHeight = 20 + 16 + 8 + 16;
+  const tableHeight = tableWrap?.scrollHeight ?? 0;
+  const natural = headHeight + fixedHeight + tableHeight;
+  const desired = pinnedDetailHeight ?? natural;
+  const bounded = Math.max(MIN_DETAIL_HEIGHT, Math.min(desired, upper));
+  detailHeightStyle.value = { height: `${Math.round(bounded)}px` };
+}
+
+function startDrag(event: MouseEvent): void {
+  const panel = detailPanelEl.value;
+  const content = contentEl.value;
+  if (panel === null || content === null) return;
+  event.preventDefault();
+  const startY = event.clientY;
+  const startHeight = panel.offsetHeight;
+  const upper = content.clientHeight - HEADER_PLUS_FIVE_ROWS - 5 - 8;
+  let currentHeight = startHeight;
+  const onMove = (moveEvent: MouseEvent): void => {
+    const delta = startY - moveEvent.clientY;
+    currentHeight = Math.max(MIN_DETAIL_HEIGHT, Math.min(startHeight + delta, upper));
+    detailHeightStyle.value = { height: `${Math.round(currentHeight)}px` };
+  };
+  const onUp = (): void => {
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', onUp);
+    if (Number.isFinite(currentHeight) && currentHeight > 0) {
+      pinnedDetailHeight = currentHeight;
+      savePinnedHeight(currentHeight);
+    }
+  };
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+}
+
+function onWindowResize(): void {
+  void nextTick().then(() => updateDetailHeight());
+}
+
 watch([selectedIds, detailCollapsed], () => {
   stopDetailTimer();
+  clearChunkSamples();
   detail.value = null;
+  detailHeightStyle.value = {};
   if (selectedIds.value.size === 1 && !detailCollapsed.value) {
+    pinnedDetailHeight = loadPinnedHeight();
     const id = Array.from(selectedIds.value)[0] as number;
     void loadDetail(id);
     detailTimer = setInterval(() => { void loadDetail(id); }, 500);
@@ -716,6 +893,8 @@ onMounted(async () => {
       }
     });
     window.addEventListener('keydown', onKeydown);
+    window.addEventListener('resize', onWindowResize);
+    pinnedDetailHeight = loadPinnedHeight();
   } catch (err) {
     showFatalError(errText(err));
   }
@@ -725,6 +904,7 @@ onUnmounted(() => {
   if (unlisten) { unlisten(); unlisten = null; }
   stopDetailTimer();
   window.removeEventListener('keydown', onKeydown);
+  window.removeEventListener('resize', onWindowResize);
   dismissFatalError();
 });
 </script>
@@ -815,7 +995,13 @@ button .ico { vertical-align: -2px; }
 .side-item:hover { background: var(--row-hover); }
 .side-item.active { background: var(--sel-bg); }
 .side-item .count { margin-left: auto; color: var(--gray); }
-.content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.content { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 0; }
+.table-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.splitter {
+  flex: 0 0 5px; height: 5px; margin: 4px 0; cursor: ns-resize;
+  background: var(--border); border-radius: 3px;
+}
+.splitter:hover { background: var(--blue); }
 table.tasks { width: 100%; table-layout: fixed; border-collapse: collapse; }
 table.tasks th, table.tasks td {
   border: 1px solid var(--border); padding: 4px 6px; text-align: left; height: 28px; overflow: hidden;
@@ -842,14 +1028,16 @@ table.tasks .num { text-align: right; font-variant-numeric: tabular-nums; white-
 .pbar-fill.failed { background: var(--red); }
 .pbar-text { position: absolute; inset: 0; text-align: center; line-height: 15px; color: var(--fg); font-variant-numeric: tabular-nums; }
 .statusbar { display: flex; gap: 24px; padding: 6px 4px; border-top: 1px solid var(--border); color: var(--fg); }
-.detail { height: 200px; flex-shrink: 0; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; display: flex; flex-direction: column; }
-.detail.collapsed { height: auto; }
+.detail { flex: 0 0 auto; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.detail.collapsed { flex-basis: auto; }
 .detail-head {
+  flex: 0 0 auto;
   display: flex; align-items: center; justify-content: space-between; padding: 5px 8px;
   background: var(--header-bg); cursor: pointer; font-weight: bold;
 }
 .fold-btn { padding: 2px 8px; }
-.detail-body { flex: 1; overflow: auto; padding: 8px; }
+.detail-body { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: 8px; display: flex; flex-direction: column; }
+.chunk-table-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; }
 .detail-meta { margin-bottom: 6px; }
 .detail-empty { color: var(--gray); padding: 16px; text-align: center; }
 .segbar { position: relative; width: 100%; height: 16px; background: var(--track); margin-bottom: 8px; }

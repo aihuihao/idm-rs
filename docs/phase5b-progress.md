@@ -33,3 +33,11 @@
 - 步骤 3.5 Rust（任务详情）：service.rs 新增 ChunkView/TaskDetail 结构与 task_detail(id)（活动用 queue.progress 快照、否则用 store.get_task 的 chunks；end 转包含式、downloaded=current/committed-start、speed=0、state 映射）；commands.rs 新增 task_detail 命令并注册。未改 idm-core。新增 task_detail_reports_chunks 测试（慢速 4 连接，中途校验≥4 块、首尾相接覆盖整个文件、之和与列表差≤1MiB，完成后全 done），单次 PASS。
 - 步骤 3+4（界面美化）：App.vue 全量重写——顶部工具栏 6 按钮（内联 SVG 图标+文字，继续/暂停/删除作用于选中项）；添加任务自定义模态框（回车/开始下载提交、红字错误）；左侧 160px 分类栏（状态 4 项 + 类型 6 项，各带数量，点击筛选）；任务表格去操作列、加类型图标列、进度条内嵌百分比且按状态着色、单选/Ctrl 多选/双击打开/右键自定义菜单/Delete 批量删除；底部状态栏（下载中数/总速度/全局限速）；详情面板（恰好选中一个显示、200px、可折叠、500ms 刷新 task_detail、分段进度条+连接表、单连接提示）；CSS 变量深浅色跟随系统、13px 系统中文 字体、28px 行高、隔行底纹、悬停高亮；观察模式除选项外工具栏与右键菜单全禁用。tauri.conf.json 加 minWidth=860/minHeight=520。`npm run build` PASS。
 - 步骤 5（测试与验证）：classify_groups_by_extension、task_detail_reports_chunks 各单独连续 10 次 PASS=10 FAIL=0；桌面测试全量 1 次 20 passed（原 18 + 新 2）。cargo fmt --all -- --check PASS；cargo clippy --workspace --all-targets --locked -- -D warnings PASS；npm run build PASS；verify-workspace.ps1 全部 24 步 PASS；phase4b-e2e.ps1 运行 1 次 PASS。规则合规复核通过：新增 Rust 无 unwrap/expect/allow/unsafe，App.vue 无 v-html/innerHTML/eval、无外部图标/CDN 引用，capabilities 仍仅 core:default。
+
+## Phase 5b-3-fix（详情面板高度与分块速度）
+
+- 步骤 0（保存任务原文 + git status）：完成。git status 干净（HEAD 1048982），无残留 idm 进程，任务原文原样保存为 docs/prompts/phase5b-3-fix.md。
+- 步骤 1（详情面板高度）：App.vue 内容区改纵向弹性布局；表格包 .table-wrap（flex:1、min-height:0、overflow:auto）；表格与详情间加 5px 分隔线 .splitter（ns-resize 光标，startDrag 拖动）；详情面板高度由内联 style 控制——自动高度=标题栏+固定区+连接表 scrollHeight，上限=可用高度-(表头+5行 168)-分隔线-gap，clamp 到 [120, 上限]，超出上限时连接表 .chunk-table-wrap 内部滚动；pinnedDetailHeight 存 localStorage 键 idm-rs.detailHeight（读写均 try/catch，异常回自动）；resize 重算；折叠时不设高度、表格占满。
+- 步骤 2（分块速度前端计算）：每 500ms 以 index:start 为键记录 {t, downloaded} 采样，保留约 2 秒滑动窗口；速度=(末-首 downloaded)/(时间差)，后端 speed_bps>0 时优先；状态非 active 显示 —；downloaded 负增量（分块拆分）丢弃该块历史重算；选中变化/面板关闭清空采样。
+- 步骤 3（小修正）：新增 formatBytes，0 字节显示 0 B；范围列与已下载/总量列改用之。
+- 前端验证：vue-tsc + vite build PASS；无 v-html/innerHTML/eval；仅改 apps/idm-desktop/src/App.vue，未改 Rust、未新增 npm 包。
