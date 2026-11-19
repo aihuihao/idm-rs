@@ -47,7 +47,7 @@ impl serde::Serialize for ServiceError {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 pub struct TaskView {
     pub id: i64,
     pub file_name: Option<String>,
@@ -67,6 +67,7 @@ pub struct Settings {
     pub max_tasks: usize,
     pub default_connections: usize,
     pub autostart: bool,
+    pub notify_on_complete: bool,
 }
 
 pub struct DesktopService {
@@ -119,13 +120,54 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
             .map_err(internal)?,
         DEFAULT_CONNECTIONS,
     );
+    let notify_on_complete = match store
+        .get_setting("notify-on-complete")
+        .await
+        .map_err(internal)?
+    {
+        Some(v) => v.trim() != "false",
+        None => true,
+    };
     Ok(Settings {
         download_dir: download,
         global_max_speed,
         max_tasks,
         default_connections,
         autostart: autostart::query(desktop_name).is_some(),
+        notify_on_complete,
     })
+}
+
+/// 对比前后两帧任务列表，找出期间新进入终态的任务。
+///
+/// 返回 `(任务 id, 显示名称, 是否完成)`：`true` 表示完成，`false` 表示失败。
+/// 仅统计 prev 中存在、且当时不是 Completed/Failed，而在 now 中变为终态的任务；
+/// prev 中不存在的新任务不计入。
+pub fn finished_since(prev: &[TaskView], now: &[TaskView]) -> Vec<(i64, String, bool)> {
+    let finished = |state: &str| match state {
+        "Completed" => Some(true),
+        "Failed" => Some(false),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for item in now {
+        let Some(is_completed) = finished(&item.state) else {
+            continue;
+        };
+        let Some(before) = prev.iter().find(|p| p.id == item.id) else {
+            continue;
+        };
+        if finished(&before.state).is_some() {
+            continue;
+        }
+        let name = item
+            .file_name
+            .clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| item.url_display.clone());
+        out.push((item.id, name, is_completed));
+    }
+    out
 }
 
 /// 只保留 scheme://host[:port]/path，去掉 userinfo、query 与 fragment。
@@ -428,6 +470,10 @@ impl DesktopService {
             .map_err(internal)?;
         self.store
             .set_setting("default-connections", &s.default_connections.to_string())
+            .await
+            .map_err(internal)?;
+        self.store
+            .set_setting("notify-on-complete", &s.notify_on_complete.to_string())
             .await
             .map_err(internal)?;
 

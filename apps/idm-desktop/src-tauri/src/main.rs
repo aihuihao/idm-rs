@@ -11,8 +11,9 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, RunEvent};
 
-use idm_desktop::service::DesktopService;
+use idm_desktop::service::{DesktopService, TaskView, finished_since};
 use idm_desktop::throttle::Throttle;
+use tauri_plugin_notification::NotificationExt;
 
 use commands::AppState;
 
@@ -51,6 +52,20 @@ fn run() -> Result<(), String> {
     };
 
     let app = tauri::Builder::default()
+        // single-instance 必须是第一个注册的插件。
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // 第二次启动若带 --minimized，已运行实例不做任何事。
+            if args.iter().any(|arg| arg == "--minimized") {
+                return;
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::is_read_only,
@@ -63,6 +78,7 @@ fn run() -> Result<(), String> {
             commands::clear_completed,
             commands::get_settings,
             commands::set_settings,
+            commands::pick_download_dir,
         ])
         .setup(move |app| {
             // --- 托盘：菜单 + 图标 ---
@@ -128,6 +144,8 @@ fn run() -> Result<(), String> {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut throttle = Throttle::new(Duration::from_millis(250));
+                // 首次快照只建立基线、不发通知，避免把历史任务全报一遍。
+                let mut prev: Option<Vec<TaskView>> = None;
                 loop {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     let shared = handle.state::<AppState>();
@@ -139,7 +157,37 @@ fn run() -> Result<(), String> {
                         Ok(t) => t,
                         Err(_) => continue,
                     };
+                    let read_only = service.is_read_only();
                     drop(guard);
+
+                    // 通知：仅非首次、非观察模式、设置开启时发送。
+                    if let Some(previous) = prev.as_ref() {
+                        let finished = finished_since(previous, &tasks);
+                        if !finished.is_empty() && !read_only {
+                            let guard = shared.service.lock().await;
+                            let notify = match guard.as_ref() {
+                                Some(svc) => match svc.get_settings().await {
+                                    Ok(settings) => settings.notify_on_complete,
+                                    Err(_) => false,
+                                },
+                                None => false,
+                            };
+                            drop(guard);
+                            if notify {
+                                for (_, name, ok) in finished {
+                                    let title = if ok { "下载完成" } else { "下载失败" };
+                                    let _ = handle
+                                        .notification()
+                                        .builder()
+                                        .title(title)
+                                        .body(name)
+                                        .show();
+                                }
+                            }
+                        }
+                    }
+                    prev = Some(tasks.clone());
+
                     let snapshot = match serde_json::to_vec(&tasks) {
                         Ok(bytes) => bytes,
                         Err(_) => continue,

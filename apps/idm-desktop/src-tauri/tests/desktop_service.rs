@@ -113,6 +113,7 @@ fn default_settings(download_dir: &Path) -> Settings {
         max_tasks: 3,
         default_connections: 8,
         autostart: false,
+        notify_on_complete: true,
     }
 }
 
@@ -848,6 +849,88 @@ async fn autostart_toggle() -> TestResult {
     settings.autostart = false;
     svc.set_settings(settings).await?;
     assert!(!reg_query(&desktop_name), "关闭后应删除桌面启动值");
+
+    svc.shutdown().await?;
+    Ok(())
+}
+
+// --- finished_since：完成/失败通知的纯函数判定 ------------------------
+
+fn view(id: i64, state: &str, name: &str) -> TaskView {
+    TaskView {
+        id,
+        file_name: Some(name.to_string()),
+        url_display: format!("https://example.com/{name}"),
+        total_size: None,
+        downloaded: 0,
+        speed_bps: 0,
+        state: state.to_string(),
+        pause_reason: None,
+        last_error: None,
+    }
+}
+
+#[test]
+fn finished_since_detects_new_terminal_states() {
+    use idm_desktop::service::finished_since;
+
+    // prev：1 排队、2 下载中、3 已完成、4 暂停；5/6 尚不存在。
+    let prev = vec![
+        view(1, "Queued", "a.bin"),
+        view(2, "Downloading", "b.bin"),
+        view(3, "Completed", "c.bin"),
+        view(4, "Paused", "d.bin"),
+    ];
+    // now：1 完成、2 失败、3 仍完成（不重复报）、4 仍暂停（不报）、
+    //      5 新出现且完成（不报）、6 新出现失败（不报）。
+    let now = vec![
+        view(1, "Completed", "a.bin"),
+        view(2, "Failed", "b.bin"),
+        view(3, "Completed", "c.bin"),
+        view(4, "Paused", "d.bin"),
+        view(5, "Completed", "e.bin"),
+        view(6, "Failed", "f.bin"),
+    ];
+    let got = finished_since(&prev, &now);
+    assert_eq!(got.len(), 2, "只应报两条：{got:?}");
+    assert_eq!(got[0], (1, "a.bin".to_string(), true), "排队→完成");
+    assert_eq!(got[1], (2, "b.bin".to_string(), false), "下载中→失败");
+
+    // 空列表场景。
+    assert!(finished_since(&[], &[]).is_empty(), "两空列表应为空");
+    assert!(finished_since(&prev, &[]).is_empty(), "now 为空应为空");
+}
+
+#[tokio::test]
+async fn notify_setting_roundtrip() -> TestResult {
+    let tmp = TempDir::new()?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db.clone()).await?;
+    // 默认值为真。
+    assert!(
+        svc.get_settings().await?.notify_on_complete,
+        "notify-on-complete 默认为真"
+    );
+
+    // 写 false 读回 false，再写 true 读回 true。
+    let mut settings = default_settings(&download);
+    settings.notify_on_complete = false;
+    svc.set_settings(settings.clone()).await?;
+    assert!(
+        !svc.get_settings().await?.notify_on_complete,
+        "写入 false 后应读回 false"
+    );
+
+    settings.notify_on_complete = true;
+    svc.set_settings(settings).await?;
+    assert!(
+        svc.get_settings().await?.notify_on_complete,
+        "写入 true 后应读回 true"
+    );
 
     svc.shutdown().await?;
     Ok(())

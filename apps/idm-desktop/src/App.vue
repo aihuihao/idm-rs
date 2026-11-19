@@ -11,6 +11,12 @@
       <button class="error-close" @click="dismissFatalError">×</button>
     </div>
 
+    <div class="toolbar">
+      <button :disabled="readOnly || !urlInput.trim()" @click="onAdd">添加任务</button>
+      <button :disabled="readOnly" @click="confirmClearCompleted = true">清除已完成</button>
+      <button @click="openOptions">选项</button>
+    </div>
+
     <section class="add-bar">
       <input
         v-model="urlInput"
@@ -19,39 +25,45 @@
         placeholder="输入下载网址"
         @keyup.enter="onAdd"
       />
-      <button :disabled="readOnly || !urlInput.trim()" @click="onAdd">添加</button>
       <div v-if="addError" class="error-text">{{ addError }}</div>
     </section>
 
-    <div class="clear-bar">
-      <button :disabled="readOnly" @click="confirmClearCompleted = true">清除已完成</button>
-    </div>
-
     <table class="tasks">
+      <colgroup>
+        <col class="col-name" />
+        <col class="col-size" />
+        <col class="col-progress" />
+        <col class="col-speed" />
+        <col class="col-eta" />
+        <col class="col-state" />
+        <col class="col-ops" />
+      </colgroup>
       <thead>
         <tr>
           <th>文件名</th>
-          <th>大小</th>
-          <th>进度</th>
-          <th>速度</th>
-          <th>剩余时间</th>
+          <th class="num">大小</th>
+          <th class="num">进度</th>
+          <th class="num">速度</th>
+          <th class="num">剩余时间</th>
           <th>状态</th>
           <th>操作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="task in tasks" :key="task.id">
-          <td class="name">{{ task.file_name || task.url_display }}</td>
-          <td>{{ formatSize(task.total_size) }}</td>
-          <td>
+          <td class="name" :title="task.file_name || task.url_display">
+            {{ task.file_name || task.url_display }}
+          </td>
+          <td class="num">{{ formatSize(task.total_size) }}</td>
+          <td class="num">
             <template v-if="task.total_size && task.total_size > 0">
               <progress :value="percent(task)" :max="100"></progress>
               <span class="pct">{{ percent(task) }}%</span>
             </template>
-            <span v-else>{{ formatSize(task.downloaded) }}</span>
+            <span v-else>—</span>
           </td>
-          <td>{{ formatSpeed(task.speed_bps) }}</td>
-          <td>{{ formatEta(task) }}</td>
+          <td class="num">{{ formatSpeed(task.speed_bps) }}</td>
+          <td class="num">{{ formatEta(task) }}</td>
           <td :title="task.state === 'Failed' ? (task.last_error || '') : ''">
             {{ stateText(task) }}
           </td>
@@ -103,23 +115,24 @@
       </div>
     </div>
 
-    <section class="settings">
-      <button class="settings-toggle" @click="settingsOpen = !settingsOpen">
-        {{ settingsOpen ? '收起设置' : '展开设置' }}
-      </button>
-      <div v-if="settingsOpen" class="settings-body">
+    <div v-if="optionsOpen" class="overlay">
+      <div class="dialog options-dialog">
+        <h2>选项</h2>
         <div class="field">
           <label>下载目录</label>
-          <input v-model="settings.download_dir" :disabled="readOnly" type="text" />
+          <div class="dir-row">
+            <input v-model="draftSettings.download_dir" :disabled="readOnly" type="text" />
+            <button :disabled="readOnly" @click="onPickDir">选择…</button>
+          </div>
         </div>
         <div class="field">
           <label>全局限速（KB/秒，0 表示不限速）</label>
-          <input v-model.number="speedKb" :disabled="readOnly" type="number" min="0" />
+          <input v-model.number="draftSpeedKb" :disabled="readOnly" type="number" min="0" />
         </div>
         <div class="field">
           <label>同时下载任务数（1~16）</label>
           <input
-            v-model.number="settings.max_tasks"
+            v-model.number="draftSettings.max_tasks"
             :disabled="readOnly"
             type="number"
             min="1"
@@ -129,7 +142,7 @@
         <div class="field">
           <label>每任务默认连接数（1~32）</label>
           <input
-            v-model.number="settings.default_connections"
+            v-model.number="draftSettings.default_connections"
             :disabled="readOnly"
             type="number"
             min="1"
@@ -138,14 +151,27 @@
         </div>
         <div class="field">
           <label class="checkbox">
-            <input v-model="settings.autostart" :disabled="readOnly" type="checkbox" />
+            <input v-model="draftSettings.autostart" :disabled="readOnly" type="checkbox" />
             开机自动启动（以托盘方式启动）
           </label>
         </div>
-        <button :disabled="readOnly" @click="onSaveSettings">保存</button>
-        <div v-if="settingsError" class="error-text">{{ settingsError }}</div>
+        <div class="field">
+          <label class="checkbox">
+            <input
+              v-model="draftSettings.notify_on_complete"
+              :disabled="readOnly"
+              type="checkbox"
+            />
+            下载完成时通知
+          </label>
+        </div>
+        <div v-if="optionsError" class="error-text">{{ optionsError }}</div>
+        <div class="dialog-ops">
+          <button @click="closeOptions">取消</button>
+          <button :disabled="readOnly" @click="onSaveOptions">保存</button>
+        </div>
       </div>
-    </section>
+    </div>
   </div>
 </template>
 
@@ -172,6 +198,7 @@ interface Settings {
   max_tasks: number;
   default_connections: number;
   autostart: boolean;
+  notify_on_complete: boolean;
 }
 
 const readOnly = ref(false);
@@ -179,21 +206,23 @@ const tasks = ref<TaskView[]>([]);
 const urlInput = ref('');
 const addError = ref('');
 const fatalError = ref('');
-const settingsOpen = ref(false);
-const settings = ref<Settings>({
-  download_dir: '',
-  global_max_speed: 0,
-  max_tasks: 3,
-  default_connections: 8,
-  autostart: false,
-});
-const speedKb = ref(0);
-const settingsError = ref('');
 const confirmTarget = ref<TaskView | null>(null);
 const deleteFile = ref(false);
 const confirmError = ref('');
 const confirmClearCompleted = ref(false);
 const clearError = ref('');
+
+const optionsOpen = ref(false);
+const draftSettings = ref<Settings>({
+  download_dir: '',
+  global_max_speed: 0,
+  max_tasks: 3,
+  default_connections: 8,
+  autostart: false,
+  notify_on_complete: true,
+});
+const draftSpeedKb = ref(0);
+const optionsError = ref('');
 
 let unlisten: (() => void) | null = null;
 let fatalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -369,29 +398,50 @@ async function onClearCompleted(): Promise<void> {
   }
 }
 
-async function onSaveSettings(): Promise<void> {
-  settingsError.value = '';
+async function openOptions(): Promise<void> {
+  optionsError.value = '';
+  const saved = await invoke<Settings>('get_settings');
+  draftSettings.value = { ...saved };
+  draftSpeedKb.value = Math.round(saved.global_max_speed / 1024);
+  optionsOpen.value = true;
+}
+
+function closeOptions(): void {
+  optionsOpen.value = false;
+  optionsError.value = '';
+}
+
+async function onPickDir(): Promise<void> {
+  optionsError.value = '';
+  try {
+    const path = await invoke<string>('pick_download_dir');
+    if (path) draftSettings.value.download_dir = path;
+  } catch (err) {
+    optionsError.value = errText(err);
+  }
+}
+
+async function onSaveOptions(): Promise<void> {
+  optionsError.value = '';
   const payload: Settings = {
-    download_dir: settings.value.download_dir,
-    global_max_speed: Math.max(0, Math.round(speedKb.value)) * 1024,
-    max_tasks: settings.value.max_tasks,
-    default_connections: settings.value.default_connections,
-    autostart: settings.value.autostart,
+    download_dir: draftSettings.value.download_dir,
+    global_max_speed: Math.max(0, Math.round(draftSpeedKb.value)) * 1024,
+    max_tasks: draftSettings.value.max_tasks,
+    default_connections: draftSettings.value.default_connections,
+    autostart: draftSettings.value.autostart,
+    notify_on_complete: draftSettings.value.notify_on_complete,
   };
   try {
     await invoke('set_settings', { settings: payload });
-    settings.value = payload;
+    closeOptions();
   } catch (err) {
-    settingsError.value = errText(err);
+    optionsError.value = errText(err);
   }
 }
 
 onMounted(async () => {
   try {
     readOnly.value = await invoke<boolean>('is_read_only');
-    const saved = await invoke<Settings>('get_settings');
-    settings.value = saved;
-    speedKb.value = Math.round(saved.global_max_speed / 1024);
     await refreshTasks();
     unlisten = await listen<string>('tasks-updated', (event) => {
       try {
@@ -460,6 +510,11 @@ h1 {
   line-height: 1;
   padding: 0 4px;
 }
+.toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
 .add-bar {
   display: flex;
   flex-wrap: wrap;
@@ -475,9 +530,6 @@ h1 {
 .add-bar .error-text {
   flex-basis: 100%;
 }
-.clear-bar {
-  margin-bottom: 8px;
-}
 button {
   padding: 5px 12px;
   cursor: pointer;
@@ -488,6 +540,7 @@ button:disabled {
 }
 table.tasks {
   width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -496,18 +549,49 @@ table.tasks td {
   border: 1px solid #ddd;
   padding: 6px;
   text-align: left;
+  overflow: hidden;
 }
 table.tasks th {
   background: #f5f5f5;
 }
+table.tasks .col-name {
+  width: 30%;
+}
+table.tasks .col-size {
+  width: 10%;
+}
+table.tasks .col-progress {
+  width: 14%;
+}
+table.tasks .col-speed {
+  width: 12%;
+}
+table.tasks .col-eta {
+  width: 12%;
+}
+table.tasks .col-state {
+  width: 10%;
+}
+table.tasks .col-ops {
+  width: 210px;
+}
 table.tasks .name {
-  max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+table.tasks .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+table.tasks .num progress {
+  width: 42px;
+  vertical-align: middle;
+}
 table.tasks .ops {
   white-space: nowrap;
+  text-overflow: clip;
 }
 table.tasks .ops button {
   margin-right: 4px;
@@ -534,6 +618,33 @@ table.tasks .ops button {
   border-radius: 6px;
   min-width: 320px;
 }
+.options-dialog {
+  min-width: 420px;
+}
+.options-dialog h2 {
+  font-size: 17px;
+  margin: 0 0 12px;
+}
+.field {
+  margin-bottom: 10px;
+}
+.field label {
+  display: block;
+  margin-bottom: 4px;
+}
+.field input[type='text'],
+.field input[type='number'] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px;
+}
+.dir-row {
+  display: flex;
+  gap: 6px;
+}
+.dir-row input {
+  flex: 1;
+}
 .checkbox {
   display: flex;
   align-items: center;
@@ -545,27 +656,5 @@ table.tasks .ops button {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 12px;
-}
-.settings {
-  margin-top: 20px;
-  border-top: 1px solid #ddd;
-  padding-top: 12px;
-}
-.settings-toggle {
-  margin-bottom: 8px;
-}
-.settings-body {
-  display: grid;
-  gap: 10px;
-  max-width: 480px;
-}
-.field label {
-  display: block;
-  margin-bottom: 4px;
-}
-.field input {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 6px;
 }
 </style>

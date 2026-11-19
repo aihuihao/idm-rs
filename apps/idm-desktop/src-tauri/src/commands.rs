@@ -92,3 +92,18 @@ pub(crate) async fn set_settings(
     let service = guard.as_ref().ok_or_else(closed)?;
     service.set_settings(settings).await
 }
+
+/// 在 Rust 端弹出文件夹选择框，返回选中路径；取消返回空字符串。
+#[tauri::command]
+pub(crate) async fn pick_download_dir(app: tauri::AppHandle) -> Result<String, ServiceError> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app.dialog().file().blocking_pick_folder();
+    let path = match picked {
+        Some(file_path) => match file_path.into_path() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(err) => return Err(ServiceError::Internal(err.to_string())),
+        },
+        None => String::new(),
+    };
+    Ok(path)
+}
