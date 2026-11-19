@@ -2,7 +2,7 @@
 
 use tauri::State;
 
-use idm_desktop::service::{DesktopService, ServiceError, Settings, TaskView};
+use idm_desktop::service::{DesktopService, ServiceError, Settings, TaskDetail, TaskView};
 
 pub(crate) struct AppState {
     pub(crate) service: std::sync::Arc<tokio::sync::Mutex<Option<DesktopService>>>,
@@ -76,6 +76,17 @@ pub(crate) async fn clear_completed(state: State<'_, AppState>) -> Result<usize,
     service.clear_completed().await
 }
 
+/// 读取任务分块详情（只读，观察模式允许）。
+#[tauri::command]
+pub(crate) async fn task_detail(
+    id: i64,
+    state: State<'_, AppState>,
+) -> Result<TaskDetail, ServiceError> {
+    let guard = state.service.lock().await;
+    let service = guard.as_ref().ok_or_else(closed)?;
+    service.task_detail(id).await
+}
+
 #[tauri::command]
 pub(crate) async fn get_settings(state: State<'_, AppState>) -> Result<Settings, ServiceError> {
     let guard = state.service.lock().await;
@@ -97,7 +108,11 @@ pub(crate) async fn set_settings(
 #[tauri::command]
 pub(crate) async fn pick_download_dir(app: tauri::AppHandle) -> Result<String, ServiceError> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = app.dialog().file().blocking_pick_folder();
+    // 对话框是阻塞式的，放到专用阻塞线程池，避免长期占用异步工作线程。
+    let picked =
+        tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+            .await
+            .map_err(|err| ServiceError::Internal(err.to_string()))?;
     let path = match picked {
         Some(file_path) => match file_path.into_path() {
             Ok(p) => p.to_string_lossy().into_owned(),

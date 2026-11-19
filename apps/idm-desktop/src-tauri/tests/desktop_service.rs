@@ -859,6 +859,7 @@ async fn autostart_toggle() -> TestResult {
 fn view(id: i64, state: &str, name: &str) -> TaskView {
     TaskView {
         id,
+        kind: idm_desktop::service::classify(name).to_string(),
         file_name: Some(name.to_string()),
         url_display: format!("https://example.com/{name}"),
         total_size: None,
@@ -932,6 +933,124 @@ async fn notify_setting_roundtrip() -> TestResult {
         "写入 true 后应读回 true"
     );
 
+    svc.shutdown().await?;
+    Ok(())
+}
+
+// --- classify：任务类型分类 ------------------------------------------
+
+#[test]
+fn classify_groups_by_extension() {
+    use idm_desktop::service::classify;
+
+    let cases: &[(&str, &str)] = &[
+        // archive
+        ("setup.zip", "archive"),
+        ("disc.iso", "archive"),
+        ("bash-5.2.tar.gz", "archive"),
+        ("data.TAR.GZ", "archive"),
+        // video
+        ("movie.mp4", "video"),
+        ("clip.WEBM", "video"),
+        // audio
+        ("song.mp3", "audio"),
+        ("tune.FLAC", "audio"),
+        // document
+        ("report.pdf", "document"),
+        ("notes.DOCX", "document"),
+        // program
+        ("app.exe", "program"),
+        ("pkg.MSI", "program"),
+        // other
+        ("README", "other"),
+        ("image.png", "other"),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(classify(name), *expected, "name={name}");
+    }
+}
+
+// --- task_detail：分块详情（只读，慢速 4 连接）--------------------------
+
+#[tokio::test]
+async fn task_detail_reports_chunks() -> TestResult {
+    let size = 8 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        speed: Some(SpeedPolicy(Arc::new(|_, _| Some(512 * KIB)))),
+        ..ServerConfig::default()
+    })
+    .await?;
+
+    let tmp = TempDir::new()?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db.clone()).await?;
+    let id = svc.add_task(srv.url("/detail.bin"), Some(4)).await?;
+
+    // 等待下载真正开始且有一定进度。
+    wait_for(
+        &svc,
+        |v| {
+            v.iter()
+                .any(|t| t.id == id && t.state == "Downloading" && t.downloaded > 0)
+        },
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    let detail = svc.task_detail(id).await?;
+    assert_eq!(detail.id, id);
+    assert!(
+        detail.chunks.len() >= 4,
+        "4 连接应至少 4 个分块：{}",
+        detail.chunks.len()
+    );
+
+    // 分块范围首尾相接、覆盖整个文件且不重叠（end 为包含式）。
+    let mut ranges: Vec<(u64, u64)> = detail
+        .chunks
+        .iter()
+        .map(|c| (c.start, c.end.saturating_add(1)))
+        .collect();
+    ranges.sort();
+    let mut expected = 0u64;
+    for (start, end_exclusive) in ranges {
+        assert_eq!(start, expected, "分块应首尾相接");
+        assert!(end_exclusive >= start, "分块区间不得倒置");
+        expected = end_exclusive;
+    }
+    assert_eq!(expected, size, "分块应覆盖整个文件");
+
+    // 各块 downloaded 之和与列表里的 downloaded 相差不超过 1 MiB。
+    let chunk_sum: u64 = detail.chunks.iter().map(|c| c.downloaded).sum();
+    let listed = svc
+        .list_tasks()
+        .await?
+        .into_iter()
+        .find(|t| t.id == id)
+        .map(|t| t.downloaded)
+        .ok_or("task missing in list")?;
+    let diff = chunk_sum.abs_diff(listed);
+    assert!(diff <= MIB, "分块之和与列表下载量相差过大: {diff}");
+
+    // 完成后所有块为 done。
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.state == "Completed"),
+        Duration::from_secs(60),
+    )
+    .await?;
+    let final_detail = svc.task_detail(id).await?;
+    assert!(
+        final_detail.chunks.iter().all(|c| c.state == "done"),
+        "完成后所有块应为 done"
+    );
+
+    srv.shutdown();
     svc.shutdown().await?;
     Ok(())
 }

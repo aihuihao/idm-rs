@@ -1,5 +1,5 @@
 <template>
-  <div class="app">
+  <div class="app" @click="closeContextMenu">
     <h1>idm-rs 下载管理器</h1>
 
     <div v-if="readOnly" class="banner">
@@ -8,114 +8,218 @@
 
     <div v-if="fatalError" class="error-banner">
       <span>{{ fatalError }}</span>
-      <button class="error-close" @click="dismissFatalError">×</button>
+      <button class="error-close" @click.stop="dismissFatalError">×</button>
     </div>
 
     <div class="toolbar">
-      <button :disabled="readOnly || !urlInput.trim()" @click="onAdd">添加任务</button>
-      <button :disabled="readOnly" @click="confirmClearCompleted = true">清除已完成</button>
-      <button @click="openOptions">选项</button>
+      <button :disabled="readOnly" @click="openAddDialog">
+        <svg class="ico" viewBox="0 0 16 16"><path :d="icons.add" /></svg>添加任务
+      </button>
+      <button :disabled="readOnly || !canResumeSelection" @click="onResumeSelected">
+        <svg class="ico" viewBox="0 0 16 16"><path :d="icons.resume" /></svg>继续
+      </button>
+      <button :disabled="readOnly || !canPauseSelection" @click="onPauseSelected">
+        <svg class="ico" viewBox="0 0 16 16"><path :d="icons.pause" /></svg>暂停
+      </button>
+      <button :disabled="readOnly || selectedIds.size === 0" @click="askDeleteSelected">
+        <svg class="ico" viewBox="0 0 16 16"><path :d="icons.delete" /></svg>删除
+      </button>
+      <button :disabled="readOnly" @click="confirmClearCompleted = true">
+        <svg class="ico" viewBox="0 0 16 16"><path :d="icons.clear" /></svg>清除已完成
+      </button>
+      <button @click="openOptions">
+        <svg class="ico" viewBox="0 0 16 16"><path :d="icons.options" /></svg>选项
+      </button>
     </div>
 
-    <section class="add-bar">
-      <input
-        v-model="urlInput"
-        :disabled="readOnly"
-        type="text"
-        placeholder="输入下载网址"
-        @keyup.enter="onAdd"
-      />
-      <div v-if="addError" class="error-text">{{ addError }}</div>
-    </section>
+    <div class="main">
+      <aside class="sidebar">
+        <div class="side-title">状态</div>
+        <button
+          v-for="s in statusCats"
+          :key="s.key"
+          class="side-item"
+          :class="{ active: filterStatus === s.key }"
+          @click="filterStatus = s.key"
+        >
+          <span>{{ s.label }}</span><span class="count">{{ statusCount(s.key) }}</span>
+        </button>
+        <div class="side-title kind-title">类型</div>
+        <button
+          v-for="k in kindCats"
+          :key="k.key"
+          class="side-item"
+          :class="{ active: filterKind === k.key }"
+          @click="filterKind = k.key"
+        >
+          <svg class="ico" viewBox="0 0 16 16"><path :d="icons[k.icon]" /></svg>
+          <span>{{ k.label }}</span><span class="count">{{ kindCount(k.key) }}</span>
+        </button>
+      </aside>
 
-    <table class="tasks">
-      <colgroup>
-        <col class="col-name" />
-        <col class="col-size" />
-        <col class="col-progress" />
-        <col class="col-speed" />
-        <col class="col-eta" />
-        <col class="col-state" />
-        <col class="col-ops" />
-      </colgroup>
-      <thead>
-        <tr>
-          <th>文件名</th>
-          <th class="num">大小</th>
-          <th class="num">进度</th>
-          <th class="num">速度</th>
-          <th class="num">剩余时间</th>
-          <th>状态</th>
-          <th>操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="task in tasks" :key="task.id">
-          <td class="name" :title="task.file_name || task.url_display">
-            {{ task.file_name || task.url_display }}
-          </td>
-          <td class="num">{{ formatSize(task.total_size) }}</td>
-          <td class="num">
-            <template v-if="task.total_size && task.total_size > 0">
-              <progress :value="percent(task)" :max="100"></progress>
-              <span class="pct">{{ percent(task) }}%</span>
+      <div class="content">
+        <table class="tasks">
+          <colgroup>
+            <col class="col-icon" />
+            <col class="col-name" />
+            <col class="col-size" />
+            <col class="col-progress" />
+            <col class="col-speed" />
+            <col class="col-eta" />
+            <col class="col-state" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th></th>
+              <th>文件名</th>
+              <th class="num">大小</th>
+              <th class="num">进度</th>
+              <th class="num">速度</th>
+              <th class="num">剩余时间</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="task in filteredTasks"
+              :key="task.id"
+              :class="{ selected: selectedIds.has(task.id) }"
+              @click="onRowClick($event, task)"
+              @dblclick="onRowDblClick(task)"
+              @contextmenu.prevent="onContextMenu($event, task)"
+            >
+              <td class="type-icon">
+                <svg class="ico" viewBox="0 0 16 16" :title="kindLabel(task.kind)">
+                  <path :d="icons[kindIcon(task.kind)]" />
+                </svg>
+              </td>
+              <td class="name" :title="task.file_name || task.url_display">
+                {{ task.file_name || task.url_display }}
+              </td>
+              <td class="num">{{ formatSize(task.total_size) }}</td>
+              <td class="num">
+                <div v-if="task.total_size && task.total_size > 0" class="pbar">
+                  <div class="pbar-fill" :class="progressClass(task)" :style="{ width: percent(task) + '%' }"></div>
+                  <span class="pbar-text">{{ percent(task) }}%</span>
+                </div>
+                <span v-else>—</span>
+              </td>
+              <td class="num">{{ formatSpeed(task.speed_bps) }}</td>
+              <td class="num">{{ formatEta(task) }}</td>
+              <td :title="task.state === 'Failed' ? (task.last_error || '') : ''">{{ stateText(task) }}</td>
+            </tr>
+            <tr v-if="filteredTasks.length === 0">
+              <td colspan="7" class="empty">暂无任务</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <section v-if="selectedIds.size === 1" class="detail" :class="{ collapsed: detailCollapsed }">
+          <div class="detail-head" @click="detailCollapsed = !detailCollapsed">
+            <span>任务详情 — {{ singleSelected?.file_name || singleSelected?.url_display }}</span>
+            <button class="fold-btn" @click.stop="detailCollapsed = !detailCollapsed">
+              {{ detailCollapsed ? '展开' : '折叠' }}
+            </button>
+          </div>
+          <div v-if="!detailCollapsed" class="detail-body">
+            <template v-if="detail && detail.total_size != null && detail.chunks.length > 0">
+              <div class="detail-meta">
+                总大小 {{ formatSize(detail.total_size) }}　连接数 {{ detail.connections }}
+              </div>
+              <div class="segbar">
+                <div
+                  v-for="c in detail.chunks"
+                  :key="c.index"
+                  class="seg"
+                  :style="{ left: segLeft(c) + '%', width: segWidth(c) + '%' }"
+                >
+                  <div class="seg-fill" :class="chunkClass(c)" :style="{ width: chunkPct(c) + '%' }"></div>
+                </div>
+              </div>
+              <table class="chunks">
+                <thead>
+                  <tr><th>编号</th><th>范围</th><th class="num">已下载/总量</th><th class="num">速度</th><th>状态</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="c in detail.chunks" :key="c.index">
+                    <td>{{ c.index }}</td>
+                    <td>{{ formatSize(c.start) }} - {{ formatSize(c.end + 1) }}</td>
+                    <td class="num">{{ formatSize(c.downloaded) }}/{{ formatSize(c.end + 1 - c.start) }}</td>
+                    <td class="num">{{ formatSpeed(c.speed_bps) }}</td>
+                    <td>{{ chunkStateText(c.state) }}</td>
+                  </tr>
+                </tbody>
+              </table>
             </template>
-            <span v-else>—</span>
-          </td>
-          <td class="num">{{ formatSpeed(task.speed_bps) }}</td>
-          <td class="num">{{ formatEta(task) }}</td>
-          <td :title="task.state === 'Failed' ? (task.last_error || '') : ''">
-            {{ stateText(task) }}
-          </td>
-          <td class="ops">
-            <button
-              :disabled="readOnly || !canPause(task)"
-              @click="onPause(task.id)"
-            >暂停</button>
-            <button
-              :disabled="readOnly || !canResume(task)"
-              @click="onResume(task.id)"
-            >继续</button>
-            <button :disabled="readOnly" @click="askRemove(task)">删除</button>
-            <button
-              :disabled="task.state !== 'Completed'"
-              @click="onReveal(task.id)"
-            >打开文件夹</button>
-          </td>
-        </tr>
-        <tr v-if="tasks.length === 0">
-          <td colspan="7" class="empty">暂无任务</td>
-        </tr>
-      </tbody>
-    </table>
+            <div v-else class="detail-empty">该任务为单连接下载，无分段信息</div>
+          </div>
+        </section>
+      </div>
+    </div>
 
-    <div v-if="confirmTarget" class="overlay">
+    <div class="statusbar">
+      <span>下载中：{{ downloadingCount }}</span>
+      <span>总速度：{{ formatSpeed(totalSpeed) }}</span>
+      <span>全局限速：{{ globalSpeed === 0 ? '不限速' : formatSpeed(globalSpeed) }}</span>
+    </div>
+
+    <!-- 右键菜单 -->
+    <div v-if="contextMenu.visible" class="ctx-menu" :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }">
+      <button :disabled="readOnly || !ctxCanResume" @click.stop="ctxAction('resume')">继续</button>
+      <button :disabled="readOnly || !ctxCanPause" @click.stop="ctxAction('pause')">暂停</button>
+      <button :disabled="readOnly" @click.stop="ctxAction('delete')">删除</button>
+      <button :disabled="readOnly || ctxTask?.state !== 'Completed'" @click.stop="ctxAction('reveal')">打开文件夹</button>
+    </div>
+
+    <!-- 添加任务对话框 -->
+    <div v-if="addOpen" class="overlay" @click.self="addOpen = false">
       <div class="dialog">
-        <p>确定删除任务「{{ confirmTarget.file_name || confirmTarget.url_display }}」吗？</p>
+        <h2>添加任务</h2>
+        <input
+          v-model="addUrl"
+          type="text"
+          placeholder="输入下载网址"
+          autofocus
+          @keyup.enter="onAdd"
+        />
+        <div v-if="addError" class="error-text">{{ addError }}</div>
+        <div class="dialog-ops">
+          <button @click="addOpen = false">取消</button>
+          <button :disabled="!addUrl.trim()" @click="onAdd">开始下载</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 删除确认框 -->
+    <div v-if="confirmDelete" class="overlay" @click.self="confirmDelete = false">
+      <div class="dialog">
+        <p>{{ deleteConfirmText }}</p>
         <label class="checkbox">
           <input v-model="deleteFile" type="checkbox" />
           同时删除已下载的文件
         </label>
         <div v-if="confirmError" class="error-text">{{ confirmError }}</div>
         <div class="dialog-ops">
-          <button :disabled="readOnly" @click="confirmTarget = null">取消</button>
-          <button :disabled="readOnly" @click="onConfirmRemove">确定</button>
+          <button @click="confirmDelete = false">取消</button>
+          <button :disabled="readOnly" @click="onConfirmDelete">确定</button>
         </div>
       </div>
     </div>
 
-    <div v-if="confirmClearCompleted" class="overlay">
+    <!-- 清除已完成确认框 -->
+    <div v-if="confirmClearCompleted" class="overlay" @click.self="confirmClearCompleted = false">
       <div class="dialog">
         <p>确定清除所有已完成的任务记录吗？已下载的文件不会被删除。</p>
         <div v-if="clearError" class="error-text">{{ clearError }}</div>
         <div class="dialog-ops">
-          <button :disabled="readOnly" @click="confirmClearCompleted = false">取消</button>
+          <button @click="confirmClearCompleted = false">取消</button>
           <button :disabled="readOnly" @click="onClearCompleted">确定</button>
         </div>
       </div>
     </div>
 
-    <div v-if="optionsOpen" class="overlay">
+    <!-- 选项对话框 -->
+    <div v-if="optionsOpen" class="overlay" @click.self="closeOptions">
       <div class="dialog options-dialog">
         <h2>选项</h2>
         <div class="field">
@@ -131,23 +235,11 @@
         </div>
         <div class="field">
           <label>同时下载任务数（1~16）</label>
-          <input
-            v-model.number="draftSettings.max_tasks"
-            :disabled="readOnly"
-            type="number"
-            min="1"
-            max="16"
-          />
+          <input v-model.number="draftSettings.max_tasks" :disabled="readOnly" type="number" min="1" max="16" />
         </div>
         <div class="field">
           <label>每任务默认连接数（1~32）</label>
-          <input
-            v-model.number="draftSettings.default_connections"
-            :disabled="readOnly"
-            type="number"
-            min="1"
-            max="32"
-          />
+          <input v-model.number="draftSettings.default_connections" :disabled="readOnly" type="number" min="1" max="32" />
         </div>
         <div class="field">
           <label class="checkbox">
@@ -157,11 +249,7 @@
         </div>
         <div class="field">
           <label class="checkbox">
-            <input
-              v-model="draftSettings.notify_on_complete"
-              :disabled="readOnly"
-              type="checkbox"
-            />
+            <input v-model="draftSettings.notify_on_complete" :disabled="readOnly" type="checkbox" />
             下载完成时通知
           </label>
         </div>
@@ -176,12 +264,13 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 interface TaskView {
   id: number;
+  kind: string;
   file_name: string | null;
   url_display: string;
   total_size: number | null;
@@ -201,12 +290,73 @@ interface Settings {
   notify_on_complete: boolean;
 }
 
+interface ChunkView {
+  index: number;
+  start: number;
+  end: number;
+  downloaded: number;
+  speed_bps: number;
+  state: string;
+}
+
+interface TaskDetail {
+  id: number;
+  total_size: number | null;
+  connections: number;
+  chunks: ChunkView[];
+}
+
+// 自己绘制的简单图形路径（16x16）。
+const icons: Record<string, string> = {
+  add: 'M8 3v10M3 8h10',
+  resume: 'M4 3l9 5-9 5z',
+  pause: 'M5 3v10M11 3v10',
+  delete: 'M3 5h10M6 5V3h4v2M5 5l1 8h4l1-8',
+  clear: 'M3 8l3 3 7-7',
+  options: 'M8 5a3 3 0 1 0 0 6 3 3 0 0 0 0-6M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2',
+  archive: 'M2 4h12v3H2zM3 7v7h10V7M6 10h4',
+  video: 'M2 4h12v8H2zM6 6l4 2-4 2z',
+  audio: 'M6 12V5l6-1v7M6 12a2 2 0 1 1-2-2M12 11a2 2 0 1 1-2-2',
+  document: 'M4 2h6l3 3v9H4zM10 2v3h3',
+  program: 'M5 5h6v6H5zM3 8h2M11 8h2M8 3v2M8 11v2',
+  other: 'M5 5h6v6H5z',
+};
+
+const statusCats = [
+  { key: 'all', label: '全部' },
+  { key: 'downloading', label: '下载中' },
+  { key: 'incomplete', label: '未完成' },
+  { key: 'completed', label: '已完成' },
+];
+const kindCats = [
+  { key: 'archive', label: '压缩包', icon: 'archive' },
+  { key: 'video', label: '视频', icon: 'video' },
+  { key: 'audio', label: '音频', icon: 'audio' },
+  { key: 'document', label: '文档', icon: 'document' },
+  { key: 'program', label: '程序', icon: 'program' },
+  { key: 'other', label: '其他', icon: 'other' },
+];
+
+function kindIcon(kind: string): string {
+  return icons[kind] ? kind : 'other';
+}
+function kindLabel(kind: string): string {
+  const found = kindCats.find((k) => k.key === kind);
+  return found ? found.label : '其他';
+}
+
 const readOnly = ref(false);
 const tasks = ref<TaskView[]>([]);
-const urlInput = ref('');
-const addError = ref('');
+const selectedIds = ref<Set<number>>(new Set());
+const filterStatus = ref('all');
+const filterKind = ref('all');
 const fatalError = ref('');
-const confirmTarget = ref<TaskView | null>(null);
+
+const addOpen = ref(false);
+const addUrl = ref('');
+const addError = ref('');
+
+const confirmDelete = ref(false);
 const deleteFile = ref(false);
 const confirmError = ref('');
 const confirmClearCompleted = ref(false);
@@ -214,69 +364,102 @@ const clearError = ref('');
 
 const optionsOpen = ref(false);
 const draftSettings = ref<Settings>({
-  download_dir: '',
-  global_max_speed: 0,
-  max_tasks: 3,
-  default_connections: 8,
-  autostart: false,
-  notify_on_complete: true,
+  download_dir: '', global_max_speed: 0, max_tasks: 3,
+  default_connections: 8, autostart: false, notify_on_complete: true,
 });
 const draftSpeedKb = ref(0);
 const optionsError = ref('');
 
+const globalSpeed = ref(0);
+
+const contextMenu = ref({ visible: false, x: 0, y: 0, taskId: 0 });
+
+const detail = ref<TaskDetail | null>(null);
+const detailCollapsed = ref(false);
+
 let unlisten: (() => void) | null = null;
 let fatalTimer: ReturnType<typeof setTimeout> | null = null;
+let detailTimer: ReturnType<typeof setInterval> | null = null;
 
-function dismissFatalError(): void {
-  if (fatalTimer !== null) {
-    clearTimeout(fatalTimer);
-    fatalTimer = null;
+const filteredTasks = computed(() =>
+  tasks.value.filter((t) => statusMatch(t) && (filterKind.value === 'all' || t.kind === filterKind.value)),
+);
+const selectedTasks = computed(() => tasks.value.filter((t) => selectedIds.value.has(t.id)));
+const singleSelected = computed(() => (selectedIds.value.size === 1 ? selectedTasks.value[0] ?? null : null));
+const canResumeSelection = computed(
+  () => selectedTasks.value.length > 0 && selectedTasks.value.some((t) => t.state === 'Paused' || t.state === 'Failed'),
+);
+const canPauseSelection = computed(
+  () => selectedTasks.value.length > 0 && selectedTasks.value.some((t) => t.state === 'Queued' || t.state === 'Downloading'),
+);
+const downloadingCount = computed(() => tasks.value.filter((t) => t.state === 'Downloading').length);
+const totalSpeed = computed(() => tasks.value.reduce((sum, t) => sum + (t.speed_bps || 0), 0));
+const deleteConfirmText = computed(() => {
+  const n = selectedIds.value.size;
+  return n > 1 ? `确定删除选中的 ${n} 个任务吗？` : '确定删除任务吗？';
+});
+const ctxTask = computed(() => tasks.value.find((t) => t.id === contextMenu.value.taskId) ?? null);
+const ctxCanResume = computed(() => ctxTask.value?.state === 'Paused' || ctxTask.value?.state === 'Failed');
+const ctxCanPause = computed(() => ctxTask.value?.state === 'Queued' || ctxTask.value?.state === 'Downloading');
+
+function statusMatch(t: TaskView): boolean {
+  switch (filterStatus.value) {
+    case 'downloading': return t.state === 'Downloading';
+    case 'incomplete': return t.state === 'Queued' || t.state === 'Paused' || t.state === 'Failed';
+    case 'completed': return t.state === 'Completed';
+    default: return true;
   }
-  fatalError.value = '';
+}
+function statusCount(key: string): number {
+  return tasks.value.filter((t) => (key === 'all' ? true : statusMatchKey(t, key))).length;
+}
+function statusMatchKey(t: TaskView, key: string): boolean {
+  switch (key) {
+    case 'downloading': return t.state === 'Downloading';
+    case 'incomplete': return t.state === 'Queued' || t.state === 'Paused' || t.state === 'Failed';
+    case 'completed': return t.state === 'Completed';
+    default: return true;
+  }
+}
+function kindCount(key: string): number {
+  return key === 'all' ? tasks.value.length : tasks.value.filter((t) => t.kind === key).length;
 }
 
+function dismissFatalError(): void {
+  if (fatalTimer !== null) { clearTimeout(fatalTimer); fatalTimer = null; }
+  fatalError.value = '';
+}
 function showFatalError(message: string): void {
   dismissFatalError();
   fatalError.value = message;
-  fatalTimer = setTimeout(() => {
-    fatalTimer = null;
-    fatalError.value = '';
-  }, 8000);
+  fatalTimer = setTimeout(() => { fatalTimer = null; fatalError.value = ''; }, 8000);
 }
-
-function isStaleTaskError(message: string): boolean {
-  return message.includes('neither active nor queued') || message.includes('不在活动或排队');
-}
-
 function errText(err: unknown): string {
   if (typeof err === 'string') return err;
   if (err instanceof Error) return err.message;
   return String(err);
 }
+function isStaleTaskError(message: string): boolean {
+  return message.includes('neither active nor queued') || message.includes('不在活动或排队');
+}
 
-function formatSize(bytes: number | null): string {
+function formatSize(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined) return '未知';
   const units = ['B', 'KB', 'MB', 'GB'];
   let value = bytes;
   let index = 0;
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024;
-    index += 1;
-  }
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
   return `${value.toFixed(1)} ${units[index]}`;
 }
-
 function formatSpeed(bytesPerSecond: number): string {
   if (!bytesPerSecond || bytesPerSecond <= 0) return '—';
   return `${formatSize(bytesPerSecond)}/秒`;
 }
-
 function percent(task: TaskView): number {
   if (!task.total_size || task.total_size <= 0) return 0;
   const value = Math.round((task.downloaded / task.total_size) * 1000) / 10;
   return Math.max(0, Math.min(100, value));
 }
-
 function formatEta(task: TaskView): string {
   if (!task.total_size || !task.speed_bps || task.speed_bps <= 0) return '—';
   const remaining = task.total_size - task.downloaded;
@@ -287,106 +470,97 @@ function formatEta(task: TaskView): string {
   const seconds = totalSeconds % 60;
   return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
-
 function stateText(task: TaskView): string {
   switch (task.state) {
-    case 'Queued':
-      return '排队中';
-    case 'Downloading':
-      return '下载中';
-    case 'Paused':
-      return task.pause_reason === 'Interrupted' ? '已中断' : '已暂停';
-    case 'Completed':
-      return '已完成';
-    case 'Failed':
-      return '失败';
-    default:
-      return task.state;
+    case 'Queued': return '排队中';
+    case 'Downloading': return '下载中';
+    case 'Paused': return task.pause_reason === 'Interrupted' ? '已中断' : '已暂停';
+    case 'Completed': return '已完成';
+    case 'Failed': return '失败';
+    default: return task.state;
+  }
+}
+function progressClass(task: TaskView): string {
+  switch (task.state) {
+    case 'Completed': return 'done';
+    case 'Failed': return 'failed';
+    case 'Paused': return 'paused';
+    default: return 'active';
   }
 }
 
-function canPause(task: TaskView): boolean {
-  return task.state === 'Queued' || task.state === 'Downloading';
+function setSelected(next: Set<number>): void {
+  selectedIds.value = next;
 }
-
-function canResume(task: TaskView): boolean {
-  return task.state === 'Paused' || task.state === 'Failed';
-}
-
-async function refreshTasks(): Promise<void> {
-  try {
-    tasks.value = await invoke<TaskView[]>('list_tasks');
-  } catch (err) {
-    showFatalError(errText(err));
+function onRowClick(event: MouseEvent, task: TaskView): void {
+  const next = new Set(selectedIds.value);
+  if (event.ctrlKey || event.metaKey) {
+    if (next.has(task.id)) next.delete(task.id); else next.add(task.id);
+  } else {
+    next.clear();
+    next.add(task.id);
   }
+  setSelected(next);
+}
+function onRowDblClick(task: TaskView): void {
+  if (task.state !== 'Completed') return;
+  void invoke('reveal_task', { id: task.id }).catch((err) => showFatalError(errText(err)));
 }
 
-async function onAdd(): Promise<void> {
-  addError.value = '';
-  const url = urlInput.value.trim();
-  if (!url) return;
-  try {
-    await invoke('add_task', { url, connections: null });
-    urlInput.value = '';
-    await refreshTasks();
-  } catch (err) {
-    addError.value = errText(err);
+function onContextMenu(event: MouseEvent, task: TaskView): void {
+  if (!selectedIds.value.has(task.id)) setSelected(new Set([task.id]));
+  contextMenu.value = { visible: true, x: event.clientX, y: event.clientY, taskId: task.id };
+}
+function closeContextMenu(): void {
+  if (contextMenu.value.visible) contextMenu.value = { ...contextMenu.value, visible: false };
+}
+async function ctxAction(action: string): Promise<void> {
+  const id = contextMenu.value.taskId;
+  closeContextMenu();
+  if (action === 'reveal') {
+    await invoke('reveal_task', { id }).catch((err) => showFatalError(errText(err)));
+    return;
   }
+  await runOnIds([id], action);
 }
 
-async function onPause(id: number): Promise<void> {
-  try {
-    await invoke('pause_task', { id });
-  } catch (err) {
-    const message = errText(err);
-    if (!isStaleTaskError(message)) {
-      showFatalError(message);
-      return;
+async function runOnIds(ids: number[], action: string): Promise<void> {
+  for (const id of ids) {
+    try {
+      if (action === 'pause') await invoke('pause_task', { id });
+      else if (action === 'resume') await invoke('resume_task', { id });
+      else if (action === 'delete') await invoke('remove_task', { id, deleteFile: deleteFile.value });
+    } catch (err) {
+      const message = errText(err);
+      if (action === 'delete' || !isStaleTaskError(message)) {
+        if (action === 'delete') { confirmError.value = message; }
+        else { showFatalError(message); }
+      }
+      // 任务已结束等过期错误静默忽略
     }
   }
   await refreshTasks();
 }
 
-async function onResume(id: number): Promise<void> {
-  try {
-    await invoke('resume_task', { id });
-  } catch (err) {
-    const message = errText(err);
-    if (!isStaleTaskError(message)) {
-      showFatalError(message);
-      return;
-    }
-  }
-  await refreshTasks();
+async function onPauseSelected(): Promise<void> {
+  const ids = selectedTasks.value.filter((t) => t.state === 'Queued' || t.state === 'Downloading').map((t) => t.id);
+  await runOnIds(ids, 'pause');
 }
-
-function askRemove(task: TaskView): void {
-  confirmTarget.value = task;
+async function onResumeSelected(): Promise<void> {
+  const ids = selectedTasks.value.filter((t) => t.state === 'Paused' || t.state === 'Failed').map((t) => t.id);
+  await runOnIds(ids, 'resume');
+}
+function askDeleteSelected(): void {
   deleteFile.value = false;
   confirmError.value = '';
+  confirmDelete.value = true;
 }
-
-async function onConfirmRemove(): Promise<void> {
-  const target = confirmTarget.value;
-  if (!target) return;
+async function onConfirmDelete(): Promise<void> {
   confirmError.value = '';
-  try {
-    await invoke('remove_task', { id: target.id, deleteFile: deleteFile.value });
-    confirmTarget.value = null;
-    await refreshTasks();
-  } catch (err) {
-    confirmError.value = errText(err);
-  }
+  const ids = Array.from(selectedIds.value);
+  await runOnIds(ids, 'delete');
+  confirmDelete.value = false;
 }
-
-async function onReveal(id: number): Promise<void> {
-  try {
-    await invoke('reveal_task', { id });
-  } catch (err) {
-    showFatalError(errText(err));
-  }
-}
-
 async function onClearCompleted(): Promise<void> {
   clearError.value = '';
   try {
@@ -398,6 +572,35 @@ async function onClearCompleted(): Promise<void> {
   }
 }
 
+function openAddDialog(): void {
+  addUrl.value = '';
+  addError.value = '';
+  addOpen.value = true;
+}
+async function onAdd(): Promise<void> {
+  addError.value = '';
+  const url = addUrl.value.trim();
+  if (!url) return;
+  try {
+    await invoke('add_task', { url, connections: null });
+    addOpen.value = false;
+    await refreshTasks();
+  } catch (err) {
+    addError.value = errText(err);
+  }
+}
+
+async function refreshTasks(): Promise<void> {
+  try {
+    tasks.value = await invoke<TaskView[]>('list_tasks');
+    const valid = new Set(tasks.value.map((t) => t.id));
+    const next = new Set(Array.from(selectedIds.value).filter((id) => valid.has(id)));
+    if (next.size !== selectedIds.value.size) setSelected(next);
+  } catch (err) {
+    showFatalError(errText(err));
+  }
+}
+
 async function openOptions(): Promise<void> {
   optionsError.value = '';
   const saved = await invoke<Settings>('get_settings');
@@ -405,12 +608,10 @@ async function openOptions(): Promise<void> {
   draftSpeedKb.value = Math.round(saved.global_max_speed / 1024);
   optionsOpen.value = true;
 }
-
 function closeOptions(): void {
   optionsOpen.value = false;
   optionsError.value = '';
 }
-
 async function onPickDir(): Promise<void> {
   optionsError.value = '';
   try {
@@ -420,7 +621,6 @@ async function onPickDir(): Promise<void> {
     optionsError.value = errText(err);
   }
 }
-
 async function onSaveOptions(): Promise<void> {
   optionsError.value = '';
   const payload: Settings = {
@@ -433,228 +633,256 @@ async function onSaveOptions(): Promise<void> {
   };
   try {
     await invoke('set_settings', { settings: payload });
+    globalSpeed.value = payload.global_max_speed;
     closeOptions();
   } catch (err) {
     optionsError.value = errText(err);
   }
 }
 
+function stopDetailTimer(): void {
+  if (detailTimer !== null) { clearInterval(detailTimer); detailTimer = null; }
+}
+async function loadDetail(id: number): Promise<void> {
+  try {
+    detail.value = await invoke<TaskDetail>('task_detail', { id });
+  } catch {
+    detail.value = null;
+  }
+}
+watch([selectedIds, detailCollapsed], () => {
+  stopDetailTimer();
+  detail.value = null;
+  if (selectedIds.value.size === 1 && !detailCollapsed.value) {
+    const id = Array.from(selectedIds.value)[0] as number;
+    void loadDetail(id);
+    detailTimer = setInterval(() => { void loadDetail(id); }, 500);
+  }
+});
+
+function segLeft(c: ChunkView): number {
+  if (!detail.value?.total_size || detail.value.total_size <= 0) return 0;
+  return (c.start / detail.value.total_size) * 100;
+}
+function segWidth(c: ChunkView): number {
+  if (!detail.value?.total_size || detail.value.total_size <= 0) return 0;
+  return ((c.end + 1 - c.start) / detail.value.total_size) * 100;
+}
+function chunkPct(c: ChunkView): number {
+  const len = c.end + 1 - c.start;
+  if (len <= 0) return 0;
+  return Math.max(0, Math.min(100, (c.downloaded / len) * 100));
+}
+function chunkClass(c: ChunkView): string {
+  switch (c.state) {
+    case 'done': return 'done';
+    case 'retrying': return 'retrying';
+    case 'active': return 'active';
+    default: return 'waiting';
+  }
+}
+function chunkStateText(state: string): string {
+  switch (state) {
+    case 'active': return '下载中';
+    case 'done': return '已完成';
+    case 'retrying': return '重试中';
+    default: return '等待';
+  }
+}
+
+function onKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Delete' && selectedIds.value.size > 0 && !readOnly.value) {
+    const target = event.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+    askDeleteSelected();
+  }
+  if (event.key === 'Escape') {
+    contextMenu.value = { ...contextMenu.value, visible: false };
+  }
+}
+
 onMounted(async () => {
   try {
     readOnly.value = await invoke<boolean>('is_read_only');
+    const saved = await invoke<Settings>('get_settings');
+    globalSpeed.value = saved.global_max_speed;
     await refreshTasks();
     unlisten = await listen<string>('tasks-updated', (event) => {
       try {
         const parsed: unknown = JSON.parse(event.payload);
-        if (Array.isArray(parsed)) {
-          tasks.value = parsed as TaskView[];
-        }
+        if (Array.isArray(parsed)) tasks.value = parsed as TaskView[];
       } catch {
-        // 忽略非法载荷，保留上一次的列表
+        // 忽略非法载荷
       }
     });
+    window.addEventListener('keydown', onKeydown);
   } catch (err) {
     showFatalError(errText(err));
   }
 });
 
 onUnmounted(() => {
-  if (unlisten) {
-    unlisten();
-    unlisten = null;
-  }
+  if (unlisten) { unlisten(); unlisten = null; }
+  stopDetailTimer();
+  window.removeEventListener('keydown', onKeydown);
   dismissFatalError();
 });
 </script>
 
 <style>
-.app {
-  font-family: 'Microsoft YaHei', sans-serif;
-  max-width: 960px;
-  margin: 0 auto;
-  padding: 16px;
-  color: #222;
+:root {
+  --bg: #ffffff;
+  --fg: #222222;
+  --border: #d0d0d0;
+  --header-bg: #f0f0f0;
+  --row-alt: #f7f7f7;
+  --row-hover: #e8f0ff;
+  --sel-bg: #cfe0ff;
+  --bar-bg: #f5f5f5;
+  --track: #e6e6e6;
+  --panel-bg: #fafafa;
+  --danger: #c00000;
+  --err-bg: #f8d7da;
+  --err-border: #f5c6cb;
+  --warn-bg: #fff3cd;
+  --warn-fg: #856404;
+  --warn-border: #ffeeba;
+  --blue: #2d7ff9;
+  --green: #2eb85c;
+  --gray: #9aa0a6;
+  --red: #e55353;
+  --orange: #f0a020;
 }
-h1 {
-  font-size: 20px;
-  margin: 0 0 12px;
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --fg: #e0e0e0;
+    --border: #3a3a3a;
+    --header-bg: #2a2a2a;
+    --row-alt: #262626;
+    --row-hover: #2c3a4a;
+    --sel-bg: #344a66;
+    --bar-bg: #262626;
+    --track: #3a3a3a;
+    --panel-bg: #242424;
+    --danger: #ff6b6b;
+    --err-bg: #4a2328;
+    --err-border: #6b3038;
+    --warn-bg: #433a1f;
+    --warn-fg: #f0d98a;
+    --warn-border: #665828;
+  }
 }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+}
+.app { display: flex; flex-direction: column; height: 100vh; padding: 10px; gap: 8px; }
+h1 { font-size: 16px; margin: 0; }
 .banner {
-  background: #fff3cd;
-  border: 1px solid #ffeeba;
-  color: #856404;
-  padding: 10px;
-  border-radius: 4px;
-  margin-bottom: 12px;
-}
-.error-banner,
-.error-text {
-  color: #c00;
+  background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-fg);
+  padding: 8px; border-radius: 4px;
 }
 .error-banner {
-  background: #f8d7da;
-  border: 1px solid #f5c6cb;
-  padding: 10px;
-  border-radius: 4px;
-  margin-bottom: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  background: var(--err-bg); border: 1px solid var(--err-border); color: var(--danger);
+  padding: 8px; border-radius: 4px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
 }
-.error-close {
-  border: none;
-  background: transparent;
-  color: #c00;
-  font-size: 18px;
-  line-height: 1;
-  padding: 0 4px;
-}
-.toolbar {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-.add-bar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-  margin-bottom: 16px;
-}
-.add-bar input[type='text'] {
-  flex: 1;
-  min-width: 240px;
-  padding: 6px;
-}
-.add-bar .error-text {
-  flex-basis: 100%;
-}
+.error-text { color: var(--danger); }
+.error-close { border: none; background: transparent; color: var(--danger); font-size: 18px; line-height: 1; cursor: pointer; }
+.toolbar { display: flex; gap: 6px; flex-wrap: wrap; }
 button {
-  padding: 5px 12px;
-  cursor: pointer;
+  font-family: inherit; font-size: 13px; padding: 4px 10px; cursor: pointer;
+  color: var(--fg); background: var(--bar-bg); border: 1px solid var(--border); border-radius: 3px;
 }
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
+button:disabled { cursor: not-allowed; opacity: 0.5; }
+button .ico { vertical-align: -2px; }
+.ico { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
+.main { display: flex; flex: 1; min-height: 0; gap: 8px; }
+.sidebar {
+  width: 160px; flex-shrink: 0; overflow-y: auto; background: var(--panel-bg);
+  border: 1px solid var(--border); border-radius: 4px; padding: 6px;
 }
-table.tasks {
-  width: 100%;
-  table-layout: fixed;
-  border-collapse: collapse;
-  font-size: 13px;
+.side-title { font-weight: bold; padding: 4px 6px; color: var(--fg); }
+.kind-title { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.side-item {
+  display: flex; align-items: center; gap: 6px; width: 100%; border: none; background: transparent;
+  text-align: left; padding: 5px 6px; border-radius: 3px;
 }
-table.tasks th,
-table.tasks td {
-  border: 1px solid #ddd;
-  padding: 6px;
-  text-align: left;
-  overflow: hidden;
+.side-item:hover { background: var(--row-hover); }
+.side-item.active { background: var(--sel-bg); }
+.side-item .count { margin-left: auto; color: var(--gray); }
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+table.tasks { width: 100%; table-layout: fixed; border-collapse: collapse; }
+table.tasks th, table.tasks td {
+  border: 1px solid var(--border); padding: 4px 6px; text-align: left; height: 28px; overflow: hidden;
 }
-table.tasks th {
-  background: #f5f5f5;
+table.tasks th { background: var(--header-bg); position: sticky; top: 0; }
+table.tasks tbody tr:nth-child(even) { background: var(--row-alt); }
+table.tasks tbody tr:hover { background: var(--row-hover); }
+table.tasks tbody tr.selected { background: var(--sel-bg); }
+table.tasks .col-icon { width: 32px; }
+table.tasks .col-name { width: auto; }
+table.tasks .col-size { width: 82px; }
+table.tasks .col-progress { width: 110px; }
+table.tasks .col-speed { width: 96px; }
+table.tasks .col-eta { width: 92px; }
+table.tasks .col-state { width: 72px; }
+table.tasks .name { text-overflow: ellipsis; white-space: nowrap; }
+table.tasks .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.empty { text-align: center; color: var(--gray); padding: 16px; }
+.pbar { position: relative; width: 100%; height: 15px; background: var(--track); border-radius: 2px; overflow: hidden; }
+.pbar-fill { height: 100%; }
+.pbar-fill.active { background: var(--blue); }
+.pbar-fill.done { background: var(--green); }
+.pbar-fill.paused { background: var(--gray); }
+.pbar-fill.failed { background: var(--red); }
+.pbar-text { position: absolute; inset: 0; text-align: center; line-height: 15px; color: var(--fg); font-variant-numeric: tabular-nums; }
+.statusbar { display: flex; gap: 24px; padding: 6px 4px; border-top: 1px solid var(--border); color: var(--fg); }
+.detail { height: 200px; flex-shrink: 0; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; display: flex; flex-direction: column; }
+.detail.collapsed { height: auto; }
+.detail-head {
+  display: flex; align-items: center; justify-content: space-between; padding: 5px 8px;
+  background: var(--header-bg); cursor: pointer; font-weight: bold;
 }
-table.tasks .col-name {
-  width: 30%;
+.fold-btn { padding: 2px 8px; }
+.detail-body { flex: 1; overflow: auto; padding: 8px; }
+.detail-meta { margin-bottom: 6px; }
+.detail-empty { color: var(--gray); padding: 16px; text-align: center; }
+.segbar { position: relative; width: 100%; height: 16px; background: var(--track); margin-bottom: 8px; }
+.seg { position: absolute; top: 0; bottom: 0; border-right: 1px solid var(--bg); }
+.seg-fill { height: 100%; }
+.seg-fill.active { background: var(--blue); }
+.seg-fill.done { background: var(--green); }
+.seg-fill.retrying { background: var(--orange); }
+.seg-fill.waiting { background: transparent; }
+table.chunks { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.chunks th, table.chunks td { border: 1px solid var(--border); padding: 2px 6px; text-align: left; }
+table.chunks .num { text-align: right; font-variant-numeric: tabular-nums; }
+.ctx-menu {
+  position: fixed; z-index: 50; min-width: 130px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 4px; padding: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  display: flex; flex-direction: column;
 }
-table.tasks .col-size {
-  width: 10%;
-}
-table.tasks .col-progress {
-  width: 14%;
-}
-table.tasks .col-speed {
-  width: 12%;
-}
-table.tasks .col-eta {
-  width: 12%;
-}
-table.tasks .col-state {
-  width: 10%;
-}
-table.tasks .col-ops {
-  width: 210px;
-}
-table.tasks .name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-table.tasks .num {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-table.tasks .num progress {
-  width: 42px;
-  vertical-align: middle;
-}
-table.tasks .ops {
-  white-space: nowrap;
-  text-overflow: clip;
-}
-table.tasks .ops button {
-  margin-right: 4px;
-}
-.pct {
-  margin-left: 4px;
-}
-.empty {
-  text-align: center;
-  color: #888;
-  padding: 16px;
-}
+.ctx-menu button { border: none; background: transparent; text-align: left; }
+.ctx-menu button:hover:not(:disabled) { background: var(--row-hover); }
 .overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.35);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: flex;
+  align-items: center; justify-content: center; z-index: 100;
 }
-.dialog {
-  background: #fff;
-  padding: 20px;
-  border-radius: 6px;
-  min-width: 320px;
+.dialog { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 20px; min-width: 320px; }
+.options-dialog { min-width: 420px; }
+.dialog h2 { font-size: 16px; margin: 0 0 12px; }
+.dialog input[type='text'], .dialog input[type='number'] {
+  width: 100%; padding: 6px; color: var(--fg); background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
 }
-.options-dialog {
-  min-width: 420px;
-}
-.options-dialog h2 {
-  font-size: 17px;
-  margin: 0 0 12px;
-}
-.field {
-  margin-bottom: 10px;
-}
-.field label {
-  display: block;
-  margin-bottom: 4px;
-}
-.field input[type='text'],
-.field input[type='number'] {
-  width: 100%;
-  box-sizing: border-box;
-  padding: 6px;
-}
-.dir-row {
-  display: flex;
-  gap: 6px;
-}
-.dir-row input {
-  flex: 1;
-}
-.checkbox {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 12px 0;
-}
-.dialog-ops {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 12px;
-}
+.field { margin-bottom: 10px; }
+.field label { display: block; margin-bottom: 4px; }
+.checkbox { display: flex; align-items: center; gap: 6px; margin: 10px 0; }
+.dir-row { display: flex; gap: 6px; }
+.dir-row input { flex: 1; }
+.dialog-ops { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 </style>

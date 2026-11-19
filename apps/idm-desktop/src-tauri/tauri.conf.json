@@ -10,7 +10,9 @@
       {
         "title": "idm-rs",
         "width": 1000,
-        "height": 640
+        "height": 640,
+        "minWidth": 860,
+        "minHeight": 520
       }
     ],
     "security": {

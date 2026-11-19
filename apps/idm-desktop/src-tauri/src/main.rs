@@ -79,6 +79,7 @@ fn run() -> Result<(), String> {
             commands::get_settings,
             commands::set_settings,
             commands::pick_download_dir,
+            commands::task_detail,
         ])
         .setup(move |app| {
             // --- 托盘：菜单 + 图标 ---

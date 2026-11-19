@@ -15,6 +15,7 @@ use idm_core::net::{ProxyConfig, Url, parse_max_speed, validate_url};
 use idm_core::queue::{DownloadQueue, EnqueueRequest};
 use idm_core::runner::{Runner, RunnerConfig, RunnerStartError};
 use idm_core::store::{PauseReasonDb, Store, TaskStateDb, default_download_dir};
+use idm_core::task::ChunkState;
 
 const DEFAULT_MAX_TASKS: usize = 3;
 const DEFAULT_CONNECTIONS: usize = 8;
@@ -50,6 +51,7 @@ impl serde::Serialize for ServiceError {
 #[derive(Clone, serde::Serialize)]
 pub struct TaskView {
     pub id: i64,
+    pub kind: String,
     pub file_name: Option<String>,
     pub url_display: String,
     pub total_size: Option<u64>,
@@ -58,6 +60,29 @@ pub struct TaskView {
     pub state: String,
     pub pause_reason: Option<String>,
     pub last_error: Option<String>,
+}
+
+/// 单个下载分块的展示视图（不含请求头/Cookie/完整 URL）。
+#[derive(serde::Serialize, Clone)]
+pub struct ChunkView {
+    pub index: usize,
+    pub start: u64,
+    /// 结束位置（包含）。
+    pub end: u64,
+    pub downloaded: u64,
+    /// 拿不到实时速度时为 0。
+    pub speed_bps: u64,
+    /// "active" | "done" | "waiting" | "retrying"
+    pub state: String,
+}
+
+/// 任务详情：分块列表与整体信息。
+#[derive(serde::Serialize, Clone)]
+pub struct TaskDetail {
+    pub id: i64,
+    pub total_size: Option<u64>,
+    pub connections: usize,
+    pub chunks: Vec<ChunkView>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -168,6 +193,43 @@ pub fn finished_since(prev: &[TaskView], now: &[TaskView]) -> Vec<(i64, String, 
         out.push((item.id, name, is_completed));
     }
     out
+}
+
+/// 按文件名（或回退的 URL）扩展名判断任务类型，供左侧分类栏使用。
+///
+/// 不区分大小写；复合扩展名 `.tar.gz` 等归为 archive。
+pub fn classify(name: &str) -> &'static str {
+    const GROUPS: &[(&str, &[&str])] = &[
+        (
+            "archive",
+            &["zip", "rar", "7z", "tar", "gz", "xz", "bz2", "zst", "iso"],
+        ),
+        ("video", &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm"]),
+        ("audio", &["mp3", "flac", "wav", "aac", "ogg", "m4a"]),
+        (
+            "document",
+            &[
+                "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub",
+            ],
+        ),
+        ("program", &["exe", "msi", "apk", "dmg", "deb", "rpm"]),
+    ];
+    let lower = name.to_ascii_lowercase();
+    for ext in [".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst"] {
+        if lower.ends_with(ext) {
+            return "archive";
+        }
+    }
+    let ext = match lower.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() => ext,
+        _ => return "other",
+    };
+    for (kind, exts) in GROUPS {
+        if exts.contains(&ext) {
+            return kind;
+        }
+    }
+    "other"
 }
 
 /// 只保留 scheme://host[:port]/path，去掉 userinfo、query 与 fragment。
@@ -286,8 +348,15 @@ impl DesktopService {
                     .unwrap_or(0),
                 None => 0,
             };
+            let kind_name = item
+                .file_name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| url_display(&record.url));
+            let kind = classify(&kind_name).to_string();
             views.push(TaskView {
                 id: item.id,
+                kind,
                 file_name: item.file_name,
                 url_display: url_display(&record.url),
                 total_size: item.total_size,
@@ -393,6 +462,74 @@ impl DesktopService {
             }
         }
         Ok(())
+    }
+
+    /// 读取任务的分块详情（只读，观察模式也允许）。
+    ///
+    /// 活动任务优先取队列的实时分块快照；非活动/观察模式回退到数据库分块记录。
+    /// 分块进度区间在内部为半开 `[start, end)`，对外 `end` 转为包含式。
+    pub async fn task_detail(&self, id: i64) -> Result<TaskDetail, ServiceError> {
+        let record = self.store.get_task(id).await.map_err(internal)?;
+        let connections = record.connections.max(0) as usize;
+
+        let live = match &self.runner {
+            Some(runner) => runner.queue().progress(id).await,
+            None => None,
+        };
+
+        let chunks: Vec<ChunkView> = if let Some(snapshot) = live {
+            snapshot
+                .chunks
+                .iter()
+                .map(|c| {
+                    let state = match c.state {
+                        ChunkState::Downloading => "active",
+                        ChunkState::Done => "done",
+                        ChunkState::Failed | ChunkState::Cancelled => "retrying",
+                        ChunkState::Pending => "waiting",
+                    };
+                    ChunkView {
+                        index: c.db_index.max(0) as usize,
+                        start: c.start,
+                        end: c.end.saturating_sub(1),
+                        downloaded: c.current.saturating_sub(c.start),
+                        // 分块实时速度未发布到公开快照，按约定返回 0。
+                        speed_bps: 0,
+                        state: state.to_string(),
+                    }
+                })
+                .collect()
+        } else {
+            let all_done = record.state == TaskStateDb::Completed;
+            record
+                .chunks
+                .iter()
+                .map(|c| {
+                    let state = if all_done || c.committed >= c.end {
+                        "done"
+                    } else if c.committed > c.start {
+                        "active"
+                    } else {
+                        "waiting"
+                    };
+                    ChunkView {
+                        index: c.chunk_index.max(0) as usize,
+                        start: c.start,
+                        end: c.end.saturating_sub(1),
+                        downloaded: c.committed.saturating_sub(c.start),
+                        speed_bps: 0,
+                        state: state.to_string(),
+                    }
+                })
+                .collect()
+        };
+
+        Ok(TaskDetail {
+            id,
+            total_size: record.total_size,
+            connections,
+            chunks,
+        })
     }
 
     /// 在资源管理器中选中已完成任务的文件。观察模式（只读）也允许。
