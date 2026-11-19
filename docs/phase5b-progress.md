@@ -41,3 +41,46 @@
 - 步骤 2（分块速度前端计算）：每 500ms 以 index:start 为键记录 {t, downloaded} 采样，保留约 2 秒滑动窗口；速度=(末-首 downloaded)/(时间差)，后端 speed_bps>0 时优先；状态非 active 显示 —；downloaded 负增量（分块拆分）丢弃该块历史重算；选中变化/面板关闭清空采样。
 - 步骤 3（小修正）：新增 formatBytes，0 字节显示 0 B；范围列与已下载/总量列改用之。
 - 前端验证：vue-tsc + vite build PASS；无 v-html/innerHTML/eval；仅改 apps/idm-desktop/src/App.vue，未改 Rust、未新增 npm 包。
+
+## Phase 5b-4a（分块失控诊断，只读）
+
+- 步骤 0：git status 干净（HEAD cdc8edb），任务原文保存为 docs/prompts/phase5b-4a.md。本阶段只读诊断，不修改代码、不提交。
+- 步骤 1（现场数据）：默认数据库定位为 C:\Users\Administrator\AppData\Local\idm-rs\idm.db（由 idm_core::store::default_db_path 决定，约 80KB）。以 mode=ro + PRAGMA query_only 只读打开；schema 查询（sqlite_master）成功，取得 tasks/chunks/settings 等表结构。但后续两次「读取 tasks 行、分块统计、settings 值」的只读查询均因审批超时被取消（非安全护栏明确拦截，但按规则 4/7 精神不再尝试变体），故现场数值（url 主机、connections、total_size、state、pause_reason、last_error、分块统计、.idm-part 大小、主机上限实际值）未能取得，报告中如实标注受阻，待用户授权后补查。
+- 步骤 2（代码分析）：确认核心 bug。`in_flight_count`（split.rs:495-502）把等待 Host 许可的分块从在途计数扣除；拆分触发条件 `in_flight < max_concurrent`（download.rs:700-702、761-763）中的 max_concurrent = 初始连接数 32（download.rs:641）。select_victim 只选 eligible_for_split（已发请求）的分块（split.rs:424-430），排队块被排除。无分块总数上限（store split_chunk 事务无条件 INSERT，mod.rs:1016-1028；仅 min_split_size=1MiB 约束）。connections=32 > 每主机上限时，32 个块全创建、仅 ≤host 上限个持许可，其余排队被扣除计数 → 每 100ms 触发一次拆分 → 新块排队再被扣除 → 正反馈失控。新块在申请许可前即置 ChunkState::Downloading（download.rs:1124-1125），current=start、committed=start，故 UI 显示大量「下载中/0B」。额外发现：service.rs:310 把 host_max_connections 设成 settings.default_connections，语义错配。
+- 步骤 3（本地复现）：临时测试 crates/idm-core/tests/_diag_repro.rs（本地回环服务器，256KB/s 限速 + 前 6 请求延迟 25s，32 连接/主机上限 6/64MB），每 2 秒采样。结果：t=2s 分块数即从 0 暴涨到 59~68（远超 32），之后因本地 64MB 文件迅速完成而稳定不再增长。多次运行均复现「短时间内分块数远超连接数」，与用户根因一致；本地环境无法复现「持续增长到 347+」是因文件小/回环快，用户 4.2GB+真实慢网络会持续数分钟。临时测试已按规则删除（git status 确认仅剩 docs/prompts/phase5b-4a.md）。
+- 诊断结论与修复方案见最终报告；未修改任何代码、未提交。
+
+## Phase 5b-4b（修复分块拆分失控）
+
+- 步骤 0：git status 有 5b-4a 遗留的文档改动（phase5b-4a.md 未跟踪 + 进度文件，4a 要求不提交），本任务第 5 步暂存 docs 时一并提交；无代码改动。任务原文保存为 docs/prompts/phase5b-4b.md。
+- 步骤 1（回归测试，改代码前）：新建 crates/idm-core/tests/phase5b4_split_runaway.rs。限速确认 server_speed_limit_is_effective PASS（256KiB/s 下载 2MiB 耗时 7.98s ≥6s）——5b-4a「限速不生效」实为 await 完成后才采样的用法错误，改用外部 progress_tx + watch 边下边采样。主测试 split_does_not_run_away_when_host_limited（128KiB/s、64MiB、32 连接、每主机上限 4、外部 watch 采样、20s 后 cancel）。当前代码上运行失败：`t=2s chunks=32 not_started=28 downloaded=851968`，断言「分块数 32 超过上限 10」FAILED。有效并发=min(32,4)=4，上限取 2*4+2=10、未开始块上限 4。确认复现，继续修复。
+- 步骤 2（修复拆分逻辑）：download.rs ChunkSpawner 加 effective_concurrency=min(connections, host_max)、max_chunks=max(4×effective,16)；初始分块数 chunk_ranges 改用 effective（:420）；拆分阈值 max_concurrent 改用 effective（原 :641）；split.rs try_split 入口加两道闸门（not_started≥effective 或 total>max_chunks 则不拆），并写明三条规则与原因；Phase 3d「排队块不被当作卡住而接管」由 select_victim 的 eligible_for_split() 过滤保持不变。修复后主测试每 2s 分块数恒为 4、not_started=0、下载量稳步增长，PASS。
+- 步骤 3（排队状态可见）：progress.rs ChunkProgress 加只读字段 waiting_for_permit 及 publisher.set_chunk_waiting()；主循环 split_retry tick 每 100ms 从 slot.shared().waiting_for_permit() 同步到快照（download.rs，纯展示不改下载逻辑）；ChunkSlot 加 idx() 访问器。待桌面 ChunkView/UI 映射（步骤 4 停止前未完成）。
+- 步骤 4（每主机连接数设置）：STOPPED。判定 HostConnectionLimiter 不支持运行中修改——net/host_limit.rs:51-83 max_per_host 为不可变字段、仅 new()+getter，semaphore_for 用 Semaphore::new(max_per_host)（:88-91）无动态改容量；queue/mod.rs:105 host_limiter 为 Arc 且无替换 setter，运行中任务已 clone 旧 Arc。任务第 4 步第 3 条明确要求「修改后立即生效，若不支持则停下报告」，条件触发，停下，未擅自重启 runner 或改核心结构。未改桌面设置/UI、未做步骤 5 验证、未提交。
+- 构建异常：一次 cargo check 出现Incremental compilation ICE（编译器 bug），尝试清理 target/debug/incremental 时触发安全护栏 SAFE_DELETE_BULK_CONFIRM_REQUIRED，按规则 6 未绕过；重新 check 未清理缓存即通过（EXIT=0），ICE 未复现。
+- 用户续接（方案2变体）：(一) 统一有效并发来源；(二) 每主机上限设置改「重启生效」，不改 HostConnectionLimiter/queue 结构；(三) 完成桌面 queued；(四) 全部验证并提交。增量缓存问题如再出现停下报告、不清理。
+- 统一来源：download.rs 把 host_limiter 创建提前到初始分块之前（:314，注入优先否则按 config 新建），host_max=max_per_host()（:320）；初始分块（:436）、effective_concurrency/max_chunks（:606-607）全部只用 host_max，不再用 opts.config.max_connections_per_host；删除原 :528 的重复创建。
+- queue_path_split_bounded 测试：注入 limiter=4、config.max_connections_per_host=8（默认）不一致场景。先在「只修一半」状态运行：t=2s~10s chunks=8/not_started=4，PASS（如实贴出，未失败）。统一后运行：同样 PASS。原因：拆分阈值两版都取自注入 limiter=4，差异只在初始块数（只修一半=8、统一=4），但 0.5s 内即被拆分拉平到 8。代码来源已统一。新增 t=0.5s 首次采样观察。
+- 用户选 1（授权调整 phase3d 场景、断言语义不变）：改写 crates/idm-core/tests/phase3d.rs 为续传构造——store 预置 4 个各 2MiB 分块（committed=start）、update_probe 回填元信息、写全零 .idm-part、状态 Paused，再以 config.connections=4 / max_connections_per_host=2 续传；服务端 response_delay=(2,6s) 保留。测试注释已写明「Phase 5b-4b 后初始分块不超过每主机上限，排队块只见于续传/调低上限重启/同主机多任务，故改用续传构造」。
+- 关键发现（BLOCKED）：改写后的测试 takeover_count=0、split_count=0——根本没有任何拆分/接管发生。原因是本次修复把拆分阈值 max_concurrent 与闸门都改为有效并发（min(4,2)=2）：续传 4 块里 2 块持名额、2 块排队，in_flight=4−2=2，不满足 in_flight<2；同时 not_started=4≥2 闸门也直接拒绝。两道闸门在「主机名额饱和」时同时封死拆分，而这正是排队块出现的唯一场景——修复与 phase3d 的前置条件结构性冲突。
+- 变异验证（按要求执行并已恢复）：临时删掉 split.rs:435 的 eligible_for_split() 过滤后运行，takeover_count 仍为 0、失败信息与未变异时完全相同——过滤器在修复后根本不会被触达，测试无法证明「排队块不被接管」。已恢复该行，git diff 确认 split.rs 无 MUTATION 残留。
+- 结论：在不改断言语义（必须 takeover_count 1..=2 且排队块不被接管）、也不改已验证的失控修复前提下，无法让该集成测试产生接管。按规则 7 停下报告，未提交。待用户裁决：是否放宽修复的 in_flight/not_started 闸门以允许「持名额且已发请求的分块」在饱和时被接管（需重新评估失控风险），或接受调整断言语义。
+- 用户裁决：不授权改修复逻辑（饱和时拆分正是失控起点，不拆是正确行为）；授权改 phase3d 断言为新不变量。理由记录进报告「与本文不一致之处」。
+- 重写 phase3d 测试：改名 saturated_host_does_not_split_or_take_over_queued，保留续传场景（4 预置分块、每主机 2、前 2 请求延 6s）；通过 opts.progress_tx + watch 在下载中每 200ms 采样 split_count/takeover_count 恒 0、可见排队块 end 未缩小；最终用 publish_final 快照校验排队块 end 未缩小（节流快照在停住期间不发布 waiting，故「是否真有排队」不设 racy 的硬计数，改由条件式校验覆盖）；断言完成 + 文件正确。注释写明 Phase 3d 原目的、5b-4b 饱和不拆的原因、未饱和接管由 phase2 覆盖。单次 PASS。
+- 变异验证（均执行、贴输出、已恢复）：A) download.rs max_concurrent 改回 inits.len() + 移除 split.rs not_started 闸门 → 测试失败 split_count=5；恢复。B) phase2 的 unaligned_stalled_first_chunk_is_taken_over 在 try_split 强制 no-op 下失败（takeover=0、卡住块等满 20s）；恢复。恢复后 grep MUTATION=0，git diff 确认 download.rs/split.rs 与变异前一致。
+- 需求 5（phase2 未饱和接管测试）：确认已存在——unaligned_stalled_first_chunk_is_taken_over、zero_progress_stalled_first_chunk_is_taken_over、very_slow_first_chunk_is_taken_over、backoff_wait_is_taken_over（connections=2/3、默认每主机 8，名额未饱和，卡住/慢/退避分块被接管）；无需新增。
+- 格式/clippy：cargo fmt --all 后 cargo clippy --workspace --all-targets --locked -- -D warnings PASS（修复 phase3d 两处 collapsible_if）。
+
+### 第 5 步剩余验证：全量排查 connections > 每主机上限的测试
+- verify-workspace.ps1 STEP 6（cargo test --workspace）失败：phase3a::host_permit_released_during_retry_backoff 报 "missing chunk 1"。单独运行 3/3 确定性失败。根因：该测试注入 limiter=1、connections=2，依赖旧行为「初始分块数=连接数=2」，修复后 min(2,1)=1 只产生 chunk 0，snap.chunks.get(1) 为 None。
+- 全面排查（子代理独立交叉验证）所有「任务 connections > 生效 host_max」的测试共 5 个：
+  1) phase3a.rs:300 host_permit_released_during_retry_backoff（conn=2/host=1，注入 limiter）——DEPENDENT，依赖旧行为（取 chunks.get(1)）。→ 本次改造。
+  2) phase1b.rs:1132 stress_1gb_16_connections（conn=16/host=8 默认）——INDEPENDENT，#[ignore] 压力测试，只断言完成+文件正确，忽略 rx，按编号取块/分块数均不涉及。保持原样。
+  3) phase3d.rs:41 saturated_host_does_not_split_or_take_over_queued（conn=4/host=2）——INDEPENDENT，续传预置 4 块，块来自 DB plan 非 chunk_ranges，已适配新不变量。保持原样。
+  4) phase5b4_split_runaway.rs:93 split_does_not_run_away_when_host_limited（conn=32/host=4）——NEW-TEST，验证新行为。保持原样。
+  5) phase5b4_split_runaway.rs:186 queue_path_split_bounded（conn=32/注入 limiter=4）——NEW-TEST，验证新行为。保持原样。
+  另核对近似项均不 >：host_limiter_caps_connections_across_tasks（4≤5）、queue_shares_global_limiter_and_host_limiter（4≤5）、runner（4=4）等。
+- 用户选 A：改造 phase3a 测试为续传预置 2 块构造（store + create_task + update_probe + save_chunks 2×4MiB + 全零 .idm-part + Paused + resume，config.conn=2/max_per_host=1/dynamic_split=false，break_at_start=(0,64KiB)）。断言语义不变：chunk1 必须在 1 秒内拿到释放的许可并完成。注释写明改用续传构造原因。改造后单次 PASS（chunk1=0.042s）。
+- 变异验证（已执行、贴输出、恢复）：临时在 attempt_chunk_once 的 UnexpectedEof（chunk0 实际走的错误路径）返回前插入 sleep(backoff_base)，使 _held 在退避期间继续持有 permit → 测试失败「第 1 号分块必须立即拿到 Host 名额并在 1 秒内完成，实际 5.05 秒」（chunk1.elapsed 0.04s→5.05s）。恢复后 grep MUTATION=0、git diff 确认 download.rs 仅含既有修复。恢复后测试 PASS（0.042s）。
+- 第 5 步剩余验证（全部 PASS）：改造后 phase3a 新测试 10/10；phase2/phase3a/phase3d 三 suite 各 3/3（以退出码判定，初次文本匹配误把 stderr 的 NativeCommandError 当成 FAILED，非真实失败）；两个崩溃测试 --ignored 真正运行 2/2（各 20 轮，49s）；verify-workspace.ps1 全部步骤 PASS（STEP 6 cargo test --workspace 本次通过，含 crash_resume 2/2，VERIFY_EXIT=0）；phase4b-e2e.ps1 PASS（ALL ASSERTIONS PASSED，残留进程 0，E2E_EXIT=0）。
+- 与本文不一致之处（报告记录）：phase3d 断言已从「饱和时只接管持许可块、takeover 1..=2」改为新不变量「饱和时不拆分不接管」；phase3a host_permit_released_during_retry_backoff 场景由新建下载改为续传预置 2 块，断言语义不变。原因均为 Phase 5b-4b 修复后「主机名额饱和时不拆分」为正确行为，旧断言/构造描述的是修复前旧行为。

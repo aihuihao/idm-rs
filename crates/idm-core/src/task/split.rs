@@ -366,6 +366,11 @@ impl ChunkSlot {
     pub(super) fn shared(&self) -> &Arc<ChunkShared> {
         &self.shared
     }
+
+    /// 供主循环同步排队状态到进度快照（Phase 5b-4b）。
+    pub(super) fn idx(&self) -> usize {
+        self.idx
+    }
 }
 
 /// 10.5 零进度接管：第 7 步延迟到被接管分块的任务结束、释放写入器之后再执行。
@@ -515,6 +520,27 @@ pub(super) async fn try_split(
     pending: &mut Vec<PendingChunk>,
 ) -> Result<bool> {
     let min_split = spawner.min_split;
+
+    // Phase 5b-4b 拆分闸门（三条规则，原因见下）：
+    // 规则 2）从未开始下载（reserved 仍等于 start）的分块数 ≥ 有效并发时不拆：
+    //   这些块还在排队等 Host 名额、尚未发出任何请求，再拆只会制造更多排队块。
+    //   注意：这不改变 Phase 3d「排队块不能被当作卡住而接管」的目的——那是由
+    //   select_victim 的 eligible_for_split() 过滤保证的，此处仅阻止新增分块。
+    // 规则 3）分块总数 > 硬上限 max(4×有效并发, 16) 时不再拆，兜底防止失控增长。
+    // 规则 1）有效并发 = min(连接数, 每主机上限)，已由调用方注入 spawner，并用于
+    //   初始分块数与拆分阈值，保证「在途名额」与「实际可用名额」口径一致。
+    let not_started = slots
+        .iter()
+        .filter(|s| {
+            let (reserved, _) = s.shared.reserved_end();
+            reserved == s.shared.start
+        })
+        .count();
+    let total = slots.len() + pending.len();
+    if not_started >= spawner.effective_concurrency || total > spawner.max_chunks {
+        return Ok(false);
+    }
+
     // 第 1 步：选择被切分分块。只把共享状态交给选择器，写器句柄仍留在 slots 中
     // 供第 6 步 shrink_end 使用；这也让选择器可以直接用构造好的 ChunkShared 做单测。
     let shared: Vec<Arc<ChunkShared>> = slots.iter().map(|s| Arc::clone(&s.shared)).collect();

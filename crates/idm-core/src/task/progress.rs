@@ -42,6 +42,9 @@ pub struct ChunkProgress {
     pub avg_speed: f64,
     /// 该分块已发生的重试次数（Phase 1d）。
     pub retries: u64,
+    /// Phase 5b-4b：该分块是否正在排队等待 Host 连接许可（只读展示字段）。
+    /// 为 `true` 时它尚未发出请求、没有占连接槽位；桌面据此显示「排队」状态。
+    pub waiting_for_permit: bool,
 }
 
 /// 全局进度快照。
@@ -94,6 +97,7 @@ impl ProgressPublisher {
                 elapsed_secs: 0.0,
                 avg_speed: 0.0,
                 retries: 0,
+                waiting_for_permit: false,
             })
             .collect();
         let snap = ProgressSnapshot {
@@ -142,6 +146,19 @@ impl ProgressPublisher {
             .get_mut(idx)
         {
             c.state = state;
+        }
+    }
+
+    /// Phase 5b-4b：同步某分块是否正在排队等待 Host 许可（只读展示，不改下载逻辑）。
+    pub fn set_chunk_waiting(&self, idx: usize, waiting: bool) {
+        if let Some(c) = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .chunks
+            .get_mut(idx)
+        {
+            c.waiting_for_permit = waiting;
         }
     }
 
@@ -199,6 +216,7 @@ impl ProgressPublisher {
             elapsed_secs: 0.0,
             avg_speed: 0.0,
             retries: 0,
+            waiting_for_permit: false,
         });
         snap.chunks.len() - 1
     }

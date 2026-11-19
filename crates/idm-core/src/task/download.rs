@@ -307,6 +307,18 @@ async fn run_download(
 
     let cancelled_now = || cancel.is_some_and(|c| c.is_cancelled());
 
+    // Phase 5b-4b：实际生效的 Host 连接限制器——优先用调用方注入的（队列路径会
+    // 注入自己的 limiter），否则按任务 config 新建。必须在此处（初始分块之前）确定，
+    // 使初始分块数、有效并发、拆分阈值、分块上限全部基于同一个上限值，避免
+    // 「config 值与注入的 limiter 上限不同」时口径不一致导致分块失控。
+    let host_limiter: Arc<HostConnectionLimiter> = opts.host_limiter.clone().unwrap_or_else(|| {
+        let limit = opts.config.max_connections_per_host;
+        Arc::new(
+            HostConnectionLimiter::new(limit).unwrap_or_else(|_| HostConnectionLimiter::default()),
+        )
+    });
+    let host_max = host_limiter.max_per_host();
+
     // Phase 2.1 第一部分：续传时新分块编号必须避开数据库里**所有**已有编号。
     // 编号最大的分块可能已经下载完（被 `committed < end` 过滤掉），只看 inits 会让
     // 切分事务插入重复主键。`plan.chunks` 由 resume() 从全部分块记录构造。
@@ -417,8 +429,13 @@ async fn run_download(
                     // 路径 4：创建出错 → 收尾统一写 Failed 并记录错误。
                     Err(e) => return Err(e),
                 };
+                // Phase 5b-4b：初始分块数按「有效并发」= min(连接数, 实际生效的
+                // 每主机上限 host_max) 生成，而不是连接数本身，也不能用可能与注入
+                // limiter 不一致的 opts.config.max_connections_per_host。否则连接数
+                // 大于主机上限时会一次性创建大量永远拿不到 Host 名额的排队分块。
+                let effective = opts.config.connections.min(host_max).max(1);
                 let init: Vec<ChunkInit> =
-                    chunk_ranges(total, opts.config.connections, opts.config.min_chunk_size)
+                    chunk_ranges(total, effective, opts.config.min_chunk_size)
                         .into_iter()
                         .enumerate()
                         .map(|(i, (start, end))| ChunkInit {
@@ -516,13 +533,7 @@ async fn run_download(
         .max_speed
         .map(|rate| Arc::new(RateLimiter::new(Some(rate))));
     let bandwidth = BandwidthLimiter::new(task_limiter, opts.global_limiter.clone());
-    // 按 Host 的连接名额池；未显式注入时按 DownloadConfig 的默认上限创建。
-    let host_limiter: Arc<HostConnectionLimiter> = opts.host_limiter.clone().unwrap_or_else(|| {
-        let limit = opts.config.max_connections_per_host;
-        Arc::new(
-            HostConnectionLimiter::new(limit).unwrap_or_else(|_| HostConnectionLimiter::default()),
-        )
-    });
+    // host_limiter 已在函数开头（初始分块之前）确定，见 Phase 5b-4b 注释。
 
     // 内部取消信号：所有分块任务订阅它；外部取消/出错/panic 都会先触发它。
     let internal = CancelSignal::new();
@@ -589,6 +600,11 @@ async fn run_download(
         backoff_base: opts.config.retry_base_delay,
         backoff_cap: opts.config.retry_max_delay,
         min_split: opts.config.min_split_size,
+        // Phase 5b-4b：有效并发与分块硬上限。有效并发取「任务连接数」与
+        // 「每主机上限」的较小值——初始分块数、拆分阈值都用它，避免创建出
+        // 永远拿不到 Host 名额的排队分块。硬上限兜底防止极端情况下分块无限增长。
+        effective_concurrency: opts.config.connections.min(host_max).max(1),
+        max_chunks: (4 * opts.config.connections.min(host_max).max(1)).max(16),
     };
 
     let mut join_set: JoinSet<Result<ChunkResult>> = JoinSet::new();
@@ -638,7 +654,10 @@ async fn run_download(
     // 没有合法候选时，必须继续重试，否则被卡住的分块永远等不到接管。
     let mut split_retry = tokio::time::interval(Duration::from_millis(100));
     split_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let max_concurrent = inits.len().max(1);
+    // Phase 5b-4b：拆分阈值用有效并发（min(连接数, 每主机上限)），
+    // 而非 inits.len()（= 连接数）。连接数大于主机上限时，后者会让
+    // 被扣除排队块后的 in_flight 永远小于阈值，触发无休止拆分。
+    let max_concurrent = spawner.effective_concurrency;
 
     // 10.5 零进度接管：等待被接管分块释放写器之后才启动的新分块。
     let mut pending: Vec<PendingChunk> = Vec::new();
@@ -743,6 +762,14 @@ async fn run_download(
             // 有空闲连接时定期重试切分（10.5：卡住/明显慢是随时间的判定），
             // 同时检查延迟分配的 5 秒超时；两者都不阻塞主循环。
             _ = split_retry.tick() => {
+                // Phase 5b-4b：把「等待 Host 许可」状态同步到进度快照，供 UI
+                // 区分「排队」与「正在下载」。纯展示，不参与任何下载/拆分决策。
+                {
+                    let progress = spawner.progress.lock().await;
+                    for slot in &slots {
+                        progress.set_chunk_waiting(slot.idx(), slot.shared().waiting_for_permit());
+                    }
+                }
                 if let Err(e) = process_pending_chunks(
                     &spawner,
                     &mut slots,
@@ -1005,6 +1032,10 @@ pub(super) struct ChunkSpawner {
     backoff_cap: Duration,
     /// 普通对半切的最小分块大小（放进启动器，避免 try_split 参数过多）。
     pub(super) min_split: u64,
+    /// Phase 5b-4b：有效并发数 = min(任务连接数, 每主机上限)，至少 1。
+    pub(super) effective_concurrency: usize,
+    /// Phase 5b-4b：分块总数硬上限 = max(4 × 有效并发, 16)。
+    pub(super) max_chunks: usize,
 }
 
 impl ChunkSpawner {

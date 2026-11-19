@@ -112,6 +112,7 @@ fn default_settings(download_dir: &Path) -> Settings {
         global_max_speed: 0,
         max_tasks: 3,
         default_connections: 8,
+        max_connections_per_host: 8,
         autostart: false,
         notify_on_complete: true,
     }
@@ -512,6 +513,54 @@ async fn settings_validation() -> TestResult {
     assert!(fresh.is_dir(), "不存在的 download_dir 应被创建");
 
     svc.shutdown().await?;
+    Ok(())
+}
+
+// --- 9a：每主机连接上限设置：默认值、校验与重启后重新读取 ----------------
+
+#[tokio::test]
+async fn host_limit_setting_roundtrip() -> TestResult {
+    let tmp = TempDir::new()?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db.clone()).await?;
+    // 未设置时默认为 8。
+    assert_eq!(
+        svc.get_settings().await?.max_connections_per_host,
+        8,
+        "每主机连接上限默认应为 8"
+    );
+
+    // 0 与 33 越界，应被拒绝。
+    let mut bad = default_settings(&download);
+    bad.max_connections_per_host = 0;
+    assert!(matches!(
+        svc.set_settings(bad).await,
+        Err(ServiceError::InvalidInput(_))
+    ));
+    let mut bad = default_settings(&download);
+    bad.max_connections_per_host = 33;
+    assert!(matches!(
+        svc.set_settings(bad).await,
+        Err(ServiceError::InvalidInput(_))
+    ));
+
+    // 保存合法值后重新打开，open 时应重新读取到新值。
+    let mut s = default_settings(&download);
+    s.max_connections_per_host = 4;
+    svc.set_settings(s).await?;
+    svc.shutdown().await?;
+
+    let reopened = DesktopService::open(db.clone()).await?;
+    assert_eq!(
+        reopened.get_settings().await?.max_connections_per_host,
+        4,
+        "重新 open 后应读取到保存的每主机连接上限"
+    );
+    reopened.shutdown().await?;
     Ok(())
 }
 

@@ -21,7 +21,8 @@ use idm_core::disk::{AllocationStrategy, DiskWriterPool};
 use idm_core::error::Error;
 use idm_core::net::client::{DownloadConfig, ProxyConfig};
 use idm_core::net::{HostConnectionLimiter, RateLimiter, Url};
-use idm_core::task::{DownloadOptions, DownloadOutcome, ProgressSnapshot, download};
+use idm_core::store::{ChunkRow, NewTask, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
+use idm_core::task::{DownloadOptions, DownloadOutcome, ProgressSnapshot, download, resume};
 use proxy::{start_http_proxy, start_socks5_proxy};
 use support::{ServerConfig, SpeedPolicy, start};
 use tempfile::tempdir;
@@ -296,48 +297,113 @@ async fn host_limiter_caps_connections_across_tasks() -> TestResult {
 
 /// `max_per_host = 1`、退避基数 5 秒。第 0 号分块首次请求被断开后进入退避，
 /// Host 名额必须在退避前释放：第 1 号分块应在 1 秒内完成。
-#[tokio::test]
+///
+/// Phase 5b-4b 起初始分块数 = min(连接数, 每主机上限)。若沿用"新建下载 +
+/// connections=2 + host_max=1"，只会生成 1 个分块，根本不存在第 1 号分块。
+/// 因此改用续传构造：预置 2 个各 4 MiB 的分块（模拟此前以 2 连接下载过、
+/// 现在每主机上限为 1），续传后 2 块争抢 1 个名额。断言语义不变：0 号块
+/// 断开进入退避并释放名额后，1 号块必须立即拿到名额并在 1 秒内完成。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_permit_released_during_retry_backoff() -> TestResult {
     let size = 8 * MIB;
     let srv = start(ServerConfig {
         size,
-        // 只让起点 0 的那个请求写出 64 KiB 后断开。
+        // 只让起点 0 的那个请求写出 64 KiB 后断开，触发一次退避。
         break_at_start: Some((0, 64 * KIB)),
         ..ServerConfig::default()
     })
     .await?;
-    let tmp = tempdir()?;
-    let limiter = Arc::new(HostConnectionLimiter::new(1)?);
-    let mut opts = options(
-        tmp.path(),
-        "backoff-host.bin",
-        DownloadConfig {
+
+    let dir = tempdir()?;
+    let url = srv.url("/file.bin");
+    let store = Store::open(dir.path().join("idm.db"))?;
+    let id = store
+        .create_task(NewTask {
+            url: url.clone(),
+            dir: dir.path().to_string_lossy().into_owned(),
+            strategy: "Sparse".to_string(),
+            connections: 2,
+        })
+        .await?;
+
+    // 回填 probe 元信息并预置 2 个各 4 MiB 的分块（committed=start，尚未落盘），
+    // 让续传从 DB plan 构造出这 2 块，而不是按 min(connections, host_max) 生成。
+    let part = dir.path().join("file.bin.idm-part");
+    store
+        .update_probe(
+            id,
+            ProbeInfo {
+                final_url: url.clone(),
+                file_name: "file.bin".to_string(),
+                part_path: part.to_string_lossy().into_owned(),
+                total_size: Some(size),
+                supports_range: true,
+                etag: None,
+                etag_weak: false,
+                last_modified: None,
+                resumable: true,
+            },
+        )
+        .await?;
+    let chunk = size / 2;
+    store
+        .save_chunks(
+            id,
+            (0u64..2)
+                .map(|i| ChunkRow {
+                    chunk_index: i as i64,
+                    start: i * chunk,
+                    end: (i + 1) * chunk,
+                    committed: i * chunk,
+                    parent: None,
+                })
+                .collect(),
+        )
+        .await?;
+    std::fs::write(&part, vec![0u8; size as usize])?;
+    store
+        .update_state(id, TaskStateDb::Paused, Some(PauseReasonDb::User), None)
+        .await?;
+
+    let opts = DownloadOptions {
+        global_limiter: None,
+        host_limiter: None,
+        config: DownloadConfig {
             connections: 2,
             retry_base_delay: Duration::from_secs(5),
             retry_max_delay: Duration::from_secs(5),
             dynamic_split: false,
+            max_connections_per_host: 1,
             ..DownloadConfig::default()
         },
-    );
-    opts.host_limiter = Some(limiter);
-    let url = srv.url("/file.bin");
-    let p = pool()?;
+        strategy: AllocationStrategy::Sparse,
+        dir: dir.path().to_path_buf(),
+        out_name: Some("file.bin".to_string()),
+        progress_tx: None,
+        max_speed: None,
+    };
 
-    let (outcome, rx) = download(&url, p, &opts, None).await?;
+    let dl_pool = Arc::new(DiskWriterPool::new(4, 16)?);
+    let (outcome, rx) = resume(id, store, dl_pool, &opts, None).await?;
     assert_eq!(outcome, DownloadOutcome::Completed);
     let snap = rx.borrow().clone();
-    let chunk1 = snap.chunks.get(1).ok_or("missing chunk 1")?;
+    let chunk1 = snap
+        .chunks
+        .iter()
+        .find(|c| c.db_index == 1)
+        .ok_or("missing chunk 1")?;
     assert!(
         chunk1.elapsed_secs < 1.0,
         "第 1 号分块必须立即拿到 Host 名额并在 1 秒内完成，实际 {} 秒: {:?}",
         chunk1.elapsed_secs,
         snap.chunks
     );
-    verify_file(&tmp.path().join("backoff-host.bin"), size)?;
+    verify_file(&dir.path().join("file.bin"), size)?;
     println!(
         "HOST_BACKOFF chunk1_elapsed={:.3}s retries={}",
         chunk1.elapsed_secs, chunk1.retries
     );
+    srv.shutdown();
     Ok(())
 }
 

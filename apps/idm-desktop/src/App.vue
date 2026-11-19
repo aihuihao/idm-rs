@@ -258,6 +258,11 @@
           <input v-model.number="draftSettings.default_connections" :disabled="readOnly" type="number" min="1" max="32" />
         </div>
         <div class="field">
+          <label>每台服务器最大连接数（1~32）</label>
+          <input v-model.number="draftSettings.max_connections_per_host" :disabled="readOnly" type="number" min="1" max="32" />
+          <span class="hint">修改后重启程序生效</span>
+        </div>
+        <div class="field">
           <label class="checkbox">
             <input v-model="draftSettings.autostart" :disabled="readOnly" type="checkbox" />
             开机自动启动（以托盘方式启动）
@@ -302,6 +307,7 @@ interface Settings {
   global_max_speed: number;
   max_tasks: number;
   default_connections: number;
+  max_connections_per_host: number;
   autostart: boolean;
   notify_on_complete: boolean;
 }
@@ -381,7 +387,7 @@ const clearError = ref('');
 const optionsOpen = ref(false);
 const draftSettings = ref<Settings>({
   download_dir: '', global_max_speed: 0, max_tasks: 3,
-  default_connections: 8, autostart: false, notify_on_complete: true,
+  default_connections: 8, max_connections_per_host: 8, autostart: false, notify_on_complete: true,
 });
 const draftSpeedKb = ref(0);
 const optionsError = ref('');
@@ -670,6 +676,7 @@ async function onSaveOptions(): Promise<void> {
     global_max_speed: Math.max(0, Math.round(draftSpeedKb.value)) * 1024,
     max_tasks: draftSettings.value.max_tasks,
     default_connections: draftSettings.value.default_connections,
+    max_connections_per_host: draftSettings.value.max_connections_per_host,
     autostart: draftSettings.value.autostart,
     notify_on_complete: draftSettings.value.notify_on_complete,
   };
@@ -855,6 +862,7 @@ function chunkClass(c: ChunkView): string {
     case 'done': return 'done';
     case 'retrying': return 'retrying';
     case 'active': return 'active';
+    case 'queued':
     default: return 'waiting';
   }
 }
@@ -863,6 +871,7 @@ function chunkStateText(state: string): string {
     case 'active': return '下载中';
     case 'done': return '已完成';
     case 'retrying': return '重试中';
+    case 'queued': return '排队';
     default: return '等待';
   }
 }
@@ -1069,6 +1078,7 @@ table.chunks .num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .field { margin-bottom: 10px; }
 .field label { display: block; margin-bottom: 4px; }
+.hint { display: block; margin-top: 4px; color: var(--gray); font-size: 12px; }
 .checkbox { display: flex; align-items: center; gap: 6px; margin: 10px 0; }
 .dir-row { display: flex; gap: 6px; }
 .dir-row input { flex: 1; }

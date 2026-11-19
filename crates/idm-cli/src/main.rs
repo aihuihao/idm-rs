@@ -2097,6 +2097,7 @@ mod dl {
                     elapsed_secs: 2.0,
                     avg_speed: 512.0,
                     retries: 3,
+                    waiting_for_permit: false,
                 }],
                 ..ProgressSnapshot::default()
             };
@@ -2124,6 +2125,7 @@ mod dl {
                 elapsed_secs: 1.0,
                 avg_speed: 1024.0,
                 retries: 0,
+                waiting_for_permit: false,
             };
             let half = ChunkProgress {
                 db_index: 1,

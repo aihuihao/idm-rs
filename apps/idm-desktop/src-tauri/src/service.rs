@@ -19,6 +19,8 @@ use idm_core::task::ChunkState;
 
 const DEFAULT_MAX_TASKS: usize = 3;
 const DEFAULT_CONNECTIONS: usize = 8;
+/// 每主机连接上限默认 8（与 idm-core 的 DEFAULT_MAX_PER_HOST 一致）。重启生效：设置在 open 时读取。
+const DEFAULT_MAX_PER_HOST: usize = 8;
 
 #[derive(Debug)]
 pub enum ServiceError {
@@ -72,7 +74,7 @@ pub struct ChunkView {
     pub downloaded: u64,
     /// 拿不到实时速度时为 0。
     pub speed_bps: u64,
-    /// "active" | "done" | "waiting" | "retrying"
+    /// "active" | "done" | "waiting" | "queued" | "retrying"
     pub state: String,
 }
 
@@ -91,6 +93,7 @@ pub struct Settings {
     pub global_max_speed: u64,
     pub max_tasks: usize,
     pub default_connections: usize,
+    pub max_connections_per_host: usize,
     pub autostart: bool,
     pub notify_on_complete: bool,
 }
@@ -145,6 +148,14 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
             .map_err(internal)?,
         DEFAULT_CONNECTIONS,
     );
+    let max_connections_per_host = parse_usize_or(
+        store
+            .get_setting("max-connections-per-host")
+            .await
+            .map_err(internal)?,
+        DEFAULT_MAX_PER_HOST,
+    )
+    .clamp(1, 32);
     let notify_on_complete = match store
         .get_setting("notify-on-complete")
         .await
@@ -158,6 +169,7 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
         global_max_speed,
         max_tasks,
         default_connections,
+        max_connections_per_host,
         autostart: autostart::query(desktop_name).is_some(),
         notify_on_complete,
     })
@@ -307,7 +319,9 @@ impl DesktopService {
         let cfg = RunnerConfig {
             db_path,
             max_tasks: settings.max_tasks.clamp(1, 16),
-            host_max_connections: settings.default_connections.clamp(1, 32),
+            // 重启生效：每主机连接上限由独立的 max-connections-per-host 决定，
+            // 不再误用「每任务默认连接数」default_connections。
+            host_max_connections: settings.max_connections_per_host.clamp(1, 32),
             // 桌面服务层无代理配置入口；禁用系统代理以避免本地/受控环境差异。
             proxy: Some(ProxyConfig::Disabled),
         };
@@ -482,11 +496,17 @@ impl DesktopService {
                 .chunks
                 .iter()
                 .map(|c| {
-                    let state = match c.state {
-                        ChunkState::Downloading => "active",
-                        ChunkState::Done => "done",
-                        ChunkState::Failed | ChunkState::Cancelled => "retrying",
-                        ChunkState::Pending => "waiting",
+                    // Phase 5b-4b：排队等待 Host 许可的分块（尚未发出请求）单列
+                    // "queued"，与真正"正在下载"区分；它不改变底层 ChunkState。
+                    let state = if c.waiting_for_permit {
+                        "queued"
+                    } else {
+                        match c.state {
+                            ChunkState::Downloading => "active",
+                            ChunkState::Done => "done",
+                            ChunkState::Failed | ChunkState::Cancelled => "retrying",
+                            ChunkState::Pending => "waiting",
+                        }
                     };
                     ChunkView {
                         index: c.db_index.max(0) as usize,
@@ -591,6 +611,11 @@ impl DesktopService {
                 "default_connections must be in 1..=32".to_string(),
             ));
         }
+        if !(1..=32).contains(&s.max_connections_per_host) {
+            return Err(ServiceError::InvalidInput(
+                "max_connections_per_host must be in 1..=32".to_string(),
+            ));
+        }
         ensure_dir(Path::new(&s.download_dir))?;
 
         self.store
@@ -607,6 +632,14 @@ impl DesktopService {
             .map_err(internal)?;
         self.store
             .set_setting("default-connections", &s.default_connections.to_string())
+            .await
+            .map_err(internal)?;
+        // 每主机连接上限「重启生效」：只保存，不尝试在运行中修改 HostConnectionLimiter。
+        self.store
+            .set_setting(
+                "max-connections-per-host",
+                &s.max_connections_per_host.to_string(),
+            )
             .await
             .map_err(internal)?;
         self.store
