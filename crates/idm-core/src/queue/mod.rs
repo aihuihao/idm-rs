@@ -274,6 +274,11 @@ impl DownloadQueue {
         self.inner.host_limiter.set_max_per_host(n)
     }
 
+    /// Phase 5b-4d：读取当前每主机连接上限（详情面板计算 max_concurrent 用）。
+    pub fn max_connections_per_host(&self) -> usize {
+        self.inner.host_limiter.max_per_host()
+    }
+
     /// 订阅队列事件流。
     pub fn subscribe_events(&self) -> broadcast::Receiver<QueueEvent> {
         self.inner.events.subscribe()

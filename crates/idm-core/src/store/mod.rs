@@ -424,6 +424,12 @@ enum Command {
         id: i64,
         reply: Reply<()>,
     },
+    /// Phase 5b-4d：只更新 tasks.connections（不改分块记录）。
+    SetTaskConnections {
+        id: i64,
+        n: usize,
+        reply: Reply<()>,
+    },
     /// Phase 4a：读取全局设置。
     GetSetting {
         key: String,
@@ -670,6 +676,14 @@ impl Store {
             .await
     }
 
+    /// Phase 5b-4d：只更新任务的 `connections` 列（不动分块记录）。
+    ///
+    /// 供桌面「继续下载时使用当前默认连接数」在恢复前调整任务连接数。
+    pub async fn set_task_connections(&self, id: i64, n: usize) -> Result<()> {
+        self.call(|reply| Command::SetTaskConnections { id, n, reply })
+            .await
+    }
+
     /// 读取全局设置；不存在返回 `None`。
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let key = key.to_string();
@@ -846,6 +860,9 @@ fn handle_command(conn: &mut Connection, cmd: Command, fail: &AtomicBool) {
         }
         Command::ClearTaskHeaders { id, reply } => {
             let _ = reply.send(clear_task_headers(conn, id));
+        }
+        Command::SetTaskConnections { id, n, reply } => {
+            let _ = reply.send(set_task_connections(conn, id, n));
         }
         Command::GetSetting { key, reply } => {
             let _ = reply.send(get_setting(conn, &key));
@@ -1241,6 +1258,21 @@ fn set_task_headers(conn: &mut Connection, id: i64, headers: &[(String, String)]
         }
     }
     tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// Phase 5b-4d：只更新 tasks.connections 与 updated_at，不触碰 chunks 表。
+fn set_task_connections(conn: &Connection, id: i64, n: usize) -> Result<()> {
+    let n = n.clamp(1, 32) as i64;
+    let count = conn
+        .execute(
+            "UPDATE tasks SET connections=?2, updated_at=?3 WHERE id=?1",
+            params![id, n, now_text()],
+        )
+        .map_err(db_err)?;
+    if count == 0 {
+        return Err(Error::TaskNotFound { id });
+    }
     Ok(())
 }
 

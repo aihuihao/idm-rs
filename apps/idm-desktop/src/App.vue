@@ -138,7 +138,7 @@
           <div v-if="!detailCollapsed" ref="detailBodyEl" class="detail-body">
             <template v-if="detail && detail.total_size != null && detail.chunks.length > 0">
               <div class="detail-meta">
-                总大小 {{ formatSize(detail.total_size) }}　连接数 {{ detail.connections }}
+                分段 {{ detail.segments }}　下载中 {{ detail.downloading }}　排队 {{ detail.queued }}　最多同时 {{ detail.max_concurrent }}
               </div>
               <div class="segbar">
                 <div
@@ -256,6 +256,11 @@
         <div class="field">
           <label>每任务默认连接数（1~32）</label>
           <input v-model.number="draftSettings.default_connections" :disabled="readOnly" type="number" min="1" max="32" />
+          <label class="checkbox">
+            <input v-model="draftSettings.resume_uses_current_connections" :disabled="readOnly" type="checkbox" />
+            继续下载时使用当前的默认连接数
+          </label>
+          <span class="hint">勾选后，暂停的任务继续时改用上面的连接数；已下载的分段保留</span>
         </div>
         <div class="field">
           <label>每台服务器最大连接数（1~32）</label>
@@ -308,6 +313,7 @@ interface Settings {
   max_tasks: number;
   default_connections: number;
   max_connections_per_host: number;
+  resume_uses_current_connections: boolean;
   autostart: boolean;
   notify_on_complete: boolean;
 }
@@ -325,6 +331,10 @@ interface TaskDetail {
   id: number;
   total_size: number | null;
   connections: number;
+  segments: number;
+  downloading: number;
+  queued: number;
+  max_concurrent: number;
   chunks: ChunkView[];
 }
 
@@ -387,7 +397,8 @@ const clearError = ref('');
 const optionsOpen = ref(false);
 const draftSettings = ref<Settings>({
   download_dir: '', global_max_speed: 0, max_tasks: 3,
-  default_connections: 8, max_connections_per_host: 8, autostart: false, notify_on_complete: true,
+  default_connections: 8, max_connections_per_host: 8, resume_uses_current_connections: true,
+  autostart: false, notify_on_complete: true,
 });
 const draftSpeedKb = ref(0);
 const optionsError = ref('');
@@ -677,6 +688,7 @@ async function onSaveOptions(): Promise<void> {
     max_tasks: draftSettings.value.max_tasks,
     default_connections: draftSettings.value.default_connections,
     max_connections_per_host: draftSettings.value.max_connections_per_host,
+    resume_uses_current_connections: draftSettings.value.resume_uses_current_connections,
     autostart: draftSettings.value.autostart,
     notify_on_complete: draftSettings.value.notify_on_complete,
   };

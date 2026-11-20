@@ -31,7 +31,9 @@ use crate::net::retry::{
     MAX_TOTAL_ATTEMPTS, PROGRESS_RESET_BYTES, XorShift64, backoff_delay, is_retryable,
     parse_retry_after,
 };
-use crate::net::{BandwidthLimiter, HostConnectionLimiter, HostPermit, RateLimiter};
+use crate::net::{
+    AdjustablePermit, BandwidthLimiter, HostConnectionLimiter, HostPermit, RateLimiter, TaskGate,
+};
 use crate::store::{ChunkRow, PauseReasonDb, ProbeInfo, Store, TaskStateDb};
 use crate::task::cancel::{CancelSignal, wait_cancelled};
 use crate::task::progress::{ChunkInit, ProgressPublisher, ProgressSnapshot};
@@ -582,6 +584,12 @@ async fn run_download(
         hook();
     }
 
+    // Phase 5b-4d：每个下载任务创建自己的连接闸门，许可数 = min(connections, 当前上限)。
+    // 任务 connections 是该任务同时连接数的上限；新建下载初始分段数就等于它，只有
+    // 续传等「分段数 > connections」的场景闸门才会实际限流。注册到 limiter 后，
+    // 运行中调整每主机上限会同步到此闸门。
+    let task_gate = host_limiter.new_task_gate(opts.config.connections)?;
+
     let spawner = ChunkSpawner {
         client: client.clone(),
         url: download_url.clone(),
@@ -592,6 +600,7 @@ async fn run_download(
         verify_etag: verify_etag.clone(),
         bandwidth: bandwidth.clone(),
         host_limiter: Arc::clone(&host_limiter),
+        task_gate: Arc::clone(&task_gate),
         cancel: internal.clone(),
         cancel_rx: internal.subscribe(),
         task_id,
@@ -600,10 +609,6 @@ async fn run_download(
         backoff_base: opts.config.retry_base_delay,
         backoff_cap: opts.config.retry_max_delay,
         min_split: opts.config.min_split_size,
-        // Phase 5b-4c：保存任务连接数；有效并发与分块硬上限改为每次判断时
-        // 动态计算（见 ChunkSpawner::effective_concurrency/max_chunks），
-        // 使运行中调整每主机上限后拆分行为能立即跟随。
-        connections: opts.config.connections,
     };
 
     let mut join_set: JoinSet<Result<ChunkResult>> = JoinSet::new();
@@ -1022,6 +1027,8 @@ pub(super) struct ChunkSpawner {
     verify_etag: Option<(String, bool)>,
     bandwidth: BandwidthLimiter,
     host_limiter: Arc<HostConnectionLimiter>,
+    /// Phase 5b-4d：本任务的连接闸门，与拆分判断共用同一有效并发值。
+    task_gate: Arc<TaskGate>,
     cancel: CancelSignal,
     cancel_rx: watch::Receiver<bool>,
     pub(super) task_id: u64,
@@ -1031,18 +1038,13 @@ pub(super) struct ChunkSpawner {
     backoff_cap: Duration,
     /// 普通对半切的最小分块大小（放进启动器，避免 try_split 参数过多）。
     pub(super) min_split: u64,
-    /// 任务连接数。与 limiter 当前上限取小得到有效并发（5b-4c 动态计算）。
-    connections: usize,
 }
 
 impl ChunkSpawner {
-    /// Phase 5b-4c：有效并发 = min(任务连接数, limiter **当前**上限)，至少 1。
-    /// 运行中上限可被 `set_max_per_host` 改变，故每次判断都重新读取，不缓存。
+    /// 有效并发直接取任务闸门的当前许可数 = min(任务连接数, limiter 当前上限)。
+    /// 运行中上限被 `set_max_per_host` 改变时闸门被同步，故每次判断都重新读取。
     pub(super) fn effective_concurrency(&self) -> usize {
-        self.connections
-            .max(1)
-            .min(self.host_limiter.max_per_host())
-            .max(1)
+        self.task_gate.effective()
     }
 
     /// Phase 5b-4c：分块总数硬上限 = max(4 × 当前有效并发, 16)，动态计算。
@@ -1087,6 +1089,7 @@ impl ChunkSpawner {
             cancel_rx: self.cancel_rx.clone(),
             bandwidth: self.bandwidth.clone(),
             host_limiter: Arc::clone(&self.host_limiter),
+            task_gate: Arc::clone(&self.task_gate),
             task_id: self.task_id,
             received: Arc::new(AtomicU64::new(0)),
             acked: Arc::clone(&shared.acked),
@@ -1130,6 +1133,7 @@ struct ChunkJob {
     cancel_rx: watch::Receiver<bool>,
     bandwidth: BandwidthLimiter,
     host_limiter: Arc<HostConnectionLimiter>,
+    task_gate: Arc<TaskGate>,
     task_id: u64,
     received: Arc<AtomicU64>,
     /// 只在 pool.write 成功返回后推进的绝对写入位置（检查点快照来源）。
@@ -1275,6 +1279,7 @@ async fn wake_on_shrink(
 /// `acked < end` 时继续等**同一个**申请，不会把分块重新排到 Semaphore 公平队列的
 /// 队尾。被接管到 `acked >= end` 时返回 `Ok(None)`——丢弃等待、不占名额，调用方
 /// 立即以 `Completed` 结束（零进度接管等它 5 秒的场景由此不再超时失败）。
+#[cfg(test)]
 async fn acquire_with_shrink(
     limiter: &HostConnectionLimiter,
     url: &Url,
@@ -1301,6 +1306,52 @@ async fn acquire_with_shrink(
     }
 }
 
+/// Phase 5b-4d：一次分块请求同时申请两级许可——先任务级闸门，再主机级闸门。
+///
+/// 等待任一级许可期间都标记为 `waiting_for_permit`（计入排队、不计入 in_flight，
+/// 界面显示「排队」）。两级 future 都只创建一次并跨 `select!` 轮次复用，保持
+/// Semaphore 公平队列位置；被 10.5 接管到 `acked >= end` 时返回 `Ok(None)`，
+/// 已拿到的许可由 RAII 自动释放。
+async fn acquire_chunk_permits(
+    task_gate: &Arc<TaskGate>,
+    limiter: &HostConnectionLimiter,
+    url: &Url,
+    cancel: &CancelSignal,
+    shared: &ChunkShared,
+    acked: &AtomicU64,
+    end_rx: &mut watch::Receiver<u64>,
+) -> Result<Option<(AdjustablePermit, HostPermit)>> {
+    shared.mark_waiting_for_permit();
+    let _waiting = WaitingForPermitGuard(shared);
+
+    // 第一级：任务连接闸门。
+    let mut task_fut = task_gate.acquire_future()?;
+    let task_permit = loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            exit = wake_on_shrink(end_rx, shared, acked) => {
+                if exit.is_some() { return Ok(None); }
+            }
+            p = &mut task_fut => break p?,
+        }
+    };
+
+    // 第二级：主机名额。若等待期间被接管，task_permit 随返回自动 drop 释放。
+    let mut host_fut = limiter.acquire_future(url)?;
+    let host_permit = loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            exit = wake_on_shrink(end_rx, shared, acked) => {
+                if exit.is_some() { return Ok(None); }
+            }
+            p = &mut host_fut => break p?,
+        }
+    };
+    Ok(Some((task_permit, host_permit)))
+}
+
 /// 离开名额申请（拿到名额 / 被接管唤醒 / 取消 / 任务被 abort）时清除排队标记。
 struct WaitingForPermitGuard<'a>(&'a ChunkShared);
 
@@ -1314,6 +1365,8 @@ impl Drop for WaitingForPermitGuard<'_> {
 /// 提前关闭，`attempt_chunk_once` 返回时都会释放「持有名额」标记。
 /// `eligible_for_split` 不复位——退避中的分块仍可被接管（10.5）。
 struct HeldPermit<'a> {
+    /// 任务级连接许可（Phase 5b-4d）：退避前与主机许可一起 drop 释放。
+    _task_permit: AdjustablePermit,
     _permit: HostPermit,
     shared: &'a ChunkShared,
 }
@@ -1466,6 +1519,7 @@ async fn attempt_chunk_once(
         streaming,
         bandwidth,
         host_limiter,
+        task_gate,
         cancel,
         task_id,
         received: received_counter,
@@ -1492,10 +1546,11 @@ async fn attempt_chunk_once(
         return Ok(ChunkExit::Completed);
     }
 
-    // Phase 3d：每次尝试（含重试）都重新申请 Host 名额；等待期间与取消、10.5 的
-    // end 缩小并列监听，且保持 Semaphore 公平队列中的位置。被接管到 acked 时
-    // 立即以 Completed 结束：不发请求、不占名额、不再排队。
-    let permit = match acquire_with_shrink(
+    // Phase 3d / 5b-4d：每次尝试（含重试）先申请任务级连接闸门，再申请 Host 名额；
+    // 等待两级期间都标记排队并与取消、10.5 的 end 缩小并列监听，保持 Semaphore
+    // 公平队列位置。被接管到 acked 时立即以 Completed 结束：不发请求、不占名额、不再排队。
+    let (task_permit, permit) = match acquire_chunk_permits(
+        task_gate,
         host_limiter,
         url,
         cancel,
@@ -1505,16 +1560,17 @@ async fn attempt_chunk_once(
     )
     .await
     {
-        Ok(Some(permit)) => permit,
+        Ok(Some(permits)) => permits,
         Ok(None) => return Ok(ChunkExit::Completed),
         Err(Error::Cancelled) => return Ok(ChunkExit::Cancelled),
         Err(e) => return Err(e.into()),
     };
-    // 拿到名额、`req.send()` 即将开始：置位 holds_permit 与 eligible_for_split，
+    // 拿到两级许可、`req.send()` 即将开始：置位 holds_permit 与 eligible_for_split，
     // 并把速度采样 / is_fresh 的计时起点重置到此刻。守卫在函数任何返回路径上
-    // 复位 holds_permit（退避期间不占在途连接数）。
+    // 复位 holds_permit；两级许可随守卫 drop 一起释放（退避期间都不占连接数）。
     shared.mark_request_started();
     let _held = HeldPermit {
+        _task_permit: task_permit,
         _permit: permit,
         shared: shared.as_ref(),
     };

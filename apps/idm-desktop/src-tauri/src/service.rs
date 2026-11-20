@@ -84,6 +84,14 @@ pub struct TaskDetail {
     pub id: i64,
     pub total_size: Option<u64>,
     pub connections: usize,
+    /// Phase 5b-4d：分段总数。
+    pub segments: usize,
+    /// Phase 5b-4d：正在持许可下载的分段数（非活动任务恒为 0）。
+    pub downloading: usize,
+    /// Phase 5b-4d：等待许可排队的分段数（非活动任务恒为 0）。
+    pub queued: usize,
+    /// Phase 5b-4d：min(任务 connections, 当前每主机上限)。
+    pub max_concurrent: usize,
     pub chunks: Vec<ChunkView>,
 }
 
@@ -94,6 +102,8 @@ pub struct Settings {
     pub max_tasks: usize,
     pub default_connections: usize,
     pub max_connections_per_host: usize,
+    /// Phase 5b-4d：暂停任务继续时是否改用当前的 default_connections。
+    pub resume_uses_current_connections: bool,
     pub autostart: bool,
     pub notify_on_complete: bool,
 }
@@ -156,6 +166,15 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
         DEFAULT_MAX_PER_HOST,
     )
     .clamp(1, 32);
+    // Phase 5b-4d：默认为真；仅显式写入 "false" 时关闭。
+    let resume_uses_current_connections = match store
+        .get_setting("resume-uses-current-connections")
+        .await
+        .map_err(internal)?
+    {
+        Some(v) => v.trim() != "false",
+        None => true,
+    };
     let notify_on_complete = match store
         .get_setting("notify-on-complete")
         .await
@@ -170,6 +189,7 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
         max_tasks,
         default_connections,
         max_connections_per_host,
+        resume_uses_current_connections,
         autostart: autostart::query(desktop_name).is_some(),
         notify_on_complete,
     })
@@ -431,6 +451,16 @@ impl DesktopService {
         if self.read_only {
             return Err(ServiceError::ReadOnly);
         }
+        // Phase 5b-4d：勾选时，恢复前把该任务 DB 中的 connections 改为当前的
+        // 默认连接数；已存在的分段一律保留，不动 chunks 表。仅影响桌面「继续」，
+        // CLI 与浏览器接管不经过这里，行为不变。
+        let settings = read_settings(&self.store, &self.autostart_desktop_name).await?;
+        if settings.resume_uses_current_connections {
+            self.store
+                .set_task_connections(id, settings.default_connections)
+                .await
+                .map_err(internal)?;
+        }
         queue_of(self)?
             .resume_queued(id, false)
             .await
@@ -485,6 +515,13 @@ impl DesktopService {
     pub async fn task_detail(&self, id: i64) -> Result<TaskDetail, ServiceError> {
         let record = self.store.get_task(id).await.map_err(internal)?;
         let connections = record.connections.max(0) as usize;
+        // Phase 5b-4d：同时并发上限 = min(任务 connections, 当前每主机上限)。
+        // 运行器模式读共享 limiter 的实时值；观察模式不下载，用默认值即可。
+        let host_max = match &self.runner {
+            Some(runner) => runner.queue().max_connections_per_host(),
+            None => DEFAULT_MAX_PER_HOST,
+        };
+        let max_concurrent = connections.min(host_max);
 
         // Phase 5b-4c：只有任务当前 DB 状态为 Downloading 时才采用队列的实时快照。
         // 暂停/失败的任务即使队列里残留旧快照，也不能据其显示 active/queued。
@@ -555,10 +592,29 @@ impl DesktopService {
                 .collect()
         };
 
+        let segments = chunks.len();
+        // Phase 5b-4d：只有活动任务才统计 downloading/queued；
+        // 暂停/失败/完成等任务一律为 0（其分块状态也不是 active/queued）。
+        let active = record.state == TaskStateDb::Downloading;
+        let downloading = if active {
+            chunks.iter().filter(|c| c.state == "active").count()
+        } else {
+            0
+        };
+        let queued = if active {
+            chunks.iter().filter(|c| c.state == "queued").count()
+        } else {
+            0
+        };
+
         Ok(TaskDetail {
             id,
             total_size: record.total_size,
             connections,
+            segments,
+            downloading,
+            queued,
+            max_concurrent,
             chunks,
         })
     }
@@ -643,6 +699,14 @@ impl DesktopService {
             .map_err(internal)?;
         self.store
             .set_setting("default-connections", &s.default_connections.to_string())
+            .await
+            .map_err(internal)?;
+        // Phase 5b-4d：保存「继续时使用当前默认连接数」选项。
+        self.store
+            .set_setting(
+                "resume-uses-current-connections",
+                &s.resume_uses_current_connections.to_string(),
+            )
             .await
             .map_err(internal)?;
         // 每主机连接上限即时生效：保存后由 queue 转调共享 limiter。

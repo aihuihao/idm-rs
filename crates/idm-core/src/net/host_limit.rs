@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use reqwest::Url;
@@ -47,29 +47,178 @@ pub fn host_key(url: &Url) -> Result<HostKey> {
     Ok((scheme, host, port))
 }
 
-/// 单个 Host 的名额池：物理信号量 + 调小上限时的欠额。
+/// 可调上限的信号量（Phase 5b-4d 从按 Host 名额池抽取为通用结构）。
 ///
-/// `deficit` 表示「还需在许可归还时回收多少个」：调小上限时先 `forget_permits`
-/// 回收空闲许可，空闲不足的部分记入欠额；之后每次 `HostPermit` 归还时，若欠额
-/// 大于 0 就 CAS 减一并把该许可 `forget` 掉（不回到池、不唤醒等待者），直到欠额清零。
+/// 封装「物理信号量 + 当前上限 `max` + 调小上限时的欠额 `deficit`」：
+/// - 调大用 `add_permits` 立即补充差额并唤醒等待者；
+/// - 调小先 `forget_permits` 回收当前空闲许可，空闲不足的部分记入欠额，
+///   之后每次许可归还时若欠额大于 0 就 CAS 减一并把该许可 `forget` 掉
+///   （不回到池、不唤醒等待者），直到欠额清零——已持有者不被中断。
+///
+/// 既用于按 Host 的名额池，也用于每个下载任务的连接闸门（Phase 5b-4d）。
 #[derive(Debug)]
-struct HostSemaphore {
+pub struct AdjustableSemaphore {
     sem: Arc<Semaphore>,
     deficit: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl AdjustableSemaphore {
+    pub(crate) fn new(max: usize) -> Self {
+        AdjustableSemaphore {
+            sem: Arc::new(Semaphore::new(max)),
+            deficit: AtomicUsize::new(0),
+            max: AtomicUsize::new(max),
+        }
+    }
+
+    pub(crate) fn max(&self) -> usize {
+        self.max.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn available_permits(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    /// 调整上限：调大立即补充差额；调小先回收空闲、余量记为欠额。
+    pub(crate) fn set_max(&self, n: usize) {
+        let old = self.max.swap(n, Ordering::AcqRel);
+        if old == n {
+            return;
+        }
+        if n > old {
+            self.sem.add_permits(n - old);
+        } else {
+            let need = old - n;
+            let available = self.sem.available_permits();
+            let reclaimed = self.sem.forget_permits(available.min(need));
+            let debt = need - reclaimed;
+            if debt > 0 {
+                self.deficit.fetch_add(debt, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// 返回可跨 `select!` 轮次复用、不丢失公平队列位置的许可申请 future。
+    pub(crate) fn acquire_future(self: &Arc<Self>) -> Result<AdjustablePermitFuture> {
+        let sem = Arc::clone(self);
+        Ok(AdjustablePermitFuture {
+            inner: Box::pin(async move {
+                let permit = Arc::clone(&sem.sem).acquire_owned().await.map_err(|_| {
+                    Error::InvalidArgument {
+                        message: "connection semaphore closed".to_string(),
+                    }
+                })?;
+                Ok(AdjustablePermit {
+                    permit: Some(permit),
+                    sem,
+                })
+            }),
+        })
+    }
+
+    /// 归还许可：欠额 > 0 时回收该许可（不归还池），否则正常归还。
+    fn release(&self, permit: OwnedSemaphorePermit) {
+        let deficit = &self.deficit;
+        let mut current = deficit.load(Ordering::Acquire);
+        while current > 0 {
+            match deficit.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    permit.forget();
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+        drop(permit);
+    }
+}
+
+/// 可跨 `select!` 中断而不丢失 Semaphore 公平队列位置的许可申请 future。
+pub struct AdjustablePermitFuture {
+    inner: Pin<Box<dyn Future<Output = Result<AdjustablePermit>> + Send>>,
+}
+
+impl Future for AdjustablePermitFuture {
+    type Output = Result<AdjustablePermit>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
+    }
+}
+
+/// 一次许可（RAII）：drop 时按所属信号量的欠额状态归还或回收。
+#[derive(Debug)]
+pub struct AdjustablePermit {
+    permit: Option<OwnedSemaphorePermit>,
+    sem: Arc<AdjustableSemaphore>,
+}
+
+impl Drop for AdjustablePermit {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.sem.release(permit);
+        }
+    }
+}
+
+/// 单个下载任务的连接闸门（Phase 5b-4d）。
+///
+/// 任务 `connections` 是该任务同时连接数的上限：新建下载时初始分段数就等于它，
+/// 因此只有续传等「分段数 > connections」的场景，闸门才会实际限流。闸门许可数
+/// = min(connections, 每主机上限当前值)，随每主机上限调整而同步（见
+/// [`HostConnectionLimiter::set_max_per_host`]）；调小同样不中断已持有者。
+#[derive(Debug)]
+pub struct TaskGate {
+    sem: Arc<AdjustableSemaphore>,
+    connections: usize,
+}
+
+impl TaskGate {
+    /// 创建闸门。初始许可数 = min(connections, host_max)，至少 1。
+    pub(crate) fn new(connections: usize, host_max: usize) -> Result<Self> {
+        let effective = connections.max(1).min(host_max).max(1);
+        Ok(TaskGate {
+            sem: Arc::new(AdjustableSemaphore::new(effective)),
+            connections,
+        })
+    }
+
+    /// 当前任务有效并发 = min(任务 connections, 每主机上限当前值)。
+    pub(crate) fn effective(&self) -> usize {
+        self.sem.max()
+    }
+
+    /// 申请一个任务级许可， future 可跨 `select!` 复用、保持公平队列位置。
+    pub(crate) fn acquire_future(self: &Arc<Self>) -> Result<AdjustablePermitFuture> {
+        self.sem.acquire_future()
+    }
 }
 
 /// 按 Host 限制并发连接数。
 #[derive(Debug)]
 pub struct HostConnectionLimiter {
     max_per_host: AtomicUsize,
-    semaphores: Mutex<HashMap<HostKey, Arc<HostSemaphore>>>,
+    semaphores: Mutex<HashMap<HostKey, Arc<AdjustableSemaphore>>>,
+    /// 活动任务闸门注册表（弱引用，任务结束即自动失效）。每主机上限调整时同步。
+    task_gates: Mutex<Vec<Weak<TaskGate>>>,
 }
+
+/// 兼容原有 API 的别名：Host 名额申请 future 与许可。
+pub type HostPermitFuture = AdjustablePermitFuture;
+pub type HostPermit = AdjustablePermit;
 
 impl Default for HostConnectionLimiter {
     fn default() -> Self {
         HostConnectionLimiter {
             max_per_host: AtomicUsize::new(DEFAULT_MAX_PER_HOST),
             semaphores: Mutex::new(HashMap::new()),
+            task_gates: Mutex::new(Vec::new()),
         }
     }
 }
@@ -87,6 +236,7 @@ impl HostConnectionLimiter {
         Ok(HostConnectionLimiter {
             max_per_host: AtomicUsize::new(max_per_host),
             semaphores: Mutex::new(HashMap::new()),
+            task_gates: Mutex::new(Vec::new()),
         })
     }
 
@@ -98,7 +248,7 @@ impl HostConnectionLimiter {
     ///
     /// 调大：对每个已存在的 host 信号量 `add_permits(差值)`，唤醒排队分块。
     /// 调小：不中断已持有许可的连接——先 `forget_permits` 回收当前空闲许可，
-    /// 空闲不足的部分记入欠额，由后续 `HostPermit` 归还时逐步回收。
+    /// 空闲不足的部分记入欠额，由后续许可归还时逐步回收。
     pub fn set_max_per_host(&self, n: usize) -> Result<()> {
         if !(1..=32).contains(&n) {
             return Err(Error::InvalidArgument {
@@ -109,36 +259,47 @@ impl HostConnectionLimiter {
         if old == n {
             return Ok(());
         }
-        let map = self.semaphores.lock().unwrap_or_else(|p| p.into_inner());
-        for hs in map.values() {
-            if n > old {
-                hs.sem.add_permits(n - old);
-            } else {
-                let need = old - n;
-                // 先回收空闲许可（available 之外的部分无法立刻回收）。
-                let available = hs.sem.available_permits();
-                let reclaimed = hs.sem.forget_permits(available.min(need));
-                let debt = need - reclaimed;
-                if debt > 0 {
-                    hs.deficit.fetch_add(debt, Ordering::AcqRel);
-                }
+        {
+            let map = self.semaphores.lock().unwrap_or_else(|p| p.into_inner());
+            for hs in map.values() {
+                hs.set_max(n);
             }
+        }
+        // Phase 5b-4d：同步所有活动任务闸门到 min(connections, 新上限)。
+        // 弱引用失效的条目顺手清理；调小由 AdjustableSemaphore 的欠额机制处理，
+        // 不中断已持有许可的分块。
+        {
+            let mut gates = self.task_gates.lock().unwrap_or_else(|p| p.into_inner());
+            gates.retain(|weak| {
+                if let Some(gate) = weak.upgrade() {
+                    gate.sem.set_max(gate.connections.max(1).min(n).max(1));
+                    true
+                } else {
+                    false
+                }
+            });
         }
         Ok(())
     }
 
-    fn semaphore_for(&self, url: &Url) -> Result<Arc<HostSemaphore>> {
+    /// Phase 5b-4d：为一次下载创建任务级连接闸门（许可数 = min(connections, 当前上限)），
+    /// 并登记到注册表，使运行中调整每主机上限时能被同步。
+    pub(crate) fn new_task_gate(self: &Arc<Self>, connections: usize) -> Result<Arc<TaskGate>> {
+        let current = self.max_per_host.load(Ordering::Acquire);
+        let gate = Arc::new(TaskGate::new(connections, current)?);
+        let mut gates = self.task_gates.lock().unwrap_or_else(|p| p.into_inner());
+        gates.retain(|weak| weak.strong_count() > 0);
+        gates.push(Arc::downgrade(&gate));
+        Ok(gate)
+    }
+
+    fn semaphore_for(&self, url: &Url) -> Result<Arc<AdjustableSemaphore>> {
         let key = host_key(url)?;
         let mut map = self.semaphores.lock().unwrap_or_else(|p| p.into_inner());
         let current = self.max_per_host.load(Ordering::Acquire);
         Ok(map
             .entry(key)
-            .or_insert_with(|| {
-                Arc::new(HostSemaphore {
-                    sem: Arc::new(Semaphore::new(current)),
-                    deficit: AtomicUsize::new(0),
-                })
-            })
+            .or_insert_with(|| Arc::new(AdjustableSemaphore::new(current)))
             .clone())
     }
 
@@ -161,79 +322,12 @@ impl HostConnectionLimiter {
     /// 本方法把该 future **pin 住并返回**：调用方用 `&mut fut` 反复 poll 同一个
     /// future，即可在并列监听取消 / `end` 缩小的同时保持原来的排队位置。
     pub fn acquire_future(&self, url: &Url) -> Result<HostPermitFuture> {
-        let host = self.semaphore_for(url)?;
-        Ok(HostPermitFuture {
-            inner: Box::pin(async move {
-                let permit = Arc::clone(&host.sem).acquire_owned().await.map_err(|_| {
-                    Error::InvalidArgument {
-                        message: "host connection semaphore closed".to_string(),
-                    }
-                })?;
-                Ok(HostPermit {
-                    permit: Some(permit),
-                    host: Arc::clone(&host),
-                })
-            }),
-        })
+        self.semaphore_for(url)?.acquire_future()
     }
 
     /// 指定 Host 当前可用的名额数（诊断 / 测试用）。
     pub fn available_permits(&self, url: &Url) -> Result<usize> {
-        Ok(self.semaphore_for(url)?.sem.available_permits())
-    }
-}
-
-/// 可被 `select!` 中断而不丢失 Semaphore 公平队列位置的名额申请 future。
-///
-/// 实现了 [`Future`]，且内部是 `Pin<Box<...>>`，因此自身 [`Unpin`]：调用方可以直接
-/// 在 `tokio::select!` 里写 `p = &mut fut`，而不会因为其它分支先完成就 drop 它。
-pub struct HostPermitFuture {
-    inner: Pin<Box<dyn Future<Output = Result<HostPermit>> + Send>>,
-}
-
-impl Future for HostPermitFuture {
-    type Output = Result<HostPermit>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.as_mut().poll(cx)
-    }
-}
-
-/// 一次 HTTP 请求的连接名额（RAII）。
-#[derive(Debug)]
-pub struct HostPermit {
-    /// 用 `Option` 包装以便在 Drop 中取出：`forget()` 消费 permit 本身，
-    /// 使其不归还到信号量池（调小上限后的欠额回收）。
-    permit: Option<OwnedSemaphorePermit>,
-    /// 所属 Host 的名额池（含欠额计数）：归还时据此判断是否回收许可。
-    host: Arc<HostSemaphore>,
-}
-
-impl Drop for HostPermit {
-    fn drop(&mut self) {
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        // 欠额 > 0 时 CAS 减一，并把本次许可 forget 掉（不归还、不唤醒等待者）。
-        // 多个归还并发：CAS 保证恰好欠额次数被回收，其余许可正常归还。
-        let deficit = &self.host.deficit;
-        let mut current = deficit.load(Ordering::Acquire);
-        while current > 0 {
-            match deficit.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    permit.forget();
-                    return;
-                }
-                Err(actual) => current = actual,
-            }
-        }
-        // 无欠额：permit 在此正常 drop，归还到信号量池。
-        drop(permit);
+        Ok(self.semaphore_for(url)?.available_permits())
     }
 }
 
@@ -458,6 +552,26 @@ mod tests {
         drop(rb);
         drop(c);
         drop(held);
+        Ok(())
+    }
+
+    /// Phase 5b-4d：每主机上限调整时，所有活动任务闸门同步到 min(connections, 新上限)。
+    #[test]
+    fn task_gate_effective_follows_host_limit()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let limiter = Arc::new(HostConnectionLimiter::new(8)?);
+        let small = limiter.new_task_gate(6)?;
+        let large = limiter.new_task_gate(32)?;
+        assert_eq!(small.effective(), 6, "闸门初始上限应为 min(6, 8)");
+        assert_eq!(large.effective(), 8, "闸门初始上限应为 min(32, 8)");
+
+        limiter.set_max_per_host(2)?;
+        assert_eq!(small.effective(), 2, "调小后应同步到 min(6, 2)");
+        assert_eq!(large.effective(), 2, "调小后应同步到 min(32, 2)");
+
+        limiter.set_max_per_host(8)?;
+        assert_eq!(small.effective(), 6, "调大后应恢复 min(6, 8)");
+        assert_eq!(large.effective(), 8, "调大后应恢复 min(32, 8)");
         Ok(())
     }
 }

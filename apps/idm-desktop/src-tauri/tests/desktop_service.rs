@@ -113,6 +113,7 @@ fn default_settings(download_dir: &Path) -> Settings {
         max_tasks: 3,
         default_connections: 8,
         max_connections_per_host: 8,
+        resume_uses_current_connections: true,
         autostart: false,
         notify_on_complete: true,
     }
@@ -1225,6 +1226,276 @@ async fn reported_speed_respects_global_limit() -> TestResult {
         avg <= limit_f * 1.2,
         "全程平均速度 {avg:.0} B/s 超过 2.4 MiB/s"
     );
+
+    srv.shutdown();
+    svc.shutdown().await?;
+    Ok(())
+}
+
+// --- Phase 5b-4d：继续下载时使用当前默认连接数 --------------------------
+
+/// 设置项持久化：默认为真，显式写假后读回为假。
+#[tokio::test]
+async fn resume_connections_setting_roundtrip() -> TestResult {
+    let tmp = TempDir::new()?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db).await?;
+    let initial = svc.get_settings().await?;
+    assert!(
+        initial.resume_uses_current_connections,
+        "resume-uses-current-connections 默认为真"
+    );
+
+    let mut changed = initial;
+    changed.resume_uses_current_connections = false;
+    svc.set_settings(changed).await?;
+
+    let reread = svc.get_settings().await?;
+    assert!(
+        !reread.resume_uses_current_connections,
+        "写入假后读回应为假"
+    );
+    svc.shutdown().await?;
+    Ok(())
+}
+
+/// 调小：以 8 连接创建并暂停，把默认连接数改为 2 后继续。
+/// DB connections 应变为 2；继续后同时下载的分段数 ≤ 2；分段总数不变；文件正确。
+#[tokio::test]
+async fn resume_lowers_connections() -> TestResult {
+    let tmp = TempDir::new()?;
+    let size = 8 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        // 每连接 256 KiB/s：暂停前 8 路 ≈2 MiB/s，继续后 2 路 ≈512 KiB/s，
+        // 使继续阶段有足够长的窗口采样活跃分段数。
+        speed: Some(SpeedPolicy(Arc::new(|_, _| Some(256 * KIB)))),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db).await?;
+    let id = svc.add_task(srv.url("/lower.bin"), Some(8)).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.downloaded > 0),
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    let segments_before = svc.task_detail(id).await?.chunks.len();
+    assert!(
+        segments_before >= 8,
+        "初始应至少 8 段，实际 {segments_before}"
+    );
+
+    svc.pause_task(id).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.state == "Paused"),
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let mut settings = svc.get_settings().await?;
+    settings.default_connections = 2;
+    svc.set_settings(settings).await?;
+
+    svc.resume_task(id).await?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut samples = 0usize;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let detail = svc.task_detail(id).await?;
+        assert_eq!(
+            detail.connections, 2,
+            "继续后 DB 中任务 connections 应变为 2"
+        );
+        let active = detail.chunks.iter().filter(|c| c.state == "active").count();
+        println!(
+            "LOWER_CONN active={active} segments={} connections={}",
+            detail.chunks.len(),
+            detail.connections
+        );
+        assert!(active <= 2, "同时下载的分段数 {active} 不得超过 2");
+        assert_eq!(
+            detail.max_concurrent, 2,
+            "详情面板 max_concurrent 应为 min(任务 connections=2, 每主机上限=8)"
+        );
+        assert!(
+            detail.downloading <= 2,
+            "详情面板 downloading 不得超过 2，实际 {}",
+            detail.downloading
+        );
+        assert_eq!(
+            detail.segments, segments_before,
+            "详情面板分段总数应与暂停前相同"
+        );
+        assert_eq!(
+            detail.chunks.len(),
+            segments_before,
+            "分段总数不得变化（不得重新切分）"
+        );
+        samples += 1;
+        let completed = svc
+            .list_tasks()
+            .await?
+            .iter()
+            .any(|t| t.id == id && t.state == "Completed");
+        if completed {
+            break;
+        }
+    }
+    assert!(samples >= 2, "观测窗口内应至少有 2 次采样");
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.state == "Completed"),
+        Duration::from_secs(120),
+    )
+    .await?;
+    verify_bytes(&download.join("lower.bin"), size)?;
+
+    srv.shutdown();
+    svc.shutdown().await?;
+    Ok(())
+}
+
+/// 调大：以 2 连接创建并暂停，把默认连接数改为 6 后继续。
+/// DB connections 应变为 6；8 秒内同时下载的分段数达到 3 以上且不超过 6；文件正确。
+#[tokio::test]
+async fn resume_raises_connections() -> TestResult {
+    let tmp = TempDir::new()?;
+    let size = 64 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        speed: Some(SpeedPolicy(Arc::new(|_, _| Some(512 * KIB)))),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db).await?;
+    let id = svc.add_task(srv.url("/raise.bin"), Some(2)).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.downloaded > 0),
+        Duration::from_secs(20),
+    )
+    .await?;
+    svc.pause_task(id).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.state == "Paused"),
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let mut settings = svc.get_settings().await?;
+    settings.default_connections = 6;
+    svc.set_settings(settings).await?;
+
+    svc.resume_task(id).await?;
+
+    let mut saw_above_three = false;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let detail = svc.task_detail(id).await?;
+        assert_eq!(
+            detail.connections, 6,
+            "继续后 DB 中任务 connections 应变为 6"
+        );
+        let active = detail.chunks.iter().filter(|c| c.state == "active").count();
+        println!(
+            "RAISE_CONN active={active} segments={}",
+            detail.chunks.len()
+        );
+        assert!(active <= 6, "同时下载的分段数 {active} 不得超过 6");
+        if active >= 3 {
+            saw_above_three = true;
+        }
+    }
+    assert!(saw_above_three, "调大后同时下载的分段数必须曾达到 3 以上");
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.state == "Completed"),
+        Duration::from_secs(180),
+    )
+    .await?;
+    verify_bytes(&download.join("raise.bin"), size)?;
+
+    srv.shutdown();
+    svc.shutdown().await?;
+    Ok(())
+}
+
+/// 关闭选项：继续时不得改动任务的 connections。
+#[tokio::test]
+async fn resume_keeps_connections_when_disabled() -> TestResult {
+    let tmp = TempDir::new()?;
+    let size = 32 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        speed: Some(SpeedPolicy(Arc::new(|_, _| Some(512 * KIB)))),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db).await?;
+    let mut settings = svc.get_settings().await?;
+    settings.resume_uses_current_connections = false;
+    svc.set_settings(settings).await?;
+
+    let id = svc.add_task(srv.url("/keep.bin"), Some(8)).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.downloaded > 0),
+        Duration::from_secs(20),
+    )
+    .await?;
+    svc.pause_task(id).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.state == "Paused"),
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let mut settings = svc.get_settings().await?;
+    settings.default_connections = 2;
+    svc.set_settings(settings).await?;
+
+    svc.resume_task(id).await?;
+
+    let detail = svc.task_detail(id).await?;
+    assert_eq!(
+        detail.connections, 8,
+        "选项关闭时继续下载不得改动任务 connections"
+    );
+
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.state == "Completed"),
+        Duration::from_secs(120),
+    )
+    .await?;
+    verify_bytes(&download.join("keep.bin"), size)?;
 
     srv.shutdown();
     svc.shutdown().await?;
