@@ -2,6 +2,7 @@
 //!
 //! 发布频率不超过每 200ms 一次；没有读者时下载照常进行，不阻塞。
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,9 +70,20 @@ pub struct ProgressPublisher {
     current: Arc<Mutex<ProgressSnapshot>>,
     tx: watch::Sender<ProgressSnapshot>,
     last_publish: Instant,
-    prev_downloaded: u64,
-    prev_time: Instant,
+    /// 速度滑动窗口：记录最近约 1 秒的 (时刻, 累计下载字节)。
+    /// Phase 5b-4c：写入线程按批次更新 chunk.current，若用相邻两次 publish
+    /// （200ms）算瞬时速度会因批次抖动出现数倍尖峰；用 1 秒窗口平均可平滑，
+    /// 且仍能在一秒内反映真实速度变化。
+    speed_window: VecDeque<(Instant, u64)>,
+    /// 在窗口均值之上再叠加指数移动平均，平滑收尾阶段的单次批次跳变。
+    speed_ema: Option<f64>,
 }
+
+/// 速度滑动窗口时长（字节数在此区间上的增量除以时间差）。
+const SPEED_WINDOW: Duration = Duration::from_secs(1);
+/// EMA 权重：新样本占 1/4，抑制单次写入批次的尖峰，同时约 4 次发布（0.8 秒）
+/// 内即可跟上真实速度变化。
+const SPEED_EMA_ALPHA: f64 = 0.25;
 
 impl ProgressPublisher {
     /// 创建发布器与接收端。`chunks` 为各分块的初始信息（含数据库编号与来源）。
@@ -124,8 +136,8 @@ impl ProgressPublisher {
                 current,
                 tx,
                 last_publish: now,
-                prev_downloaded: 0,
-                prev_time: now,
+                speed_window: VecDeque::from([(now, 0)]),
+                speed_ema: None,
             },
             rx,
         )
@@ -270,17 +282,30 @@ impl ProgressPublisher {
             .iter()
             .map(|c| c.current.saturating_sub(c.start))
             .sum();
-        let elapsed = now.duration_since(self.prev_time).as_secs_f64();
-        if elapsed > 0.0 {
-            snap.speed = (downloaded.saturating_sub(self.prev_downloaded)) as f64 / elapsed;
+        // 维护约 1 秒的速度窗口：追加当前样本，丢弃早于窗口起点的旧样本，
+        // 始终保留至少一个样本作为计算基准。
+        self.speed_window.push_back((now, downloaded));
+        let cutoff = now.checked_sub(SPEED_WINDOW).unwrap_or(now);
+        while self.speed_window.len() > 2 && self.speed_window[1].0 <= cutoff {
+            self.speed_window.pop_front();
+        }
+        if let Some(&(base_time, base_bytes)) = self.speed_window.front() {
+            let elapsed = now.saturating_duration_since(base_time).as_secs_f64();
+            if elapsed > 0.0 {
+                let window_speed = (downloaded.saturating_sub(base_bytes)) as f64 / elapsed;
+                let smoothed = match self.speed_ema {
+                    None => window_speed,
+                    Some(prev) => SPEED_EMA_ALPHA * window_speed + (1.0 - SPEED_EMA_ALPHA) * prev,
+                };
+                self.speed_ema = Some(smoothed);
+                snap.speed = smoothed;
+            }
         }
         snap.downloaded = downloaded;
         let out = snap.clone();
         drop(snap);
         // 发送失败（无读者被 drop）忽略即可。
         let _ = self.tx.send(out);
-        self.prev_downloaded = downloaded;
-        self.prev_time = now;
         self.last_publish = now;
     }
 }

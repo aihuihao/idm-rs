@@ -537,7 +537,7 @@ pub(super) async fn try_split(
         })
         .count();
     let total = slots.len() + pending.len();
-    if not_started >= spawner.effective_concurrency || total > spawner.max_chunks {
+    if not_started >= spawner.effective_concurrency() || total > spawner.max_chunks() {
         return Ok(false);
     }
 

@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -46,17 +47,28 @@ pub fn host_key(url: &Url) -> Result<HostKey> {
     Ok((scheme, host, port))
 }
 
+/// 单个 Host 的名额池：物理信号量 + 调小上限时的欠额。
+///
+/// `deficit` 表示「还需在许可归还时回收多少个」：调小上限时先 `forget_permits`
+/// 回收空闲许可，空闲不足的部分记入欠额；之后每次 `HostPermit` 归还时，若欠额
+/// 大于 0 就 CAS 减一并把该许可 `forget` 掉（不回到池、不唤醒等待者），直到欠额清零。
+#[derive(Debug)]
+struct HostSemaphore {
+    sem: Arc<Semaphore>,
+    deficit: AtomicUsize,
+}
+
 /// 按 Host 限制并发连接数。
 #[derive(Debug)]
 pub struct HostConnectionLimiter {
-    max_per_host: usize,
-    semaphores: Mutex<HashMap<HostKey, Arc<Semaphore>>>,
+    max_per_host: AtomicUsize,
+    semaphores: Mutex<HashMap<HostKey, Arc<HostSemaphore>>>,
 }
 
 impl Default for HostConnectionLimiter {
     fn default() -> Self {
         HostConnectionLimiter {
-            max_per_host: DEFAULT_MAX_PER_HOST,
+            max_per_host: AtomicUsize::new(DEFAULT_MAX_PER_HOST),
             semaphores: Mutex::new(HashMap::new()),
         }
     }
@@ -73,21 +85,60 @@ impl HostConnectionLimiter {
             });
         }
         Ok(HostConnectionLimiter {
-            max_per_host,
+            max_per_host: AtomicUsize::new(max_per_host),
             semaphores: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn max_per_host(&self) -> usize {
-        self.max_per_host
+        self.max_per_host.load(Ordering::Acquire)
     }
 
-    fn semaphore_for(&self, url: &Url) -> Result<Arc<Semaphore>> {
+    /// Phase 5b-4c：运行中即时调整每主机上限，`n` 必须在 1..=32。
+    ///
+    /// 调大：对每个已存在的 host 信号量 `add_permits(差值)`，唤醒排队分块。
+    /// 调小：不中断已持有许可的连接——先 `forget_permits` 回收当前空闲许可，
+    /// 空闲不足的部分记入欠额，由后续 `HostPermit` 归还时逐步回收。
+    pub fn set_max_per_host(&self, n: usize) -> Result<()> {
+        if !(1..=32).contains(&n) {
+            return Err(Error::InvalidArgument {
+                message: format!("max_connections_per_host must be in 1..=32, got {n}"),
+            });
+        }
+        let old = self.max_per_host.swap(n, Ordering::AcqRel);
+        if old == n {
+            return Ok(());
+        }
+        let map = self.semaphores.lock().unwrap_or_else(|p| p.into_inner());
+        for hs in map.values() {
+            if n > old {
+                hs.sem.add_permits(n - old);
+            } else {
+                let need = old - n;
+                // 先回收空闲许可（available 之外的部分无法立刻回收）。
+                let available = hs.sem.available_permits();
+                let reclaimed = hs.sem.forget_permits(available.min(need));
+                let debt = need - reclaimed;
+                if debt > 0 {
+                    hs.deficit.fetch_add(debt, Ordering::AcqRel);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn semaphore_for(&self, url: &Url) -> Result<Arc<HostSemaphore>> {
         let key = host_key(url)?;
         let mut map = self.semaphores.lock().unwrap_or_else(|p| p.into_inner());
+        let current = self.max_per_host.load(Ordering::Acquire);
         Ok(map
             .entry(key)
-            .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_host)))
+            .or_insert_with(|| {
+                Arc::new(HostSemaphore {
+                    sem: Arc::new(Semaphore::new(current)),
+                    deficit: AtomicUsize::new(0),
+                })
+            })
             .clone())
     }
 
@@ -110,23 +161,25 @@ impl HostConnectionLimiter {
     /// 本方法把该 future **pin 住并返回**：调用方用 `&mut fut` 反复 poll 同一个
     /// future，即可在并列监听取消 / `end` 缩小的同时保持原来的排队位置。
     pub fn acquire_future(&self, url: &Url) -> Result<HostPermitFuture> {
-        let sem = self.semaphore_for(url)?;
+        let host = self.semaphore_for(url)?;
         Ok(HostPermitFuture {
             inner: Box::pin(async move {
-                let permit = sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::InvalidArgument {
+                let permit = Arc::clone(&host.sem).acquire_owned().await.map_err(|_| {
+                    Error::InvalidArgument {
                         message: "host connection semaphore closed".to_string(),
-                    })?;
-                Ok(HostPermit { _permit: permit })
+                    }
+                })?;
+                Ok(HostPermit {
+                    permit: Some(permit),
+                    host: Arc::clone(&host),
+                })
             }),
         })
     }
 
     /// 指定 Host 当前可用的名额数（诊断 / 测试用）。
     pub fn available_permits(&self, url: &Url) -> Result<usize> {
-        Ok(self.semaphore_for(url)?.available_permits())
+        Ok(self.semaphore_for(url)?.sem.available_permits())
     }
 }
 
@@ -149,7 +202,39 @@ impl Future for HostPermitFuture {
 /// 一次 HTTP 请求的连接名额（RAII）。
 #[derive(Debug)]
 pub struct HostPermit {
-    _permit: OwnedSemaphorePermit,
+    /// 用 `Option` 包装以便在 Drop 中取出：`forget()` 消费 permit 本身，
+    /// 使其不归还到信号量池（调小上限后的欠额回收）。
+    permit: Option<OwnedSemaphorePermit>,
+    /// 所属 Host 的名额池（含欠额计数）：归还时据此判断是否回收许可。
+    host: Arc<HostSemaphore>,
+}
+
+impl Drop for HostPermit {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        // 欠额 > 0 时 CAS 减一，并把本次许可 forget 掉（不归还、不唤醒等待者）。
+        // 多个归还并发：CAS 保证恰好欠额次数被回收，其余许可正常归还。
+        let deficit = &self.host.deficit;
+        let mut current = deficit.load(Ordering::Acquire);
+        while current > 0 {
+            match deficit.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    permit.forget();
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+        // 无欠额：permit 在此正常 drop，归还到信号量池。
+        drop(permit);
+    }
 }
 
 #[cfg(test)]
@@ -253,5 +338,126 @@ mod tests {
         drop(first);
         let second = tokio::time::timeout(Duration::from_millis(500), &mut b).await;
         assert!(matches!(second, Ok(Ok(_))), "A 释放名额后 B 应拿到名额");
+    }
+
+    /// Phase 5b-4c：调大上限应立即唤醒正在排队的获取者。
+    #[tokio::test]
+    async fn raise_limit_releases_waiters() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse("http://example.com/f")?;
+        let limiter = HostConnectionLimiter::new(1)?;
+        let cancel = CancelSignal::new();
+        let first = limiter.acquire(&url, &cancel).await?;
+
+        let mut second = limiter.acquire_future(&url)?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "调大前第二个获取者必须阻塞"
+        );
+
+        limiter.set_max_per_host(2)?;
+        let acquired = tokio::time::timeout(Duration::from_millis(100), &mut second).await?;
+        assert!(acquired.is_ok(), "调到 2 后等待者应在 100ms 内拿到许可");
+        assert_eq!(limiter.max_per_host(), 2);
+        drop(acquired);
+        drop(first);
+        Ok(())
+    }
+
+    /// Phase 5b-4c：调小上限不中断已持有者；空闲不够的部分记为欠额，
+    /// 归还时优先抵扣欠额，稳定后同时持有不超过新上限。
+    #[tokio::test]
+    async fn lower_limit_drains_without_interrupting()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse("http://example.com/f")?;
+        let limiter = HostConnectionLimiter::new(4)?;
+        let cancel = CancelSignal::new();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(limiter.acquire(&url, &cancel).await?);
+        }
+        assert_eq!(limiter.available_permits(&url)?, 0);
+
+        limiter.set_max_per_host(2)?;
+        assert_eq!(held.len(), 4, "已持有的 4 个许可不应被中断");
+        assert_eq!(limiter.max_per_host(), 2);
+        assert_eq!(limiter.available_permits(&url)?, 0, "没有空闲可立即回收");
+
+        // 归还全部 4 个：前 2 个被欠额吸收，后 2 个回到池中。
+        drop(held.remove(0));
+        drop(held.remove(0));
+        assert_eq!(
+            limiter.available_permits(&url)?,
+            0,
+            "欠额抵扣期间可用数仍为 0"
+        );
+        drop(held.remove(0));
+        drop(held.remove(0));
+        assert_eq!(limiter.available_permits(&url)?, 2, "稳定后池内应恰好 2 个");
+
+        let mut a = limiter.acquire_future(&url)?;
+        let mut b = limiter.acquire_future(&url)?;
+        let mut c = limiter.acquire_future(&url)?;
+        let ra = tokio::time::timeout(Duration::from_millis(100), &mut a).await?;
+        let rb = tokio::time::timeout(Duration::from_millis(100), &mut b).await?;
+        assert!(ra.is_ok(), "应拿到第 1 个许可");
+        assert!(rb.is_ok(), "应拿到第 2 个许可");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut c)
+                .await
+                .is_err(),
+            "第 3 个获取者必须阻塞（上限已降到 2）"
+        );
+        drop(ra);
+        drop(rb);
+        drop(c);
+        Ok(())
+    }
+
+    /// Phase 5b-4c：4 → 1 → 3 交替调整，最终可同时持有恰好 3 个。
+    #[tokio::test]
+    async fn lower_then_raise_settles_correctly()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse("http://example.com/f")?;
+        let limiter = HostConnectionLimiter::new(4)?;
+        let cancel = CancelSignal::new();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(limiter.acquire(&url, &cancel).await?);
+        }
+
+        limiter.set_max_per_host(1)?;
+        drop(held.remove(0));
+        drop(held.remove(0));
+        drop(held.remove(0));
+        assert_eq!(held.len(), 1, "欠额抵扣后应只剩 1 个持有");
+        assert_eq!(limiter.available_permits(&url)?, 0);
+
+        limiter.set_max_per_host(3)?;
+        assert_eq!(limiter.max_per_host(), 3);
+        assert_eq!(
+            limiter.available_permits(&url)?,
+            2,
+            "调大应立即补足 2 个空闲"
+        );
+
+        let mut a = limiter.acquire_future(&url)?;
+        let mut b = limiter.acquire_future(&url)?;
+        let mut c = limiter.acquire_future(&url)?;
+        let ra = tokio::time::timeout(Duration::from_millis(100), &mut a).await?;
+        let rb = tokio::time::timeout(Duration::from_millis(100), &mut b).await?;
+        assert!(ra.is_ok() && rb.is_ok(), "调大后应能同时持有 3 个");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut c)
+                .await
+                .is_err(),
+            "第 4 个获取者必须阻塞（上限为 3）"
+        );
+        drop(ra);
+        drop(rb);
+        drop(c);
+        drop(held);
+        Ok(())
     }
 }

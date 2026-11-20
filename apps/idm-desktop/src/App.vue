@@ -260,7 +260,7 @@
         <div class="field">
           <label>每台服务器最大连接数（1~32）</label>
           <input v-model.number="draftSettings.max_connections_per_host" :disabled="readOnly" type="number" min="1" max="32" />
-          <span class="hint">修改后重启程序生效</span>
+          <span class="hint">保存后立即对正在下载的任务生效</span>
         </div>
         <div class="field">
           <label class="checkbox">
@@ -862,6 +862,7 @@ function chunkClass(c: ChunkView): string {
     case 'done': return 'done';
     case 'retrying': return 'retrying';
     case 'active': return 'active';
+    case 'paused': return 'paused';
     case 'queued':
     default: return 'waiting';
   }
@@ -872,6 +873,7 @@ function chunkStateText(state: string): string {
     case 'done': return '已完成';
     case 'retrying': return '重试中';
     case 'queued': return '排队';
+    case 'paused': return '已暂停';
     default: return '等待';
   }
 }
@@ -1055,6 +1057,7 @@ table.tasks .num { text-align: right; font-variant-numeric: tabular-nums; white-
 .seg-fill.active { background: var(--blue); }
 .seg-fill.done { background: var(--green); }
 .seg-fill.retrying { background: var(--orange); }
+.seg-fill.paused { background: var(--gray); }
 .seg-fill.waiting { background: transparent; }
 table.chunks { width: 100%; border-collapse: collapse; font-size: 12px; }
 table.chunks th, table.chunks td { border: 1px solid var(--border); padding: 2px 6px; text-align: left; }

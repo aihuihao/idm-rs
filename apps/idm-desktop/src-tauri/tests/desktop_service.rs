@@ -1103,3 +1103,130 @@ async fn task_detail_reports_chunks() -> TestResult {
     svc.shutdown().await?;
     Ok(())
 }
+
+/// Phase 5b-4c：暂停任务的分块详情不得显示 active/queued。
+/// 暂停后队列残留的旧快照或直接读 DB，都不应把未下完的块显示为下载中。
+#[tokio::test]
+async fn paused_task_chunks_not_shown_downloading() -> TestResult {
+    let tmp = TempDir::new()?;
+    let size = 8 * MIB;
+    // 慢速 + 4 连接：暂停时多个块处于部分下载（committed > start）。
+    let srv = start(ServerConfig {
+        size,
+        speed: Some(SpeedPolicy(Arc::new(|_, _| Some(256 * KIB)))),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open(db.clone()).await?;
+    let id = svc.add_task(srv.url("/paused.bin"), Some(4)).await?;
+    wait_for(
+        &svc,
+        |v| v.iter().any(|t| t.id == id && t.downloaded > 0),
+        Duration::from_secs(20),
+    )
+    .await?;
+    svc.pause_task(id).await?;
+    wait_for(
+        &svc,
+        |v| {
+            v.iter().any(|t| {
+                t.id == id && t.state == "Paused" && t.pause_reason.as_deref() == Some("User")
+            })
+        },
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    // 暂停确认后再取详情：不应有任何分块为 active 或 queued。
+    let detail = svc.task_detail(id).await?;
+    println!(
+        "PAUSED_CHUNKS states={:?}",
+        detail
+            .chunks
+            .iter()
+            .map(|c| c.state.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        detail
+            .chunks
+            .iter()
+            .all(|c| c.state != "active" && c.state != "queued"),
+        "暂停任务的分块不得显示 active/queued，实际 {:?}",
+        detail
+            .chunks
+            .iter()
+            .map(|c| c.state.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    srv.shutdown();
+    svc.shutdown().await?;
+    Ok(())
+}
+
+/// Phase 5b-4c：全局限速 2 MiB/s 时，界面报告的平均速度与瞬时速度都不得超额。
+#[tokio::test]
+async fn reported_speed_respects_global_limit() -> TestResult {
+    let tmp = TempDir::new()?;
+    const MIB: u64 = 1024 * 1024;
+    let limit = 2 * MIB;
+    let size = 24 * MIB;
+    let srv = start(ServerConfig {
+        size,
+        ..ServerConfig::default()
+    })
+    .await?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, Some(limit)).await?;
+
+    let svc = DesktopService::open(db.clone()).await?;
+    let id = svc.add_task(srv.url("/speed.bin"), Some(8)).await?;
+
+    let started = Instant::now();
+    let mut samples: Option<(u64, u64)> = None;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let tasks = svc.list_tasks().await?;
+        let Some(view) = tasks.iter().find(|t| t.id == id) else {
+            continue;
+        };
+        samples = Some(match samples {
+            None => (view.downloaded, view.downloaded),
+            Some((first, _)) => (first, view.downloaded),
+        });
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed >= 2.0 && view.speed_bps > 3 * MIB {
+            return Err(format!(
+                "第 2 秒后瞬时速度 {} B/s 超过 3 MiB/s（t={elapsed:.2}s）",
+                view.speed_bps
+            )
+            .into());
+        }
+        if view.state == "Completed" || elapsed > 40.0 {
+            break;
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let (first_downloaded, last_downloaded) = samples.unwrap_or((0, 0));
+    let avg = (last_downloaded.saturating_sub(first_downloaded)) as f64 / elapsed.max(0.001);
+    let limit_f = limit as f64;
+    println!(
+        "SPEED avg={avg:.0} B/s limit={limit} downloaded={last_downloaded} elapsed={elapsed:.2}s"
+    );
+    assert!(
+        avg <= limit_f * 1.2,
+        "全程平均速度 {avg:.0} B/s 超过 2.4 MiB/s"
+    );
+
+    srv.shutdown();
+    svc.shutdown().await?;
+    Ok(())
+}

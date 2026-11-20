@@ -600,11 +600,10 @@ async fn run_download(
         backoff_base: opts.config.retry_base_delay,
         backoff_cap: opts.config.retry_max_delay,
         min_split: opts.config.min_split_size,
-        // Phase 5b-4b：有效并发与分块硬上限。有效并发取「任务连接数」与
-        // 「每主机上限」的较小值——初始分块数、拆分阈值都用它，避免创建出
-        // 永远拿不到 Host 名额的排队分块。硬上限兜底防止极端情况下分块无限增长。
-        effective_concurrency: opts.config.connections.min(host_max).max(1),
-        max_chunks: (4 * opts.config.connections.min(host_max).max(1)).max(16),
+        // Phase 5b-4c：保存任务连接数；有效并发与分块硬上限改为每次判断时
+        // 动态计算（见 ChunkSpawner::effective_concurrency/max_chunks），
+        // 使运行中调整每主机上限后拆分行为能立即跟随。
+        connections: opts.config.connections,
     };
 
     let mut join_set: JoinSet<Result<ChunkResult>> = JoinSet::new();
@@ -657,7 +656,7 @@ async fn run_download(
     // Phase 5b-4b：拆分阈值用有效并发（min(连接数, 每主机上限)），
     // 而非 inits.len()（= 连接数）。连接数大于主机上限时，后者会让
     // 被扣除排队块后的 in_flight 永远小于阈值，触发无休止拆分。
-    let max_concurrent = spawner.effective_concurrency;
+    // Phase 5b-4c：有效并发每次判断时通过 spawner.effective_concurrency() 动态读取。
 
     // 10.5 零进度接管：等待被接管分块释放写器之后才启动的新分块。
     let mut pending: Vec<PendingChunk> = Vec::new();
@@ -718,7 +717,7 @@ async fn run_download(
                         }
                         if opts.config.dynamic_split
                             && !streaming
-                            && in_flight(&slots, &join_set, &pending) < max_concurrent
+                            && in_flight(&slots, &join_set, &pending) < spawner.effective_concurrency()
                             && let Err(e) = try_split(
                                 ctx,
                                 &spawner,
@@ -787,7 +786,7 @@ async fn run_download(
                 }
                 if opts.config.dynamic_split
                     && !streaming
-                    && in_flight(&slots, &join_set, &pending) < max_concurrent
+                    && in_flight(&slots, &join_set, &pending) < spawner.effective_concurrency()
                     && let Err(e) = try_split(
                         ctx,
                         &spawner,
@@ -1032,13 +1031,25 @@ pub(super) struct ChunkSpawner {
     backoff_cap: Duration,
     /// 普通对半切的最小分块大小（放进启动器，避免 try_split 参数过多）。
     pub(super) min_split: u64,
-    /// Phase 5b-4b：有效并发数 = min(任务连接数, 每主机上限)，至少 1。
-    pub(super) effective_concurrency: usize,
-    /// Phase 5b-4b：分块总数硬上限 = max(4 × 有效并发, 16)。
-    pub(super) max_chunks: usize,
+    /// 任务连接数。与 limiter 当前上限取小得到有效并发（5b-4c 动态计算）。
+    connections: usize,
 }
 
 impl ChunkSpawner {
+    /// Phase 5b-4c：有效并发 = min(任务连接数, limiter **当前**上限)，至少 1。
+    /// 运行中上限可被 `set_max_per_host` 改变，故每次判断都重新读取，不缓存。
+    pub(super) fn effective_concurrency(&self) -> usize {
+        self.connections
+            .max(1)
+            .min(self.host_limiter.max_per_host())
+            .max(1)
+    }
+
+    /// Phase 5b-4c：分块总数硬上限 = max(4 × 当前有效并发, 16)，动态计算。
+    pub(super) fn max_chunks(&self) -> usize {
+        (4 * self.effective_concurrency()).max(16)
+    }
+
     /// 分配写器并注册到线程池。切分时必须**先** shrink 旧的、**再**分配新的，
     /// 否则两个写器的区间会重叠。
     pub(super) async fn open(&self, shared: &ChunkShared) -> Result<PoolChunk> {

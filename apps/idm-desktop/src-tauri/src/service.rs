@@ -74,7 +74,7 @@ pub struct ChunkView {
     pub downloaded: u64,
     /// 拿不到实时速度时为 0。
     pub speed_bps: u64,
-    /// "active" | "done" | "waiting" | "queued" | "retrying"
+    /// "active" | "done" | "waiting" | "queued" | "retrying" | "paused"
     pub state: String,
 }
 
@@ -486,9 +486,15 @@ impl DesktopService {
         let record = self.store.get_task(id).await.map_err(internal)?;
         let connections = record.connections.max(0) as usize;
 
-        let live = match &self.runner {
-            Some(runner) => runner.queue().progress(id).await,
-            None => None,
+        // Phase 5b-4c：只有任务当前 DB 状态为 Downloading 时才采用队列的实时快照。
+        // 暂停/失败的任务即使队列里残留旧快照，也不能据其显示 active/queued。
+        let live = if record.state == TaskStateDb::Downloading {
+            match &self.runner {
+                Some(runner) => runner.queue().progress(id).await,
+                None => None,
+            }
+        } else {
+            None
         };
 
         let chunks: Vec<ChunkView> = if let Some(snapshot) = live {
@@ -521,16 +527,21 @@ impl DesktopService {
                 .collect()
         } else {
             let all_done = record.state == TaskStateDb::Completed;
+            // Phase 5b-4c：非活动任务的未下完分块状态由任务当前状态决定：
+            // 暂停/失败 → paused；排队/其它 → waiting。绝不再显示 active/queued。
+            let pending_state = match record.state {
+                TaskStateDb::Paused | TaskStateDb::Failed => "paused",
+                TaskStateDb::Completed => "done",
+                _ => "waiting",
+            };
             record
                 .chunks
                 .iter()
                 .map(|c| {
                     let state = if all_done || c.committed >= c.end {
                         "done"
-                    } else if c.committed > c.start {
-                        "active"
                     } else {
-                        "waiting"
+                        pending_state
                     };
                     ChunkView {
                         index: c.chunk_index.max(0) as usize,
@@ -634,7 +645,7 @@ impl DesktopService {
             .set_setting("default-connections", &s.default_connections.to_string())
             .await
             .map_err(internal)?;
-        // 每主机连接上限「重启生效」：只保存，不尝试在运行中修改 HostConnectionLimiter。
+        // 每主机连接上限即时生效：保存后由 queue 转调共享 limiter。
         self.store
             .set_setting(
                 "max-connections-per-host",
@@ -656,6 +667,10 @@ impl DesktopService {
         queue.set_global_max_speed(speed);
         queue
             .set_max_concurrent_tasks(s.max_tasks)
+            .map_err(internal)?;
+        // Phase 5b-4c：每主机上限保存后立即对运行中的任务生效。
+        queue
+            .set_max_connections_per_host(s.max_connections_per_host)
             .map_err(internal)?;
 
         // 开机启动：开启时写桌面项并清除旧的 CLI 运行器项，避免两个运行器抢锁；

@@ -267,6 +267,13 @@ impl DownloadQueue {
         self.inner.global_limiter.set_rate(bytes_per_sec);
     }
 
+    /// Phase 5b-4c：调整每主机连接上限（1..=32），对正在运行的任务立即生效。
+    /// 转调共享的 [`HostConnectionLimiter`]：调大唤醒排队分块，调小不中断
+    /// 已持有许可的连接，欠额在归还时回收。
+    pub fn set_max_connections_per_host(&self, n: usize) -> Result<()> {
+        self.inner.host_limiter.set_max_per_host(n)
+    }
+
     /// 订阅队列事件流。
     pub fn subscribe_events(&self) -> broadcast::Receiver<QueueEvent> {
         self.inner.events.subscribe()
