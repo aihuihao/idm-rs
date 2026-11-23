@@ -1,15 +1,15 @@
-# Phase 5c 进度记录
+# Phase 5c 进度
 
-- 步骤 0：git status 干净（HEAD decd4008），任务原文原样保存为 docs/prompts/phase5c-1.md，本进度文件已新建。
-- 步骤 1.1（测试清单）：全库仅 1 处调用 acquire_with_shrink —— queued_chunk_released_by_takeover_wakes_immediately（crates/idm-core/src/task/download.rs:1995），验证「排队等 Host 名额的分块被接管到 acked 时 100ms 内以 Completed 退出、且不占名额」。其行为在新流程 acquire_chunk_permits 中完整存在，可改造。
-- 步骤 1.2（改造）：测试改用 limiter.new_task_gate(8)（每主机上限 1 → 闸门有效许可 1，分块只在主机级排队）+ 产品实际流程 acquire_chunk_permits，断言语义不变（Ok(None)、100ms、不占名额）。已删除 acquire_with_shrink 及 #[cfg(test)]，cargo check --all-targets EXIT=0，crates 目录搜索该符号 0 命中；恢复后测试 PASS。
-- 步骤 1.3（变异验证）：移除 acquire_chunk_permits 第二级（主机级）的 wake_on_shrink 唤醒分支 → 测试 FAILED「被接管到 acked 的排队分块必须丢弃等待、以 Completed 退出: Err(Elapsed(())), 0.13s」；恢复后 PASS，无残留。
-- 步骤 2.1（profile）：根 Cargo.toml 已有 [profile.release] 含 lto=thin、codegen-units=1、debug=line-tables-only；仅补 strip=true，未改 panic 策略。版本号 workspace/tauri.conf.json/package.json 均 0.1.0，已一致，仅报告。
-- 步骤 2.2（exe 大小）：修改前 desktop 17416192 / cli 9602048 / nmhost 2790912 字节；加 strip 后 desktop 17414656（-1536）/ cli 9602048（不变）/ nmhost 2790912（不变）。MSVC release 已剥离大部分调试符号，strip 增量极小，如实报告。
-- 步骤 3.1（打包配置）：tauri.conf.json 设 active=true、targets=[nsis]、installMode=currentUser、languages=[SimpChinese,English]；externalBin=[binaries/idm-cli, binaries/idm-nmhost]（选中原因：sidecar 与主 exe 同目录，满足 nm install 绝对路径要求；resources 会落到 _up_ 子目录不满足）。首次打包下载 NSIS 3.13 + nsis-tauri-utils 0.5.3（允许的联网范围）。
-- 步骤 3.2（安装目录冲突）：依据生成 .nsi 第 540 行 currentUser 默认 `$LOCALAPPDATA\${PRODUCTNAME}` = `%LOCALAPPDATA%\idm-rs`，与数据目录（default_db_path=%LOCALAPPDATA%\idm-rs\idm.db）相同。NsisConfig schema 无 installDir 项，改用自定义 template（从 CLI 内嵌模板提取），把该行改为 `$LOCALAPPDATA\Programs\${PRODUCTNAME}`；重打包后生成 .nsi 第 544 行已生效。
-- 步骤 3.3（卸载钩子）：新增 nsis/hooks.nsh 定义 NSIS_HOOK_PREUNINSTALL：调用 $INSTDIR\idm-cli.exe nm uninstall（默认 idm_rs）、删 HKCU Run 的 idm-rs-desktop/idm-rs-runner、不删数据目录，三点均已注释。生成 .nsi 第 32 行 !include hooks.nsh、第 802-803 行 PREUNINSTALL 插入点生效。
-- 步骤 3.4（运行中提示）：确认 Tauri 默认模板已含 CheckIfAppIsRunning（.nsi 683/802 行，基于 RestartManager，utils.nsh 弹 appRunning/appRunningOkKill 提示），安装与卸载均提示关闭应用，无需额外实现。
-- 步骤 3.5（构建脚本）：新增 scripts/build-release.ps1，按序构建 release idm-cli+nmhost、前端、stage externalBin、tauri nsis 打包，每步失败非零退出，末尾打印安装包路径与大小；externalBin 的 *.exe 加入 .gitignore。
-- 步骤 3.6（打包验证）：生成安装包 target/release/bundle/nsis/idm-rs_0.1.0_x64-setup.exe（8140601 字节）；.nsi 确认语言 496/498 行 SimpChinese+English、INSTALLMODE currentUser（41 行）、RequestExecutionLevel user（106 行）、externalBin File/Delete 695-696/815-816 行、安装目录 544 行、钩子 include 32 行。
-- 步骤 4（验证）：改造测试单独连续 10 次 PASS=10 FAIL=0；cargo fmt（应用后 --check PASS）、cargo clippy -D warnings、npm run build、verify-workspace.ps1（全 24 步 PASS）、phase4b-e2e.ps1（ALL ASSERTIONS PASSED，残留 0）全 PASS；scripts/build-release.ps1 完整跑通，安装包 8086700 字节（7.71 MiB），末尾正确打印路径与大小。规则审查：改造测试初引入的 1 处 new_task_gate(...).unwrap() 已改为 match+panic，新增行无 unwrap/expect/allow/unsafe。安装包与 externalBin exe 经 git check-ignore 确认均在忽略范围。
+## Phase 5c-2：首次运行自动配置
+
+- 步骤 0：确认 git status 干净（HEAD=2eba0a87 phase5c-1），任务原文已原样保存 docs/prompts/phase5c-2.md。
+- 步骤 1（nm 上移）：新建 crates/idm-core/src/nm_host.rs，迁移 CLI nm 的注册表/manifest 读写；核心无打印（core 顶层 warn print_stdout），返回 Status 数据；CLI nm 模块保留参数解析/路径计算/打印/退出码，改为调用 nm_host::{install,uninstall,status_in}。lib.rs 注册模块。core nm 单测 2/2 PASS；phase4b 的 7 个 nm 测试 7/7 PASS（含 JSON 5 字段、幂等、非法输入、缺 exe、卸载状态），证明 CLI 行为与输出不变。修复一处 ids JSON 少引号导致的 2 个失败后通过。
+- 步骤 2（桌面集成状态）：service.rs 新增 BrowserIntegration(NotInstalled/Ok/Broken)、IntegrationConfig(host_name/manifest_dir/program_dir/current_exe 可注入)、open_with_config；三方法 browser_integration_status/enable/disable 观察模式允许；Settings 加 browser_integration_dismissed 并贯通 read/set_settings。Broken 判定：manifest host 路径不存在或与当前程序目录 nmhost 不同。
+- 步骤 3（启动自动处理）：service.rs 新增 is_dev_build 纯函数、same_path/autostart_exe_path 辅助、auto_fix_browser_integration(Broken 且非 dev → enable)、refresh_autostart_path(Run 值路径非当前程序且非 dev → 更新并保留 --minimized)；失败返回消息供 main 记日志不阻止启动。main.rs setup 接线待做。
+- 步骤 5（新测试）：新增 6 个测试（is_dev_build_variants、integration_status_variants、enable_fixes_broken、enable_without_nmhost_fails、autostart_path_refresh、autostart_path_refresh_absent_noop），随机 host 名 + 临时目录 + Drop 守卫清理注册表/manifest，不用默认 host/Run 名。发现并修复真实 bug：nm_host::extract_host_path 未反转义 JSON \\，导致 Windows 路径判定 Broken；加 json_unescape 后 6/6 PASS。
+- 步骤 5.6（变异验证）：(A) Broken 判断忽略文件存在 → integration_status_variants、enable_fixes_broken 均 FAIL（left Ok/right Broken），恢复；(B) is_dev_build 恒为假 → autostart_path_refresh 开发构建分支 FAIL「开发构建不应刷新路径」，恢复。恢复后搜索 MUT-A/B=0 命中。
+- 步骤 3 接线：main.rs setup 阶段 spawn 异步任务调用 auto_fix_browser_integration + refresh_autostart_path，结果通过 startup_auto_log 写数据目录 desktop-startup.log（失败静默、不阻止启动）；新增 3 个 tauri command（browser_integration_status/enable/disable）并注册 invoke_handler；cargo check --all-targets EXIT=0。
+- 步骤 4（界面）：App.vue 顶部提示条（NotInstalled 且未 dismissed 时显示「浏览器集成未启用，Firefox 下载不会被接管」+ 启用/不再提示）；选项对话框新增浏览器集成区域（状态文字、启用/修复或移除按钮、灰色小字）；新增 loadBrowserStatus/onEnableBrowser/onDisableBrowser/onDismissBrowserBanner，onMounted 与 openOptions 刷新状态；Settings 接口贯通 browser_integration_dismissed；无 v-html/innerHTML/eval；npm run build EXIT=0。
+- 步骤 5.7（循环）：6 个新测试各连续 10 次全 PASS（PASS=10 FAIL=0）；修复新增测试中 3 处 unwrap → ok_or_else（规则 3）；原有 phase4b 7/7、桌面全部 33/33 各 1 次 PASS。
+- 步骤 6（验证）：cargo fmt（--check PASS）、cargo clippy -D warnings（修复 startup_auto_log 的 &PathBuf→&Path 后 PASS）、npm run build PASS、verify-workspace.ps1 全 24 步 PASS（修复 nm_host 文档注释尖括号导致的 rustdoc invalid-html-tags）、phase4b-e2e.ps1 PASS（残留进程 0）、scripts/build-release.ps1 重新生成安装包 idm-rs_0.1.0_x64-setup.exe 8120574 字节（7.74 MiB）。规则扫描：新增 Rust 与测试代码无 unwrap/expect/allow/unsafe，前端无 v-html/innerHTML/eval。note: verify-workspace 首次调用因参数遗漏触发审批超时，修正审批参数后重跑同一命令通过，未绕过任何护栏。
+- 步骤 6（提交）：暂存 docs apps crates scripts，提交信息 phase5c-2: first-run browser integration and autostart path。

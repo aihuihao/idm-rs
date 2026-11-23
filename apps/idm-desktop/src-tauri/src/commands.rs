@@ -2,7 +2,9 @@
 
 use tauri::State;
 
-use idm_desktop::service::{DesktopService, ServiceError, Settings, TaskDetail, TaskView};
+use idm_desktop::service::{
+    BrowserIntegration, DesktopService, ServiceError, Settings, TaskDetail, TaskView,
+};
 
 pub(crate) struct AppState {
     pub(crate) service: std::sync::Arc<tokio::sync::Mutex<Option<DesktopService>>>,
@@ -102,6 +104,34 @@ pub(crate) async fn set_settings(
     let guard = state.service.lock().await;
     let service = guard.as_ref().ok_or_else(closed)?;
     service.set_settings(settings).await
+}
+
+// --- Phase 5c-2：浏览器集成（观察模式允许） ---
+#[tauri::command]
+pub(crate) async fn browser_integration_status(
+    state: State<'_, AppState>,
+) -> Result<BrowserIntegration, ServiceError> {
+    let guard = state.service.lock().await;
+    let service = guard.as_ref().ok_or_else(closed)?;
+    service.browser_integration_status()
+}
+
+#[tauri::command]
+pub(crate) async fn enable_browser_integration(
+    state: State<'_, AppState>,
+) -> Result<(), ServiceError> {
+    let guard = state.service.lock().await;
+    let service = guard.as_ref().ok_or_else(closed)?;
+    service.enable_browser_integration()
+}
+
+#[tauri::command]
+pub(crate) async fn disable_browser_integration(
+    state: State<'_, AppState>,
+) -> Result<(), ServiceError> {
+    let guard = state.service.lock().await;
+    let service = guard.as_ref().ok_or_else(closed)?;
+    service.disable_browser_integration()
 }
 
 /// 在 Rust 端弹出文件夹选择框，返回选中路径；取消返回空字符串。

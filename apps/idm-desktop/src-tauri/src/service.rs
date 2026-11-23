@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use idm_core::autostart;
 use idm_core::disk::AllocationStrategy;
 use idm_core::net::{ProxyConfig, Url, parse_max_speed, validate_url};
+use idm_core::nm_host;
 use idm_core::queue::{DownloadQueue, EnqueueRequest};
 use idm_core::runner::{Runner, RunnerConfig, RunnerStartError};
 use idm_core::store::{PauseReasonDb, Store, TaskStateDb, default_download_dir};
@@ -106,6 +107,54 @@ pub struct Settings {
     pub resume_uses_current_connections: bool,
     pub autostart: bool,
     pub notify_on_complete: bool,
+    /// Phase 5c-2：用户是否已关闭「浏览器集成未启用」顶部提示条。
+    pub browser_integration_dismissed: bool,
+}
+
+/// 浏览器集成状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum BrowserIntegration {
+    /// 注册表未注册。
+    NotInstalled,
+    /// 已注册且 manifest 中的 host 路径存在、与当前程序目录下的 idm-nmhost.exe 一致。
+    Ok,
+    /// 已注册但 manifest 中的 host 路径文件不存在，或与当前程序目录的 idm-nmhost.exe 不同。
+    Broken,
+}
+
+/// 浏览器集成的可注入配置（host 名、manifest 目录、当前程序目录、当前 exe 路径）。
+/// 生产环境由 open 推导；测试可注入随机 host 名与临时目录。
+#[derive(Debug, Clone)]
+pub struct IntegrationConfig {
+    pub host_name: String,
+    pub manifest_dir: PathBuf,
+    pub program_dir: PathBuf,
+    /// 当前程序 exe 路径；开机启动路径刷新据此比较与写入。
+    pub current_exe: PathBuf,
+}
+
+impl IntegrationConfig {
+    pub fn default_for(db_path: &Path) -> Result<Self, ServiceError> {
+        let exe = std::env::current_exe().map_err(internal)?;
+        let program_dir = exe
+            .parent()
+            .ok_or_else(|| ServiceError::Internal("cannot resolve exe directory".to_string()))?
+            .to_path_buf();
+        let manifest_dir = db_path
+            .parent()
+            .ok_or_else(|| ServiceError::Internal("db path has no parent".to_string()))?
+            .to_path_buf();
+        Ok(Self {
+            host_name: nm_host::DEFAULT_HOST.to_string(),
+            manifest_dir,
+            program_dir: program_dir.clone(),
+            current_exe: exe,
+        })
+    }
+
+    fn nmhost_path(&self) -> PathBuf {
+        self.program_dir.join("idm-nmhost.exe")
+    }
 }
 
 pub struct DesktopService {
@@ -114,6 +163,7 @@ pub struct DesktopService {
     read_only: bool,
     autostart_desktop_name: String,
     autostart_runner_name: String,
+    integration: IntegrationConfig,
 }
 
 const DEFAULT_AUTOSTART_DESKTOP_NAME: &str = "idm-rs-desktop";
@@ -134,6 +184,38 @@ fn parse_speed_or(raw: Option<String>) -> u64 {
         Some(v) => parse_max_speed(&v).unwrap_or(0),
         None => 0,
     }
+}
+
+/// 开发构建判断：路径中包含 `\target\debug\` 或 `\target\release\`（不区分大小写）。
+/// 用正斜杠规范化后匹配，兼容输入中混用的分隔符。
+pub fn is_dev_build(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    normalized.contains("\\target\\debug\\") || normalized.contains("\\target\\release\\")
+}
+
+/// 比较两个路径是否指向同一位置：优先尝试 canonicalize，失败时退化为规范化字符串比较。
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => {
+            let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+            norm(a) == norm(b)
+        }
+    }
+}
+
+/// 从开机启动命令行中提取 exe 路径（去掉外层引号，取第一段）。
+fn autostart_exe_path(value: &str) -> PathBuf {
+    let trimmed = value.trim();
+    let first = if let Some(rest) = trimmed.strip_prefix('"') {
+        match rest.find('"') {
+            Some(end) => &rest[..end],
+            None => rest,
+        }
+    } else {
+        trimmed.split_whitespace().next().unwrap_or("")
+    };
+    PathBuf::from(first)
 }
 
 async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, ServiceError> {
@@ -183,6 +265,15 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
         Some(v) => v.trim() != "false",
         None => true,
     };
+    // Phase 5c-2：提示条默认未关闭；仅显式 "true" 视为已关闭。
+    let browser_integration_dismissed = match store
+        .get_setting("browser-integration-dismissed")
+        .await
+        .map_err(internal)?
+    {
+        Some(v) => v.trim() == "true",
+        None => false,
+    };
     Ok(Settings {
         download_dir: download,
         global_max_speed,
@@ -192,6 +283,7 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
         resume_uses_current_connections,
         autostart: autostart::query(desktop_name).is_some(),
         notify_on_complete,
+        browser_integration_dismissed,
     })
 }
 
@@ -334,6 +426,23 @@ impl DesktopService {
         autostart_desktop_name: String,
         autostart_runner_name: String,
     ) -> Result<Self, ServiceError> {
+        let integration = IntegrationConfig::default_for(&db_path)?;
+        Self::open_with_config(
+            db_path,
+            autostart_desktop_name,
+            autostart_runner_name,
+            integration,
+        )
+        .await
+    }
+
+    /// 与 open 相同，但允许注入 autostart 值名与浏览器集成配置（供测试隔离注册表/manifest）。
+    pub async fn open_with_config(
+        db_path: PathBuf,
+        autostart_desktop_name: String,
+        autostart_runner_name: String,
+        integration: IntegrationConfig,
+    ) -> Result<Self, ServiceError> {
         let store = Store::open(&db_path).map_err(internal)?;
         let settings = read_settings(&store, &autostart_desktop_name).await?;
         let cfg = RunnerConfig {
@@ -352,6 +461,7 @@ impl DesktopService {
                 read_only: false,
                 autostart_desktop_name,
                 autostart_runner_name,
+                integration,
             }),
             Err(RunnerStartError::AlreadyRunning) => Ok(Self {
                 store,
@@ -359,6 +469,7 @@ impl DesktopService {
                 read_only: true,
                 autostart_desktop_name,
                 autostart_runner_name,
+                integration,
             }),
             Err(RunnerStartError::Other(err)) => Err(internal(err)),
         }
@@ -366,6 +477,89 @@ impl DesktopService {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    // --- Phase 5c-2：浏览器集成 --------------------------------------------
+
+    /// 查询浏览器集成状态。观察模式下允许（只查注册表与 manifest）。
+    pub fn browser_integration_status(&self) -> Result<BrowserIntegration, ServiceError> {
+        let cfg = &self.integration;
+        let status = nm_host::status_in(&cfg.host_name, &cfg.manifest_dir, &cfg.nmhost_path())
+            .map_err(ServiceError::Internal)?;
+        if !status.registered {
+            return Ok(BrowserIntegration::NotInstalled);
+        }
+        let expected = cfg.nmhost_path();
+        let broken = match status.manifest_host_path.as_deref() {
+            None => true,
+            Some(p) => !p.is_file() || !same_path(p, &expected),
+        };
+        if broken {
+            Ok(BrowserIntegration::Broken)
+        } else {
+            Ok(BrowserIntegration::Ok)
+        }
+    }
+
+    /// 用当前程序目录下的 idm-nmhost.exe 注册浏览器集成。观察模式下允许。
+    pub fn enable_browser_integration(&self) -> Result<(), ServiceError> {
+        let cfg = &self.integration;
+        let nmhost = cfg.nmhost_path();
+        if !nmhost.is_file() {
+            return Err(ServiceError::InvalidInput(
+                "找不到 idm-nmhost.exe".to_string(),
+            ));
+        }
+        let ids = vec![nm_host::DEFAULT_EXTENSION_ID.to_string()];
+        nm_host::install(&cfg.host_name, &nmhost, &ids, &cfg.manifest_dir)
+            .map_err(ServiceError::Internal)
+    }
+
+    /// 注销浏览器集成。观察模式下允许。
+    pub fn disable_browser_integration(&self) -> Result<(), ServiceError> {
+        let cfg = &self.integration;
+        nm_host::uninstall(&cfg.host_name, &cfg.manifest_dir).map_err(ServiceError::Internal)
+    }
+
+    /// 启动时自动修复：Broken 且非开发构建时调用 enable，返回可写日志的消息。
+    /// 失败只写入 Ok(Some(错误信息)) 由调用方记录日志，不阻止启动。
+    pub fn auto_fix_browser_integration(&self) -> Result<Option<String>, ServiceError> {
+        if is_dev_build(&self.integration.current_exe) {
+            return Ok(None);
+        }
+        match self.browser_integration_status()? {
+            BrowserIntegration::Broken => match self.enable_browser_integration() {
+                Ok(()) => Ok(Some(format!(
+                    "auto-fixed browser integration for host '{}'",
+                    self.integration.host_name
+                ))),
+                Err(err) => Ok(Some(format!("auto-fix browser integration failed: {err}"))),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// 启动时刷新开机启动路径：Run 中存在注入值名但路径不是当前程序，且非开发构建时，
+    /// 更新为当前程序路径并保留 `--minimized`。值不存在或开发构建时不做任何事。
+    pub fn refresh_autostart_path(&self) -> Result<Option<String>, ServiceError> {
+        let value = match autostart::query(&self.autostart_desktop_name) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if is_dev_build(&self.integration.current_exe) {
+            return Ok(None);
+        }
+        let old_exe = autostart_exe_path(&value);
+        if same_path(&old_exe, &self.integration.current_exe) {
+            return Ok(None);
+        }
+        let command_line = format!("\"{}\" --minimized", self.integration.current_exe.display());
+        autostart::install(&self.autostart_desktop_name, &command_line)
+            .map_err(ServiceError::Internal)?;
+        Ok(Some(format!(
+            "refreshed autostart path for '{}'",
+            self.autostart_desktop_name
+        )))
     }
 
     pub async fn list_tasks(&self) -> Result<Vec<TaskView>, ServiceError> {
@@ -719,6 +913,14 @@ impl DesktopService {
             .map_err(internal)?;
         self.store
             .set_setting("notify-on-complete", &s.notify_on_complete.to_string())
+            .await
+            .map_err(internal)?;
+        // Phase 5c-2：保存「不再提示浏览器集成」标记。
+        self.store
+            .set_setting(
+                "browser-integration-dismissed",
+                &s.browser_integration_dismissed.to_string(),
+            )
             .await
             .map_err(internal)?;
 

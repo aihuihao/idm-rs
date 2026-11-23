@@ -116,6 +116,7 @@ fn default_settings(download_dir: &Path) -> Settings {
         resume_uses_current_connections: true,
         autostart: false,
         notify_on_complete: true,
+        browser_integration_dismissed: false,
     }
 }
 
@@ -1498,6 +1499,283 @@ async fn resume_keeps_connections_when_disabled() -> TestResult {
     verify_bytes(&download.join("keep.bin"), size)?;
 
     srv.shutdown();
+    svc.shutdown().await?;
+    Ok(())
+}
+// --- Phase 5c-2：浏览器集成状态与首次运行自动配置 -----------------------
+
+use idm_core::nm_host;
+use idm_desktop::service::{BrowserIntegration, IntegrationConfig};
+
+fn unique_nm_host() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    format!("idm_test_{}_{nanos}_{n}", std::process::id())
+}
+
+/// 清理测试 host 的注册表键与 manifest；绝不触碰默认 host idm_rs。
+struct NmGuard {
+    host: String,
+    manifest_dir: PathBuf,
+}
+
+impl Drop for NmGuard {
+    fn drop(&mut self) {
+        let key = nm_host::reg_key(&self.host);
+        let _ = std::process::Command::new("reg")
+            .args(["delete", &key, "/f"])
+            .output();
+        let _ = std::fs::remove_file(nm_host::manifest_path(&self.manifest_dir, &self.host));
+    }
+}
+
+struct IntegrationFixture {
+    tmp: TempDir,
+    host: String,
+    manifest_dir: PathBuf,
+    program_dir: PathBuf,
+    _guard: NmGuard,
+}
+
+impl IntegrationFixture {
+    fn new() -> TestResult<Self> {
+        let tmp = TempDir::new()?;
+        let manifest_dir = tmp.join("data");
+        let program_dir = tmp.join("program");
+        std::fs::create_dir_all(&manifest_dir)?;
+        std::fs::create_dir_all(&program_dir)?;
+        let host = unique_nm_host();
+        let guard = NmGuard {
+            host: host.clone(),
+            manifest_dir: manifest_dir.clone(),
+        };
+        Ok(Self {
+            tmp,
+            host,
+            manifest_dir,
+            program_dir,
+            _guard: guard,
+        })
+    }
+
+    fn config(&self) -> IntegrationConfig {
+        IntegrationConfig {
+            host_name: self.host.clone(),
+            manifest_dir: self.manifest_dir.clone(),
+            program_dir: self.program_dir.clone(),
+            current_exe: self.program_dir.join("idm-desktop.exe"),
+        }
+    }
+
+    async fn service(&self) -> TestResult<DesktopService> {
+        let db = self.tmp.join("idm.db");
+        let download = self.tmp.join("downloads");
+        std::fs::create_dir_all(&download)?;
+        seed_settings(&db, &download, None).await?;
+        let desktop_name = unique_run_name("idm-c2-desk");
+        let runner_name = unique_run_name("idm-c2-run");
+        let svc =
+            DesktopService::open_with_config(db, desktop_name, runner_name, self.config()).await?;
+        Ok(svc)
+    }
+}
+
+fn write_fake_nmhost(program_dir: &Path) -> TestResult<PathBuf> {
+    let p = program_dir.join("idm-nmhost.exe");
+    std::fs::write(&p, b"fake nmhost")?;
+    Ok(p)
+}
+
+#[test]
+fn is_dev_build_variants() {
+    use idm_desktop::service::is_dev_build;
+    assert!(is_dev_build(Path::new(
+        r"C:\repo\target\debug\idm-desktop.exe"
+    )));
+    assert!(is_dev_build(Path::new(
+        r"D:\repo\TARGET\RELEASE\idm-desktop.exe"
+    )));
+    assert!(is_dev_build(Path::new(
+        r"C:\repo\target\Debug\idm-desktop.exe"
+    )));
+    assert!(!is_dev_build(Path::new(
+        r"C:\Users\me\AppData\Local\Programs\idm-rs\idm-desktop.exe"
+    )));
+    assert!(!is_dev_build(Path::new(
+        r"C:\my_target\tools\idm-desktop.exe"
+    )));
+    assert!(!is_dev_build(Path::new(r"C:\repo\target\idm-desktop.exe")));
+}
+
+#[tokio::test]
+async fn integration_status_variants() -> TestResult {
+    let f = IntegrationFixture::new()?;
+    let svc = f.service().await?;
+    assert_eq!(
+        svc.browser_integration_status()?,
+        BrowserIntegration::NotInstalled
+    );
+    let nmhost = write_fake_nmhost(&f.program_dir)?;
+    svc.enable_browser_integration()?;
+    assert_eq!(svc.browser_integration_status()?, BrowserIntegration::Ok);
+    std::fs::remove_file(&nmhost)?;
+    assert_eq!(
+        svc.browser_integration_status()?,
+        BrowserIntegration::Broken
+    );
+    svc.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn enable_fixes_broken() -> TestResult {
+    let f = IntegrationFixture::new()?;
+    let svc = f.service().await?;
+    let nmhost = write_fake_nmhost(&f.program_dir)?;
+    svc.enable_browser_integration()?;
+    assert_eq!(svc.browser_integration_status()?, BrowserIntegration::Ok);
+    std::fs::remove_file(&nmhost)?;
+    assert_eq!(
+        svc.browser_integration_status()?,
+        BrowserIntegration::Broken
+    );
+    // 重建 host 文件后 enable 修复
+    let nmhost2 = write_fake_nmhost(&f.program_dir)?;
+    svc.enable_browser_integration()?;
+    assert_eq!(svc.browser_integration_status()?, BrowserIntegration::Ok);
+    let s = nm_host::status_in(&f.host, &f.manifest_dir, &nmhost2)?;
+    assert_eq!(
+        s.manifest_host_path.as_deref(),
+        Some(nmhost2.as_path()),
+        "manifest 中的 host 路径应为注入程序目录下的 idm-nmhost.exe"
+    );
+    svc.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn enable_without_nmhost_fails() -> TestResult {
+    let f = IntegrationFixture::new()?;
+    let svc = f.service().await?;
+    match svc.enable_browser_integration() {
+        Err(ServiceError::InvalidInput(msg)) => assert_eq!(msg, "找不到 idm-nmhost.exe"),
+        other => return Err(format!("expected InvalidInput, got {other:?}").into()),
+    }
+    assert_eq!(
+        svc.browser_integration_status()?,
+        BrowserIntegration::NotInstalled
+    );
+    assert!(!nm_host::manifest_path(&f.manifest_dir, &f.host).exists());
+    svc.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn autostart_path_refresh() -> TestResult {
+    let desktop_name = unique_run_name("idm-c2-refresh");
+    let _guard = RunValueGuard {
+        names: vec![desktop_name.clone()],
+    };
+    let tmp = TempDir::new()?;
+    let old_exe = tmp.join("old").join("idm-desktop.exe");
+    let new_exe = tmp.join("new").join("idm-desktop.exe");
+    let old_dir = old_exe
+        .parent()
+        .ok_or_else(|| "old_exe has no parent".to_string())?;
+    let new_dir = new_exe
+        .parent()
+        .ok_or_else(|| "new_exe has no parent".to_string())?;
+    std::fs::create_dir_all(old_dir)?;
+    std::fs::create_dir_all(new_dir)?;
+
+    let old_value = format!("\"{}\" --minimized", old_exe.display());
+    idm_core::autostart::install(&desktop_name, &old_value).map_err(|e| e.to_string())?;
+
+    let cfg = IntegrationConfig {
+        host_name: unique_nm_host(),
+        manifest_dir: tmp.join("data"),
+        program_dir: new_dir.to_path_buf(),
+        current_exe: new_exe.clone(),
+    };
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+    let svc = DesktopService::open_with_config(
+        db,
+        desktop_name.clone(),
+        unique_run_name("idm-c2-run"),
+        cfg,
+    )
+    .await?;
+
+    let result = svc.refresh_autostart_path()?;
+    assert!(result.is_some(), "非开发构建应刷新路径");
+    let value = idm_core::autostart::query(&desktop_name).unwrap_or_default();
+    assert!(
+        value.contains(&new_exe.to_string_lossy().to_string()),
+        "Run 值应指向当前程序: {value}"
+    );
+    assert!(value.contains("--minimized"), "应保留 --minimized: {value}");
+
+    // 开发构建：路径不应变化
+    let cfg_dev = IntegrationConfig {
+        host_name: unique_nm_host(),
+        manifest_dir: tmp.join("data"),
+        program_dir: PathBuf::from(r"C:\repo\target\debug"),
+        current_exe: PathBuf::from(r"C:\repo\target\debug\idm-desktop.exe"),
+    };
+    let db2 = tmp.join("idm2.db");
+    seed_settings(&db2, &download, None).await?;
+    let svc_dev = DesktopService::open_with_config(
+        db2,
+        desktop_name.clone(),
+        unique_run_name("idm-c2-run2"),
+        cfg_dev,
+    )
+    .await?;
+    let result_dev = svc_dev.refresh_autostart_path()?;
+    assert!(result_dev.is_none(), "开发构建不应刷新路径");
+    let value_after = idm_core::autostart::query(&desktop_name).unwrap_or_default();
+    assert_eq!(value_after, value, "开发构建下 Run 值应保持不变");
+
+    svc_dev.shutdown().await?;
+    svc.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn autostart_path_refresh_absent_noop() -> TestResult {
+    let desktop_name = unique_run_name("idm-c2-absent");
+    let _guard = RunValueGuard {
+        names: vec![desktop_name.clone()],
+    };
+    assert!(idm_core::autostart::query(&desktop_name).is_none());
+    let tmp = TempDir::new()?;
+    let cfg = IntegrationConfig {
+        host_name: unique_nm_host(),
+        manifest_dir: tmp.join("data"),
+        program_dir: tmp.join("program"),
+        current_exe: tmp.join("program").join("idm-desktop.exe"),
+    };
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+    let svc = DesktopService::open_with_config(
+        db,
+        desktop_name.clone(),
+        unique_run_name("idm-c2-run"),
+        cfg,
+    )
+    .await?;
+    let result = svc.refresh_autostart_path()?;
+    assert!(result.is_none(), "值不存在时不应创建");
+    assert!(idm_core::autostart::query(&desktop_name).is_none());
     svc.shutdown().await?;
     Ok(())
 }

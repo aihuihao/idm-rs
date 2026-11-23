@@ -35,6 +35,10 @@ pub mod runner;
 #[cfg(windows)]
 pub mod autostart;
 
+/// Native Messaging host 注册（Phase 5c-2，从 CLI 的 nm 模块上移）。
+#[cfg(windows)]
+pub mod nm_host;
+
 /// SQLite 状态持久化：独立线程持有连接、迁移、检查点与启动恢复。
 pub mod store;
 

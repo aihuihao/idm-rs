@@ -520,16 +520,13 @@ mod runner {
 
 /// `idm-cli nm install|uninstall|status`：注册 / 注销 / 查询 Native Messaging host。
 ///
-/// 只通过 `reg.exe` 读写 HKCU 注册表、用标准库写清单文件；不新增任何依赖，
-/// 不写任何低层系统 API 调用，绝不触碰 HKLM。
+/// 注册表与 manifest 的读写逻辑已上移到 idm-core::nm_host；本模块只保留参数
+/// 解析、路径计算、输出打印与退出码，保证 CLI 行为与输出完全不变。
 #[cfg(windows)]
 mod nm {
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
 
-    const DEFAULT_HOST: &str = "idm_rs";
-    const REG_ROOT: &str = r"HKCU\Software\Mozilla\NativeMessagingHosts";
-    const MAX_EXT_ID_LEN: usize = 128;
+    use idm_core::nm_host;
 
     fn usage() -> &'static str {
         "usage: idm-cli nm <install|uninstall|status> [--host-name NAME] [--extension-id ID] [--db PATH]"
@@ -562,7 +559,7 @@ mod nm {
     }
 
     fn parse(args: &[String]) -> Result<Opts, String> {
-        let mut host = DEFAULT_HOST.to_string();
+        let mut host = nm_host::DEFAULT_HOST.to_string();
         let mut ext_id: Option<String> = None;
         let mut db: Option<PathBuf> = None;
         let mut i = 0;
@@ -593,50 +590,11 @@ mod nm {
             }
             i += 1;
         }
-        validate_host_name(&host)?;
+        nm_host::validate_host_name(&host)?;
         if let Some(id) = ext_id.as_deref() {
-            validate_ext_id(id)?;
+            nm_host::validate_ext_id(id)?;
         }
         Ok(Opts { host, ext_id, db })
-    }
-
-    /// host 名：Firefox 规定 `^\w+(\.\w+)*$`（字母数字下划线点，不能以点开头/结尾，
-    /// 不允许连续点）；任务进一步限定只允许小写，这里按更严格者实现。
-    fn validate_host_name(s: &str) -> Result<(), String> {
-        if s.is_empty() {
-            return Err("host name must not be empty".to_string());
-        }
-        if !s
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
-        {
-            return Err(
-                "host name may contain only lowercase letters, digits, '_' and '.'".to_string(),
-            );
-        }
-        if s.starts_with('.') || s.ends_with('.') || s.contains("..") {
-            return Err("host name must match Firefox's dot-separated name rule".to_string());
-        }
-        Ok(())
-    }
-
-    /// 扩展 ID：非空、只允许字母数字与 `@` / `.` / `_` / `-`、长度 ≤ 128。
-    fn validate_ext_id(s: &str) -> Result<(), String> {
-        if s.is_empty() {
-            return Err("extension id must not be empty".to_string());
-        }
-        if s.len() > MAX_EXT_ID_LEN {
-            return Err(format!("extension id exceeds {MAX_EXT_ID_LEN} characters"));
-        }
-        if !s
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'@' | b'.' | b'_' | b'-'))
-        {
-            return Err(
-                "extension id may contain only letters, digits, '@', '.', '_' and '-'".to_string(),
-            );
-        }
-        Ok(())
     }
 
     fn absolute(p: &Path) -> Result<PathBuf, String> {
@@ -663,21 +621,6 @@ mod nm {
         absolute(parent)
     }
 
-    fn manifest_path(opts: &Opts) -> Result<PathBuf, String> {
-        Ok(data_dir(opts.db.as_deref())?.join(format!("{}.json", opts.host)))
-    }
-
-    fn reg_key(host: &str) -> String {
-        format!("{REG_ROOT}\\{host}")
-    }
-
-    fn reg(args: &[&str]) -> Result<Output, String> {
-        Command::new("reg")
-            .args(args)
-            .output()
-            .map_err(|e| e.to_string())
-    }
-
     /// host 二进制与 idm-cli.exe 同目录；install 前必须真实存在。
     fn host_exe() -> Result<PathBuf, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -687,23 +630,6 @@ mod nm {
         absolute(&dir.join("idm-nmhost.exe"))
     }
 
-    /// 最小的 JSON 字符串转义：清单字段由本函数生成，字符集已被上面校验收窄。
-    fn json_escape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
     fn install(args: &[String]) -> Result<i32, String> {
         let opts = parse(args)?;
         let id = opts
@@ -711,32 +637,12 @@ mod nm {
             .clone()
             .ok_or_else(|| "install requires --extension-id <ID>".to_string())?;
         let exe = host_exe()?;
-        if !exe.is_file() {
-            return Err(format!("idm-nmhost.exe not found at {}", exe.display()));
-        }
-        let manifest = manifest_path(&opts)?;
-        let dir = manifest
-            .parent()
-            .ok_or_else(|| "manifest path has no parent directory".to_string())?;
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let dir = data_dir(opts.db.as_deref())?;
 
-        let body = format!(
-            "{{\n  \"name\": \"{host}\",\n  \"description\": \"idm-rs Native Messaging host\",\n  \"path\": \"{path}\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{id}\"]\n}}\n",
-            host = json_escape(&opts.host),
-            path = json_escape(&exe.to_string_lossy()),
-            id = json_escape(&id),
-        );
-        std::fs::write(&manifest, body).map_err(|e| e.to_string())?;
+        nm_host::install(&opts.host, &exe, &[id], &dir)?;
 
-        let key = reg_key(&opts.host);
-        let manifest_s = manifest.to_string_lossy().into_owned();
-        let out = reg(&["add", &key, "/ve", "/t", "REG_SZ", "/d", &manifest_s, "/f"])?;
-        if !out.status.success() {
-            return Err(format!(
-                "reg add failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
+        let manifest = nm_host::manifest_path(&dir, &opts.host);
+        let key = nm_host::reg_key(&opts.host);
         println!("installed native messaging host '{}'", opts.host);
         println!("manifest: {}", manifest.display());
         println!("registry: {key}");
@@ -746,49 +652,33 @@ mod nm {
 
     fn uninstall(args: &[String]) -> Result<i32, String> {
         let opts = parse(args)?;
-        let manifest = manifest_path(&opts)?;
-        let key = reg_key(&opts.host);
-        let _ = std::fs::remove_file(&manifest);
-        let _ = reg(&["delete", &key, "/f"]);
+        let dir = data_dir(opts.db.as_deref())?;
+        let manifest = nm_host::manifest_path(&dir, &opts.host);
+
+        nm_host::uninstall(&opts.host, &dir)?;
+
         println!("uninstalled native messaging host '{}'", opts.host);
         println!("manifest_removed: {}", !manifest.exists());
         Ok(0)
     }
 
-    /// 从自己生成的清单文本中提取 allowed_extensions（避免运行时依赖 JSON 解析器）。
-    fn extract_allowed(text: &str) -> String {
-        let marker = "\"allowed_extensions\"";
-        let rest = match text.find(marker) {
-            Some(pos) => &text[pos + marker.len()..],
-            None => return String::new(),
-        };
-        match (rest.find('['), rest.find(']')) {
-            (Some(a), Some(b)) if b > a => rest[a + 1..b].replace('"', "").trim().to_string(),
-            _ => String::new(),
-        }
-    }
-
     fn status(args: &[String]) -> Result<i32, String> {
         let opts = parse(args)?;
-        let manifest = manifest_path(&opts)?;
-        let key = reg_key(&opts.host);
+        let dir = data_dir(opts.db.as_deref())?;
         let exe = host_exe()?;
-        println!("host_name: {}", opts.host);
-        println!("manifest: {}", manifest.display());
-        println!("manifest_exists: {}", manifest.is_file());
-        println!("host_path: {}", exe.display());
-        println!("host_path_exists: {}", exe.is_file());
-        let q = reg(&["query", &key, "/ve"])?;
-        println!("registry_key: {key}");
-        println!("registry_exists: {}", q.status.success());
-        if q.status.success() {
-            println!(
-                "registry_value: {}",
-                String::from_utf8_lossy(&q.stdout).trim()
-            );
+
+        let s = nm_host::status_in(&opts.host, &dir, &exe)?;
+        println!("host_name: {}", s.host_name);
+        println!("manifest: {}", s.manifest_path.display());
+        println!("manifest_exists: {}", s.manifest_exists);
+        println!("host_path: {}", s.host_path.display());
+        println!("host_path_exists: {}", s.host_path_exists);
+        println!("registry_key: {}", s.registry_key);
+        println!("registry_exists: {}", s.registered);
+        if let Some(ref value) = s.registry_value {
+            println!("registry_value: {value}");
         }
-        let text = std::fs::read_to_string(&manifest).unwrap_or_default();
-        println!("allowed_extensions: {}", extract_allowed(&text));
+        println!("allowed_extensions: {}", s.allowed_extensions);
         Ok(0)
     }
 }

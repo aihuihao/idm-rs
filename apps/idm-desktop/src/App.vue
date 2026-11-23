@@ -11,6 +11,12 @@
       <button class="error-close" @click.stop="dismissFatalError">×</button>
     </div>
 
+    <div v-if="browserBannerVisible" class="banner browser-banner">
+      <span>浏览器集成未启用，Firefox 下载不会被接管</span>
+      <button class="browser-action" @click="onEnableBrowserFromBanner">启用</button>
+      <button class="browser-action" @click="onDismissBrowserBanner">不再提示</button>
+    </div>
+
     <div class="toolbar">
       <button :disabled="readOnly" @click="openAddDialog">
         <svg class="ico" viewBox="0 0 16 16"><path :d="icons.add" /></svg>添加任务
@@ -267,6 +273,16 @@
           <input v-model.number="draftSettings.max_connections_per_host" :disabled="readOnly" type="number" min="1" max="32" />
           <span class="hint">保存后立即对正在下载的任务生效</span>
         </div>
+        <div class="field browser-field">
+          <label>浏览器集成</label>
+          <div class="browser-status-row">
+            <span>当前状态：{{ browserStatusLabel }}</span>
+            <button v-if="browserStatus !== 'Ok'" @click="onEnableBrowser">启用<span v-if="browserStatus === 'Broken'">/修复</span></button>
+            <button v-if="browserStatus === 'Ok'" @click="onDisableBrowser">移除</button>
+          </div>
+          <span class="hint">启用后，Firefox 安装 idm-rs 扩展即可自动接管下载</span>
+          <span v-if="browserActionError" class="error-text">{{ browserActionError }}</span>
+        </div>
         <div class="field">
           <label class="checkbox">
             <input v-model="draftSettings.autostart" :disabled="readOnly" type="checkbox" />
@@ -316,6 +332,7 @@ interface Settings {
   resume_uses_current_connections: boolean;
   autostart: boolean;
   notify_on_complete: boolean;
+  browser_integration_dismissed: boolean;
 }
 
 interface ChunkView {
@@ -384,6 +401,16 @@ const filterStatus = ref('all');
 const filterKind = ref('all');
 const fatalError = ref('');
 
+type BrowserStatus = 'NotInstalled' | 'Ok' | 'Broken';
+const browserStatus = ref<BrowserStatus>('NotInstalled');
+const browserBannerVisible = ref(false);
+const browserActionError = ref('');
+const browserStatusLabel = computed(() => {
+  if (browserStatus.value === 'Ok') return '已启用';
+  if (browserStatus.value === 'Broken') return '需要修复';
+  return '未启用';
+});
+
 const addOpen = ref(false);
 const addUrl = ref('');
 const addError = ref('');
@@ -398,7 +425,7 @@ const optionsOpen = ref(false);
 const draftSettings = ref<Settings>({
   download_dir: '', global_max_speed: 0, max_tasks: 3,
   default_connections: 8, max_connections_per_host: 8, resume_uses_current_connections: true,
-  autostart: false, notify_on_complete: true,
+  autostart: false, notify_on_complete: true, browser_integration_dismissed: false,
 });
 const draftSpeedKb = ref(0);
 const optionsError = ref('');
@@ -660,11 +687,61 @@ async function refreshTasks(): Promise<void> {
   }
 }
 
+// --- Phase 5c-2：浏览器集成状态与提示条 ----------------------------------
+async function loadBrowserStatus(): Promise<void> {
+  try {
+    browserStatus.value = await invoke<BrowserStatus>('browser_integration_status');
+    const saved = await invoke<Settings>('get_settings');
+    browserBannerVisible.value =
+      browserStatus.value === 'NotInstalled' && !saved.browser_integration_dismissed;
+  } catch (err) {
+    showFatalError(errText(err));
+  }
+}
+
+async function onEnableBrowser(): Promise<void> {
+  browserActionError.value = '';
+  try {
+    await invoke('enable_browser_integration');
+    browserBannerVisible.value = false;
+    await loadBrowserStatus();
+  } catch (err) {
+    browserActionError.value = errText(err);
+  }
+}
+
+async function onEnableBrowserFromBanner(): Promise<void> {
+  await onEnableBrowser();
+}
+
+async function onDisableBrowser(): Promise<void> {
+  browserActionError.value = '';
+  try {
+    await invoke('disable_browser_integration');
+    await loadBrowserStatus();
+  } catch (err) {
+    browserActionError.value = errText(err);
+  }
+}
+
+async function onDismissBrowserBanner(): Promise<void> {
+  try {
+    const saved = await invoke<Settings>('get_settings');
+    const payload: Settings = { ...saved, browser_integration_dismissed: true };
+    await invoke('set_settings', { settings: payload });
+    browserBannerVisible.value = false;
+  } catch (err) {
+    showFatalError(errText(err));
+  }
+}
+
 async function openOptions(): Promise<void> {
   optionsError.value = '';
+  browserActionError.value = '';
   const saved = await invoke<Settings>('get_settings');
   draftSettings.value = { ...saved };
   draftSpeedKb.value = Math.round(saved.global_max_speed / 1024);
+  await loadBrowserStatus();
   optionsOpen.value = true;
 }
 function closeOptions(): void {
@@ -691,6 +768,7 @@ async function onSaveOptions(): Promise<void> {
     resume_uses_current_connections: draftSettings.value.resume_uses_current_connections,
     autostart: draftSettings.value.autostart,
     notify_on_complete: draftSettings.value.notify_on_complete,
+    browser_integration_dismissed: draftSettings.value.browser_integration_dismissed,
   };
   try {
     await invoke('set_settings', { settings: payload });
@@ -906,6 +984,7 @@ onMounted(async () => {
     readOnly.value = await invoke<boolean>('is_read_only');
     const saved = await invoke<Settings>('get_settings');
     globalSpeed.value = saved.global_max_speed;
+    await loadBrowserStatus();
     await refreshTasks();
     unlisten = await listen<string>('tasks-updated', (event) => {
       try {
@@ -996,6 +1075,11 @@ h1 { font-size: 16px; margin: 0; }
 }
 .error-text { color: var(--danger); }
 .error-close { border: none; background: transparent; color: var(--danger); font-size: 18px; line-height: 1; cursor: pointer; }
+.browser-banner { display: flex; align-items: center; gap: 10px; }
+.browser-banner span { flex: 1; }
+.browser-action { padding: 3px 10px; }
+.browser-status-row { display: flex; align-items: center; gap: 10px; }
+.browser-status-row span { flex: 1; }
 .toolbar { display: flex; gap: 6px; flex-wrap: wrap; }
 button {
   font-family: inherit; font-size: 13px; padding: 4px 10px; cursor: pointer;

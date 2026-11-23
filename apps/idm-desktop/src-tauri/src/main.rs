@@ -31,6 +31,24 @@ fn resolve_db_path() -> Result<PathBuf, String> {
     }
 }
 
+/// Phase 5c-2：把启动自动处理的结果追加到数据目录下的日志；失败时静默忽略。
+/// 不新增依赖（桌面 crate 无 tracing），只写文件，绝不写标准输出/注册表。
+fn startup_auto_log(db_path: &std::path::Path, msg: &str) {
+    let dir = match db_path.parent() {
+        Some(d) => d,
+        None => return,
+    };
+    let path = dir.join("desktop-startup.log");
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{msg}");
+    }
+}
+
 /// 关闭 service 并退出：由托盘「退出」与运行器停止任务共用。
 async fn shutdown_and_exit(handle: tauri::AppHandle) {
     let service = handle.state::<AppState>().service.clone();
@@ -44,6 +62,7 @@ async fn shutdown_and_exit(handle: tauri::AppHandle) {
 
 fn run() -> Result<(), String> {
     let db_path = resolve_db_path()?;
+    let log_db_path = db_path.clone();
     let service =
         tauri::async_runtime::block_on(DesktopService::open(db_path)).map_err(|e| e.to_string())?;
     let stopped_rx = service.stopped_receiver();
@@ -80,6 +99,9 @@ fn run() -> Result<(), String> {
             commands::set_settings,
             commands::pick_download_dir,
             commands::task_detail,
+            commands::browser_integration_status,
+            commands::enable_browser_integration,
+            commands::disable_browser_integration,
         ])
         .setup(move |app| {
             // --- 托盘：菜单 + 图标 ---
@@ -139,6 +161,29 @@ fn run() -> Result<(), String> {
                 && let Some(window) = app.get_webview_window("main")
             {
                 let _ = window.hide();
+            }
+
+            // --- Phase 5c-2：启动时自动处理（失败只记日志，不阻止启动） ---
+            {
+                let handle = app.handle().clone();
+                let lp = log_db_path.clone();
+                tauri::async_runtime::spawn(async move {
+                    let shared = handle.state::<AppState>();
+                    let guard = shared.service.lock().await;
+                    let Some(svc) = guard.as_ref() else { return };
+                    match svc.auto_fix_browser_integration() {
+                        Ok(Some(msg)) => startup_auto_log(&lp, &msg),
+                        Ok(None) => {}
+                        Err(err) => startup_auto_log(&lp, &format!("auto-fix check failed: {err}")),
+                    }
+                    match svc.refresh_autostart_path() {
+                        Ok(Some(msg)) => startup_auto_log(&lp, &msg),
+                        Ok(None) => {}
+                        Err(err) => {
+                            startup_auto_log(&lp, &format!("autostart path refresh failed: {err}"))
+                        }
+                    }
+                });
             }
 
             // --- 后台每 250ms 推送任务列表 ---
