@@ -38,4 +38,5 @@ undocumented_unsafe_blocks = "deny"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = true
 debug = "line-tables-only"

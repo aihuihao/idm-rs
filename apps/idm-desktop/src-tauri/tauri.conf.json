@@ -1,4 +1,5 @@
 {
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "idm-rs",
   "version": "0.1.0",
   "identifier": "com.idmrs.desktop",
@@ -20,6 +21,19 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["nsis"],
+    "externalBin": [
+      "binaries/idm-cli",
+      "binaries/idm-nmhost"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "template": "nsis/installer.nsi",
+        "installerHooks": "nsis/hooks.nsh"
+      }
+    }
   }
 }

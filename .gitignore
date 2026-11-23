@@ -4,3 +4,4 @@
 apps/idm-desktop/node_modules
 apps/idm-desktop/dist
 apps/idm-desktop/src-tauri/gen/schemas
+apps/idm-desktop/src-tauri/binaries/*.exe

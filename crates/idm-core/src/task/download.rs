@@ -1273,39 +1273,6 @@ async fn wake_on_shrink(
     }
 }
 
-/// Phase 3d：申请 Host 名额，等待期间与「取消」和 10.5 的「end 缩小」并列监听。
-///
-/// `acquire_future` 只创建一次并跨 `select!` 轮次复用：被 end 缩小唤醒但
-/// `acked < end` 时继续等**同一个**申请，不会把分块重新排到 Semaphore 公平队列的
-/// 队尾。被接管到 `acked >= end` 时返回 `Ok(None)`——丢弃等待、不占名额，调用方
-/// 立即以 `Completed` 结束（零进度接管等它 5 秒的场景由此不再超时失败）。
-#[cfg(test)]
-async fn acquire_with_shrink(
-    limiter: &HostConnectionLimiter,
-    url: &Url,
-    cancel: &CancelSignal,
-    shared: &ChunkShared,
-    acked: &AtomicU64,
-    end_rx: &mut watch::Receiver<u64>,
-) -> Result<Option<HostPermit>> {
-    // 排队等名额期间标记自己，供主循环把排队分块从在途连接数中扣除。
-    shared.mark_waiting_for_permit();
-    let _waiting = WaitingForPermitGuard(shared);
-    let mut permit_fut = limiter.acquire_future(url)?;
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Error::Cancelled),
-            exit = wake_on_shrink(end_rx, shared, acked) => {
-                if exit.is_some() {
-                    return Ok(None);
-                }
-            }
-            p = &mut permit_fut => return p.map(Some),
-        }
-    }
-}
-
 /// Phase 5b-4d：一次分块请求同时申请两级许可——先任务级闸门，再主机级闸门。
 ///
 /// 等待任一级许可期间都标记为 `waiting_for_permit`（计入排队、不计入 in_flight，
@@ -1999,6 +1966,13 @@ mod tests {
         // 唯一名额被别的请求持有：本分块只能排队。
         let held = limiter.acquire(&url, &cancel).await.unwrap();
 
+        // 任务闸门给足连接数（8），但每主机上限为 1，故闸门有效许可数为 1：
+        // 分块先拿到任务级许可，随后只能排队在主机级，复现旧测试的等待场景。
+        let task_gate = match limiter.new_task_gate(8) {
+            Ok(gate) => gate,
+            Err(err) => panic!("new_task_gate failed: {err}"),
+        };
+
         let shared = Arc::new(ChunkShared::new(0, 4 * 1024 * 1024, 0));
         let mut end_rx = shared.subscribe_end();
         let acked = Arc::clone(&shared.acked);
@@ -2006,8 +1980,18 @@ mod tests {
         let sh = Arc::clone(&shared);
         let url2 = url.clone();
         let cancel2 = cancel.clone();
+        let gate = Arc::clone(&task_gate);
         let handle = tokio::spawn(async move {
-            acquire_with_shrink(&lim, &url2, &cancel2, sh.as_ref(), &acked, &mut end_rx).await
+            acquire_chunk_permits(
+                &gate,
+                &lim,
+                &url2,
+                &cancel2,
+                sh.as_ref(),
+                &acked,
+                &mut end_rx,
+            )
+            .await
         });
 
         // 等它真正进入 Semaphore 等待队列。
