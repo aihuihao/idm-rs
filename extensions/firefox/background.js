@@ -15,6 +15,9 @@ let enabled = true;
 let lastFailed = false;
 let lastFailAt = 0;
 let runnerNotRunning = false;
+// Phase 5c-3a: why the most recent handoff failed, used only for the toolbar
+// title so the user can act. Values: "host_missing" | "timeout" | "other".
+let failReason = "other";
 const recent = new Map();
 
 function badge() {
@@ -25,12 +28,18 @@ function badge() {
 
 async function paint() {
     const b = badge();
-    const state = enabled ? "ON" : "OFF";
-    let title = "idm-rs: takeover " + state;
+    let title = enabled ? "idm-rs：接管已开启" : "idm-rs：接管已关闭";
     if (runnerNotRunning) {
+        // Keep the existing runner_not_running hint unchanged.
         title = "运行器未启动：请执行 idm-cli runner start";
     } else if (lastFailed) {
-        title += " (last handoff failed)";
+        if (failReason === "host_missing") {
+            title = "未连接到 idm-rs：请打开 idm-rs →选项→浏览器集成，点击启用";
+        } else if (failReason === "timeout") {
+            title = "idm-rs 无响应：请确认 idm-rs 正在运行";
+        } else {
+            title = "交接失败，已交给 Firefox 下载";
+        }
     }
     try {
         await browser.browserAction.setBadgeText({ text: b.text });
@@ -144,11 +153,25 @@ async function handoff(item) {
         lastFailAt = 0;
         lastFailed = false;
         runnerNotRunning = false;
+        failReason = "other";
         await paint();
     } catch (e) {
         // Never cancel on failure (missing host, rejection, or timeout).
-        // Only a fixed message is logged: no URL, no cookie, no header value.
+        // Only a fixed message is logged: no URL, no cookie, no header value,
+        // and the raw error text is never shown in the title either.
         console.warn("idm-rs: handoff failed; keeping Firefox download");
+        // Phase 5c-3a: classify the failure for a actionable Chinese title.
+        // The classification inspects only the error text, never the URL.
+        const msg = (e && e.message) ? String(e.message) : "";
+        const lower = msg.toLowerCase();
+        if (lower.indexOf("no such native application") !== -1 ||
+            lower.indexOf("not found") !== -1) {
+            failReason = "host_missing";
+        } else if (lower.indexOf("timeout") !== -1) {
+            failReason = "timeout";
+        } else {
+            failReason = "other";
+        }
         // Drop the dedup entry so an immediate manual retry is not blocked.
         recent.delete(url);
         lastFailAt = Date.now();
@@ -165,6 +188,7 @@ browser.browserAction.onClicked.addListener(async () => {
     enabled = !enabled;
     lastFailed = false;
     runnerNotRunning = false;
+    failReason = "other";
     try {
         await browser.storage.local.set({ idmRsEnabled: enabled });
     } catch (e) {

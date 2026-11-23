@@ -63,12 +63,20 @@ function Test-Permissions {
     return $true
 }
 
+# Phase 5a-2 起允许 apps/idm-desktop 使用 Node；原"仓库不得有 apps/"的规则已废止。
+# 本检查现与 verify-workspace.ps1 STEP 10 保持一致：
+#   只允许 apps/idm-desktop/package.json；extensions/ 下不得有 package.json 或
+#   node_modules；任何位置不得有被 git 跟踪的 node_modules。
 function Test-NoPackageJson {
-    # Keep the ORIGINAL rule for non-extensions locations unchanged.
-    if (Test-Path (Join-Path $repoRoot 'package.json')) { return $false }
-    if (Test-Path (Join-Path $repoRoot 'apps')) { return $false }
-    if (Test-Path (Join-Path $repoRoot 'src-tauri')) { return $false }
-    # Additionally: extensions/ must also stay free of package.json / node_modules.
+    $allowed = 'apps/idm-desktop/package.json'
+    $trackedFiles = @(git -C $repoRoot ls-files)
+    $trackedPkg = @($trackedFiles | Where-Object { $_ -match '(^|/)package\.json$' })
+    foreach ($p in $trackedPkg) {
+        if ($p -ne $allowed) { return $false }
+    }
+    $trackedNodeModules = @($trackedFiles | Where-Object { $_ -match '(^|/)node_modules(/|$)' })
+    if ($trackedNodeModules.Count -gt 0) { return $false }
+    # extensions/ must stay free of package.json / node_modules (tracked or not).
     if (-not (Test-Path $extDir)) { return $false }
     $pkg = @(Get-ChildItem -Path $extDir -Recurse -Force -Filter 'package.json' -ErrorAction SilentlyContinue)
     if ($pkg.Count -gt 0) { return $false }
@@ -210,6 +218,14 @@ function Test-NoForbiddenJsConstructs {
     return $true
 }
 
+# Phase 5c-3a: background.js must classify a missing native application so the
+# toolbar can show an actionable Chinese hint instead of "last handoff failed".
+function Test-ContainsNativeAppMissingCheck {
+    $text = Get-BackgroundText
+    if ($null -eq $text) { return $false }
+    return ($text -match 'No such native application')
+}
+
 # Phase 4c: the native messaging host must never spawn a child process.
 # Scoped to the single host source file (tests / CLI reg.exe calls are unrelated).
 function Test-NmhostHasNoCommandNew {
@@ -237,6 +253,8 @@ $staticTests = @(
     [pscustomobject]@{ Id = 3; Name = 'ps_test_no_forbidden_js_constructs'; Fn = { Test-NoForbiddenJsConstructs } }
     # Phase 4c addition: host must not spawn child processes
     [pscustomobject]@{ Id = 3; Name = 'static_nmhost_has_no_command_new'; Fn = { Test-NmhostHasNoCommandNew } }
+    # Phase 5c-3a addition: missing-native-app classification for actionable hints
+    [pscustomobject]@{ Id = 3; Name = 'static_contains_native_app_missing_check'; Fn = { Test-ContainsNativeAppMissingCheck } }
 )
 
 # --- New Rust tests (registration commands) ----------------------------------

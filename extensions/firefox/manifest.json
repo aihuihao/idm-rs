@@ -5,7 +5,11 @@
   "description": "Hands http/https downloads to the local idm-rs native messaging host.",
   "browser_specific_settings": {
     "gecko": {
-      "id": "idm-rs@local"
+      "id": "idm-rs@local",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
     }
   },
   "permissions": [
@@ -19,6 +23,6 @@
     "scripts": ["background.js"]
   },
   "browser_action": {
-    "default_title": "idm-rs: takeover ON"
+    "default_title": "idm-rs：接管已开启"
   }
 }
