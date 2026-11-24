@@ -3,7 +3,8 @@
 use tauri::State;
 
 use idm_desktop::service::{
-    BrowserIntegration, DesktopService, ServiceError, Settings, TaskDetail, TaskView,
+    BrowserIntegration, DesktopService, FirefoxExtensionStatus, ServiceError, Settings, TaskDetail,
+    TaskView,
 };
 
 pub(crate) struct AppState {
@@ -132,6 +133,26 @@ pub(crate) async fn disable_browser_integration(
     let guard = state.service.lock().await;
     let service = guard.as_ref().ok_or_else(closed)?;
     service.disable_browser_integration()
+}
+
+/// 查询 Firefox 扩展状态（只读）。
+#[tauri::command]
+pub(crate) async fn firefox_extension_status(
+    state: State<'_, AppState>,
+) -> Result<FirefoxExtensionStatus, ServiceError> {
+    let guard = state.service.lock().await;
+    let service = guard.as_ref().ok_or_else(closed)?;
+    Ok(service.firefox_extension_status())
+}
+
+/// 一键安装 Firefox 扩展（观察模式允许）。
+#[tauri::command]
+pub(crate) async fn install_firefox_extension(
+    state: State<'_, AppState>,
+) -> Result<(), ServiceError> {
+    let guard = state.service.lock().await;
+    let service = guard.as_ref().ok_or_else(closed)?;
+    service.install_firefox_extension()
 }
 
 /// 在 Rust 端弹出文件夹选择框，返回选中路径；取消返回空字符串。

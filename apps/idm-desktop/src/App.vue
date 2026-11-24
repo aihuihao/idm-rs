@@ -12,8 +12,9 @@
     </div>
 
     <div v-if="browserBannerVisible" class="banner browser-banner">
-      <span>浏览器集成未启用，Firefox 下载不会被接管</span>
-      <button class="browser-action" @click="onEnableBrowserFromBanner">启用</button>
+      <span>{{ browserBannerText }}</span>
+      <button v-if="browserBannerNeedsExtension" class="browser-action" @click="onInstallFirefoxFromBanner">安装</button>
+      <button v-else class="browser-action" @click="onEnableBrowserFromBanner">启用</button>
       <button class="browser-action" @click="onDismissBrowserBanner">不再提示</button>
     </div>
 
@@ -281,6 +282,11 @@
             <button v-if="browserStatus === 'Ok'" @click="onDisableBrowser">移除</button>
           </div>
           <span class="hint">启用后，Firefox 安装 idm-rs 扩展即可自动接管下载</span>
+          <div class="browser-status-row">
+            <span>Firefox 扩展：{{ firefoxStatusLabel }}</span>
+            <button v-if="firefoxInstallable" @click="onInstallFirefox">安装 Firefox 扩展</button>
+          </div>
+          <span v-if="firefoxActionMessage" class="hint">{{ firefoxActionMessage }}</span>
           <span v-if="browserActionError" class="error-text">{{ browserActionError }}</span>
         </div>
         <div class="field">
@@ -402,14 +408,40 @@ const filterKind = ref('all');
 const fatalError = ref('');
 
 type BrowserStatus = 'NotInstalled' | 'Ok' | 'Broken';
+type FirefoxStatus = 'firefoxMissing' | 'notInstalled' | 'unknown' | { installed: string[] };
 const browserStatus = ref<BrowserStatus>('NotInstalled');
 const browserBannerVisible = ref(false);
 const browserActionError = ref('');
+const firefoxStatus = ref<FirefoxStatus>('unknown');
+const firefoxActionMessage = ref('');
 const browserStatusLabel = computed(() => {
   if (browserStatus.value === 'Ok') return '已启用';
   if (browserStatus.value === 'Broken') return '需要修复';
   return '未启用';
 });
+const firefoxStatusLabel = computed(() => {
+  const s = firefoxStatus.value;
+  if (typeof s === 'object' && 'installed' in s) return `已安装（${s.installed.join('、')}）`;
+  if (s === 'firefoxMissing') return '未检测到 Firefox';
+  if (s === 'notInstalled') return '未安装';
+  return '无法判断';
+});
+const firefoxInstallable = computed(() => {
+  const s = firefoxStatus.value;
+  return s === 'notInstalled' || s === 'firefoxMissing';
+});
+const extensionMissing = computed(() => {
+  const s = firefoxStatus.value;
+  return s === 'notInstalled' || s === 'firefoxMissing';
+});
+const browserBannerText = computed(() =>
+  browserStatus.value === 'NotInstalled'
+    ? '浏览器集成未启用，Firefox 下载不会被接管'
+    : 'Firefox 扩展未安装'
+);
+const browserBannerNeedsExtension = computed(
+  () => browserStatus.value !== 'NotInstalled' && extensionMissing.value
+);
 
 const addOpen = ref(false);
 const addUrl = ref('');
@@ -688,12 +720,23 @@ async function refreshTasks(): Promise<void> {
 }
 
 // --- Phase 5c-2：浏览器集成状态与提示条 ----------------------------------
+async function loadFirefoxStatus(): Promise<void> {
+  try {
+    firefoxStatus.value = await invoke<FirefoxStatus>('firefox_extension_status');
+  } catch (err) {
+    showFatalError(errText(err));
+  }
+}
+
 async function loadBrowserStatus(): Promise<void> {
   try {
     browserStatus.value = await invoke<BrowserStatus>('browser_integration_status');
+    await loadFirefoxStatus();
     const saved = await invoke<Settings>('get_settings');
+    const integrationMissing = browserStatus.value === 'NotInstalled';
+    const extensionMissingNow = browserStatus.value === 'Ok' && extensionMissing.value;
     browserBannerVisible.value =
-      browserStatus.value === 'NotInstalled' && !saved.browser_integration_dismissed;
+      !saved.browser_integration_dismissed && (integrationMissing || extensionMissingNow);
   } catch (err) {
     showFatalError(errText(err));
   }
@@ -733,6 +776,23 @@ async function onDismissBrowserBanner(): Promise<void> {
   } catch (err) {
     showFatalError(errText(err));
   }
+}
+
+async function onInstallFirefox(): Promise<void> {
+  firefoxActionMessage.value = '';
+  browserActionError.value = '';
+  try {
+    await invoke('install_firefox_extension');
+    firefoxActionMessage.value =
+      '请在 Firefox 弹出的窗口中点击添加；建议不勾选“允许在隐私窗口中运行”';
+    await loadFirefoxStatus();
+  } catch (err) {
+    browserActionError.value = errText(err);
+  }
+}
+
+async function onInstallFirefoxFromBanner(): Promise<void> {
+  await onInstallFirefox();
 }
 
 async function openOptions(): Promise<void> {

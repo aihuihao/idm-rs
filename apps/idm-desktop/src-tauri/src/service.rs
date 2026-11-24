@@ -133,6 +133,20 @@ pub struct IntegrationConfig {
     pub current_exe: PathBuf,
 }
 
+/// Firefox 扩展状态（供界面显示，序列化为 camelCase 变体名）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FirefoxExtensionStatus {
+    /// 未找到 firefox.exe。
+    FirefoxMissing,
+    /// 已安装，列出含该扩展的配置名。
+    Installed(Vec<String>),
+    /// 找到 Firefox 但没有任何配置安装该扩展。
+    NotInstalled,
+    /// 无法判断（如 profiles.ini 不存在/读取失败）。
+    Unknown,
+}
+
 impl IntegrationConfig {
     pub fn default_for(db_path: &Path) -> Result<Self, ServiceError> {
         let exe = std::env::current_exe().map_err(internal)?;
@@ -164,6 +178,8 @@ pub struct DesktopService {
     autostart_desktop_name: String,
     autostart_runner_name: String,
     integration: IntegrationConfig,
+    /// 安装扩展用的 xpi 路径；由配置层注入（dev 构建指向仓库 dist），业务逻辑不硬编码。
+    extension_xpi: PathBuf,
 }
 
 const DEFAULT_AUTOSTART_DESKTOP_NAME: &str = "idm-rs-desktop";
@@ -191,6 +207,23 @@ fn parse_speed_or(raw: Option<String>) -> u64 {
 pub fn is_dev_build(path: &Path) -> bool {
     let normalized = path.to_string_lossy().replace('/', "\\").to_lowercase();
     normalized.contains("\\target\\debug\\") || normalized.contains("\\target\\release\\")
+}
+
+/// 推导安装扩展用的 xpi 路径（配置层）：
+/// - 开发构建：指向仓库 `dist/` 下的签名 xpi（由编译期 manifest 目录推导，非业务逻辑硬编码）；
+/// - 生产构建：指向安装目录中的 `idm-rs-firefox.xpi`。
+fn default_extension_xpi(integration: &IntegrationConfig) -> PathBuf {
+    if is_dev_build(&integration.current_exe) {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..");
+        repo_root
+            .join("dist")
+            .join("idm-rs-firefox-0.1.0-signed.xpi")
+    } else {
+        integration.program_dir.join("idm-rs-firefox.xpi")
+    }
 }
 
 /// 比较两个路径是否指向同一位置：优先尝试 canonicalize，失败时退化为规范化字符串比较。
@@ -437,11 +470,31 @@ impl DesktopService {
     }
 
     /// 与 open 相同，但允许注入 autostart 值名与浏览器集成配置（供测试隔离注册表/manifest）。
+    /// xpi 路径由配置层按是否开发构建推导：dev 指向仓库 dist，生产指向安装目录。
     pub async fn open_with_config(
         db_path: PathBuf,
         autostart_desktop_name: String,
         autostart_runner_name: String,
         integration: IntegrationConfig,
+    ) -> Result<Self, ServiceError> {
+        let extension_xpi = default_extension_xpi(&integration);
+        Self::open_with_config_and_extension(
+            db_path,
+            autostart_desktop_name,
+            autostart_runner_name,
+            integration,
+            extension_xpi,
+        )
+        .await
+    }
+
+    /// 与 open_with_config 相同，但允许注入扩展 xpi 路径（供测试与配置层使用）。
+    pub async fn open_with_config_and_extension(
+        db_path: PathBuf,
+        autostart_desktop_name: String,
+        autostart_runner_name: String,
+        integration: IntegrationConfig,
+        extension_xpi: PathBuf,
     ) -> Result<Self, ServiceError> {
         let store = Store::open(&db_path).map_err(internal)?;
         let settings = read_settings(&store, &autostart_desktop_name).await?;
@@ -462,6 +515,7 @@ impl DesktopService {
                 autostart_desktop_name,
                 autostart_runner_name,
                 integration,
+                extension_xpi,
             }),
             Err(RunnerStartError::AlreadyRunning) => Ok(Self {
                 store,
@@ -470,6 +524,7 @@ impl DesktopService {
                 autostart_desktop_name,
                 autostart_runner_name,
                 integration,
+                extension_xpi,
             }),
             Err(RunnerStartError::Other(err)) => Err(internal(err)),
         }
@@ -519,6 +574,67 @@ impl DesktopService {
     pub fn disable_browser_integration(&self) -> Result<(), ServiceError> {
         let cfg = &self.integration;
         nm_host::uninstall(&cfg.host_name, &cfg.manifest_dir).map_err(ServiceError::Internal)
+    }
+
+    /// Firefox 扩展状态（供界面显示）：未检测到 Firefox / 已安装 / 未安装 / 无法判断。
+    /// 只读，观察模式下允许。
+    pub fn firefox_extension_status(&self) -> FirefoxExtensionStatus {
+        if crate::firefox::find_firefox().is_none() {
+            return FirefoxExtensionStatus::FirefoxMissing;
+        }
+        let ini = match crate::firefox::profiles_ini_path() {
+            Some(p) => p,
+            None => return FirefoxExtensionStatus::Unknown,
+        };
+        match crate::firefox::detect_extension(&ini) {
+            Ok(crate::firefox::ExtensionStatus::Installed(names)) => {
+                FirefoxExtensionStatus::Installed(names)
+            }
+            Ok(crate::firefox::ExtensionStatus::NotInstalled) => {
+                FirefoxExtensionStatus::NotInstalled
+            }
+            Ok(crate::firefox::ExtensionStatus::Unknown) | Err(_) => {
+                FirefoxExtensionStatus::Unknown
+            }
+        }
+    }
+
+    /// 一键安装 Firefox 扩展：用找到的 firefox.exe 打开 xpi，Firefox 弹出安装确认窗口。
+    /// 找不到 Firefox 或 xpi 返回 InvalidInput。观察模式下允许（不检查 read_only）。
+    pub fn install_firefox_extension(&self) -> Result<(), ServiceError> {
+        self.install_firefox_extension_with(
+            crate::firefox::find_firefox,
+            |firefox: &Path, xpi: &Path| {
+                std::process::Command::new(firefox)
+                    .arg(xpi)
+                    .spawn()
+                    .map(|_| ())
+            },
+        )
+    }
+
+    /// 可注入版本：`find` 返回 firefox.exe 路径，`launch` 执行打开动作；供测试避免真实启动 Firefox。
+    pub fn install_firefox_extension_with<F, L>(
+        &self,
+        find: F,
+        launch: L,
+    ) -> Result<(), ServiceError>
+    where
+        F: FnOnce() -> Option<PathBuf>,
+        L: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    {
+        let firefox = find().ok_or_else(|| {
+            ServiceError::InvalidInput("未检测到 Firefox，请先安装 Firefox 浏览器".to_string())
+        })?;
+        let xpi = &self.extension_xpi;
+        if !xpi.is_file() {
+            return Err(ServiceError::InvalidInput(format!(
+                "找不到 Firefox 扩展文件：{}",
+                xpi.display()
+            )));
+        }
+        launch(&firefox, xpi)
+            .map_err(|e| ServiceError::Internal(format!("无法启动 Firefox 安装扩展: {e}")))
     }
 
     /// 启动时自动修复：Broken 且非开发构建时调用 enable，返回可写日志的消息。

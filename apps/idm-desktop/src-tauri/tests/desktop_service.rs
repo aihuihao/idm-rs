@@ -1779,3 +1779,118 @@ async fn autostart_path_refresh_absent_noop() -> TestResult {
     svc.shutdown().await?;
     Ok(())
 }
+
+// --- v0.2.0 步骤 3/5：一键安装 Firefox 扩展 --------------------------------
+
+/// 用注入的 xpi 路径构造 service（dev 路径由配置注入，不硬编码在业务逻辑）。
+async fn service_with_xpi(xpi: PathBuf) -> TestResult<DesktopService> {
+    let tmp = TempDir::new()?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+    let cfg = IntegrationConfig {
+        host_name: unique_nm_host(),
+        manifest_dir: tmp.join("data"),
+        program_dir: tmp.path.clone(),
+        current_exe: tmp.path.join("idm-desktop.exe"),
+    };
+    // TempDir 必须在 service 生命周期内存活：把它交给一个静态保活集合。
+    KEEP_ALIVE.lock().map_err(|_| "lock poisoned")?.push(tmp);
+    DesktopService::open_with_config_and_extension(
+        db,
+        unique_run_name("idm-c2-desk"),
+        unique_run_name("idm-c2-run"),
+        cfg,
+        xpi,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+static KEEP_ALIVE: std::sync::Mutex<Vec<TempDir>> = std::sync::Mutex::new(Vec::new());
+
+#[tokio::test]
+async fn install_extension_no_firefox() -> TestResult {
+    let tmp = TempDir::new()?;
+    let xpi = tmp.join("idm-rs-firefox.xpi");
+    std::fs::write(&xpi, b"fake xpi")?;
+    let svc = service_with_xpi(xpi).await?;
+    let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let launched2 = Arc::clone(&launched);
+    let result = svc.install_firefox_extension_with(
+        || None::<PathBuf>,
+        |_ff: &Path, _xpi: &Path| {
+            launched2.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    match result {
+        Err(ServiceError::InvalidInput(msg)) if msg.contains("未检测到 Firefox") => {}
+        other => {
+            return Err(
+                format!("找不到 Firefox 应返回 InvalidInput(含 Firefox), got {other:?}").into(),
+            );
+        }
+    }
+    assert!(
+        !launched.load(Ordering::SeqCst),
+        "找不到 Firefox 不应启动进程"
+    );
+    svc.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn install_extension_no_xpi() -> TestResult {
+    let tmp = TempDir::new()?;
+    let xpi = tmp.join("missing.xpi");
+    let svc = service_with_xpi(xpi).await?;
+    let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let launched2 = Arc::clone(&launched);
+    let result = svc.install_firefox_extension_with(
+        || Some(PathBuf::from("C:/Firefox/firefox.exe")),
+        |_ff: &Path, _xpi: &Path| {
+            launched2.store(true, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    match result {
+        Err(ServiceError::InvalidInput(msg)) if msg.contains("扩展") || msg.contains("xpi") => {}
+        other => return Err(format!("找不到 xpi 应返回 InvalidInput, got {other:?}").into()),
+    }
+    assert!(!launched.load(Ordering::SeqCst), "找不到 xpi 不应启动进程");
+    svc.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn install_extension_success_launches_firefox() -> TestResult {
+    let tmp = TempDir::new()?;
+    let xpi = tmp.join("idm-rs-firefox.xpi");
+    std::fs::write(&xpi, b"fake xpi")?;
+    let svc = service_with_xpi(xpi.clone()).await?;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<(PathBuf, PathBuf)>::new()));
+    let calls2 = Arc::clone(&calls);
+    let firefox = PathBuf::from("C:/Firefox/firefox.exe");
+    let firefox2 = firefox.clone();
+    let result = svc.install_firefox_extension_with(
+        move || Some(firefox2.clone()),
+        |ff: &Path, x: &Path| {
+            calls2
+                .lock()
+                .map_err(|_| std::io::Error::other("lock poisoned"))?
+                .push((ff.to_path_buf(), x.to_path_buf()));
+            Ok(())
+        },
+    );
+    if result.is_err() {
+        return Err(format!("应成功, got {result:?}").into());
+    }
+    let got = calls.lock().map_err(|_| "lock poisoned")?.clone();
+    if got != vec![(firefox, xpi)] {
+        return Err(format!("启动参数不符: {got:?}").into());
+    }
+    svc.shutdown().await?;
+    Ok(())
+}

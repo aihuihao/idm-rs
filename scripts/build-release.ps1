@@ -39,6 +39,14 @@ $TauriDir = Join-Path $RepoRoot 'apps\idm-desktop\src-tauri'
 $BinariesDir = Join-Path $TauriDir 'binaries'
 $SetupDir = Join-Path $ReleaseDir 'bundle\nsis'
 
+# Signed Firefox extension bundled into the installer.
+# Single source of truth for the expected hash: update here when shipping a new extension.
+# docs/maintenance.md documents the same value and the update procedure.
+$ExtensionSha256 = 'D918224C3DF5800289A8311245D555A4328053C2B8AD980CDD229729C60F3227'
+$ExtensionSource = Join-Path $RepoRoot 'dist\idm-rs-firefox-0.1.0-signed.xpi'
+$ExtensionStageDir = Join-Path $TauriDir 'resources'
+$ExtensionStaged = Join-Path $ExtensionStageDir 'idm-rs-firefox.xpi'
+
 # 1) release binaries: idm-cli and idm-nmhost (idm-ipc crate)
 Invoke-Step 'cargo build --release idm-cli + idm-ipc(nmhost)' {
     cargo build --release -p idm-cli -p idm-ipc --bins
@@ -61,7 +69,22 @@ Invoke-Step 'stage external binaries (binaries/*-<triple>.exe)' {
     Copy-Item -Force $nmSrc (Join-Path $BinariesDir "idm-nmhost-$Triple.exe")
 }
 
-# 4) desktop release build + NSIS installer
+# 4) verify and stage signed Firefox extension as a bundled resource
+Invoke-Step 'verify + stage signed Firefox extension' {
+    if (-not (Test-Path $ExtensionSource)) { throw "missing signed extension: $ExtensionSource" }
+    $actual = (Get-FileHash -Algorithm SHA256 $ExtensionSource).Hash
+    if ($actual -ne $ExtensionSha256) {
+        throw "extension SHA256 mismatch: expected $ExtensionSha256, got $actual"
+    }
+    New-Item -ItemType Directory -Force -Path $ExtensionStageDir | Out-Null
+    Copy-Item -Force $ExtensionSource $ExtensionStaged
+    $stagedHash = (Get-FileHash -Algorithm SHA256 $ExtensionStaged).Hash
+    if ($stagedHash -ne $ExtensionSha256) { throw "staged extension SHA256 mismatch: $stagedHash" }
+    Write-Output "EXTENSION: $ExtensionStaged ($((Get-Item $ExtensionStaged).Length) bytes)"
+    Write-Output "SHA256: $stagedHash"
+}
+
+# 5) desktop release build + NSIS installer
 Invoke-Step 'tauri build (nsis)' {
     Push-Location (Join-Path $RepoRoot 'apps\idm-desktop')
     try { npx tauri build --bundles nsis } finally { Pop-Location }

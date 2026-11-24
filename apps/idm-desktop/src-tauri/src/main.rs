@@ -102,6 +102,8 @@ fn run() -> Result<(), String> {
             commands::browser_integration_status,
             commands::enable_browser_integration,
             commands::disable_browser_integration,
+            commands::firefox_extension_status,
+            commands::install_firefox_extension,
         ])
         .setup(move |app| {
             // --- 托盘：菜单 + 图标 ---

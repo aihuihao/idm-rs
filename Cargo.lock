@@ -1886,7 +1886,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "idm-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "idm-core",
  "rusqlite",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "idm-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "reqwest",
@@ -1914,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "idm-desktop"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "idm-core",
  "serde",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "idm-ipc"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "idm-core",
  "serde",

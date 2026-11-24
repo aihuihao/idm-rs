@@ -372,3 +372,114 @@ async fn queue_pause_downloading_rejected() -> TestResult {
     srv.shutdown();
     Ok(())
 }
+
+// --- v0.2.0 步骤0：queue pause 与运行器内存队列的竞态 ---------------------
+
+/// 带 `--max-tasks N` 启动运行器（用于限制并发名额）。
+fn spawn_runner_max(db: &str, max: u32) -> std::io::Result<QueueRunner> {
+    let child = Command::new(env!("CARGO_BIN_EXE_idm-cli"))
+        .args(["queue", "run", "--db", db, "--max-tasks", &max.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(QueueRunner(child))
+}
+
+/// 入队并指定输出名，返回任务 id。
+fn enqueue_named(url: &str, out: &str, db: &Path, dir: &Path) -> TestResult<i64> {
+    let db_s = db.to_string_lossy().into_owned();
+    let dir_s = dir.to_string_lossy().into_owned();
+    let out = run_cli(&["enqueue", url, "--dir", &dir_s, "--db", &db_s, "--out", out])?;
+    if !out.status.success() {
+        return Err(format!("enqueue 失败: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    parse_enqueue_id(&out)
+}
+
+/// 竞态：A 占住唯一名额，运行器已把 B 读入队列后暂停 B；A 完成后 B 不得开始下载。
+#[tokio::test]
+async fn pause_queued_while_runner_running() -> TestResult {
+    let size = 1024 * 1024;
+    let stall_used = Arc::new(AtomicBool::new(false));
+    let srv = start(ServerConfig {
+        size,
+        stall: Some(StallConfig {
+            after_bytes: 0,
+            duration: Duration::from_secs(4),
+            stall_used: Arc::clone(&stall_used),
+            variable_blocks: false,
+            closed_early: Arc::new(AtomicBool::new(false)),
+            close_after_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        }),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("out");
+    std::fs::create_dir_all(&dir)?;
+    let db = tmp.path().join("idm.db");
+    let db_s = db.to_string_lossy().into_owned();
+
+    let a = enqueue_named(&srv.url("/a.bin"), "a.bin", &db, &dir)?;
+    let b = enqueue_named(&srv.url("/b.bin"), "b.bin", &db, &dir)?;
+    let _runner = spawn_runner_max(&db_s, 1)?;
+
+    // 等 A 进入 Downloading（stall 期间），B 应仍为 Queued。
+    let began = Instant::now();
+    let mut a_downloading = false;
+    while began.elapsed() < Duration::from_secs(10) {
+        if let Ok((state, _)) = task_state_pause(&db, a)
+            && state == "Downloading"
+        {
+            a_downloading = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !a_downloading {
+        return Err("任务 A 未进入 Downloading".into());
+    }
+
+    // 等 2 秒，确保运行器已完成一次调度轮询（A 已占住唯一名额）。
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // 暂停 B，应成功（B 仍为 Queued）。
+    let out = run_cli(&["queue", "pause", &b.to_string(), "--db", &db_s])?;
+    if !out.status.success() {
+        return Err(format!(
+            "pause(B) 应成功: code={:?} stdout={} stderr={}",
+            out.status.code(),
+            stdout_text(&out),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    let (b_state, _) = task_state_pause(&db, b)?;
+    if b_state != "Paused" {
+        return Err(format!("暂停后 B 应为 Paused, got {b_state}").into());
+    }
+
+    // 等 A 完成（stall 4 秒后继续下载 1 MiB），释放唯一名额。
+    if !wait_complete(&dir.join("a.bin"), size, Duration::from_secs(20)).await {
+        return Err("任务 A 未完成，无法验证 B 是否被错误调度".into());
+    }
+
+    // 观察 B 10 秒：状态必须始终为 Paused，且没有 b.bin.idm-part。
+    let part = dir.join("b.bin.idm-part");
+    let observe = Instant::now();
+    while observe.elapsed() < Duration::from_secs(10) {
+        let (state, _) = task_state_pause(&db, b)?;
+        if state != "Paused" {
+            return Err(format!("竞态发生：A 完成后 B 状态变为 {state}，应为 Paused").into());
+        }
+        if part.exists() {
+            return Err("竞态发生：B 产生了 .idm-part 文件，说明已开始下载".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    drop(_runner);
+    srv.shutdown();
+    Ok(())
+}

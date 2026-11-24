@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "idm-rs",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "identifier": "com.idmrs.desktop",
   "build": {
     "frontendDist": "../dist"
@@ -27,6 +27,9 @@
       "binaries/idm-cli",
       "binaries/idm-nmhost"
     ],
+    "resources": {
+      "resources/idm-rs-firefox.xpi": "idm-rs-firefox.xpi"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",

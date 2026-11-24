@@ -14,14 +14,14 @@ idm-rs 是一个本地下载管理器，由桌面程序（Tauri）、命令行�
 
 ## 安装
 
-1. 运行安装包 `idm-rs_0.1.1_x64-setup.exe`。安装采用"当前用户"模式，默认安装到 `%LOCALAPPDATA%\Programs\idm-rs`，不需要管理员权限。
+1. 运行安装包 `idm-rs_0.2.0_x64-setup.exe`。安装采用"当前用户"模式，默认安装到 `%LOCALAPPDATA%\Programs\idm-rs`，不需要管理员权限。
 2. Windows 可能弹出"未知发布者"（Windows 已保护你的电脑）提示：这是因为程序尚未做代码签名。确认发布者来源为你自己构建/信任的副本后，点击"更多信息"→"仍要运行"继续安装。
-3. 安装完成后，开始菜单出现 `idm-rs` 快捷方式；安装目录含 `idm-desktop.exe`、`idm-cli.exe`、`idm-nmhost.exe` 三个程序。
+3. 安装完成后，开始菜单出现 `idm-rs` 快捷方式；安装目录含 `idm-desktop.exe`、`idm-cli.exe`、`idm-nmhost.exe` 三个程序，以及随包分发的签名扩展 `idm-rs-firefox.xpi`。
 
 ## 首次使用
 
 1. **启用浏览器集成**：打开 idm-rs →「选项」→「浏览器集成」，点击「启用」（或点击界面顶部的提示条「启用」）。这会把 `idm-nmhost.exe` 注册为本机 Native Messaging host，供 Firefox 扩展连接。
-2. **安装 Firefox 扩展**：把经 Mozilla 签名后的 `idm-rs-firefox-0.1.0-signed.xpi` 文件直接拖入 Firefox 窗口，按提示完成安装。安装确认窗口中"允许在隐私窗口中运行"建议**不要勾选**——隐私窗口中的下载会被记入 idm-rs 的下载记录，与隐私窗口的预期行为不符。扩展启用后，工具栏图标显示 `ON`。
+2. **安装 Firefox 扩展**：安装包已自带经 Mozilla 签名的扩展，无需另行下载。打开 idm-rs →「选项」→「浏览器集成」，查看「Firefox 扩展」状态；若显示"未安装"，点击「安装 Firefox 扩展」（或点击顶部横幅的「安装」），程序会用 Firefox 打开随包分发的 `idm-rs-firefox.xpi`，Firefox 弹出安装确认窗口后点击「添加」即可。安装确认窗口中"允许在隐私窗口中运行"建议**不要勾选**——隐私窗口中的下载会被记入 idm-rs 的下载记录，与隐私窗口的预期行为不符。扩展启用后，工具栏图标显示 `ON`。
 
 接管已开启/关闭可通过点击工具栏图标切换；图标上的 `!` 表示最近一次交接失败（见常见问题）。
 
@@ -71,4 +71,4 @@ pwsh -File scripts/package-extension.ps1   # 生成 dist/idm-rs-firefox-0.1.0.zi
 
 **Firefox 扩展调试**：开发者可在 `about:debugging#/runtime/this-firefox` 中点击「临时载入附加组件」，选择 `extensions/firefox/manifest.json` 临时载入扩展进行验证。此方式仅用于开发调试，重启浏览器后即失效；普通用户应按「首次使用」中的说明安装经 Mozilla 签名的 `.xpi`，不要使用临时载入。
 
-更完整的功能与限制说明见 `docs/release-notes-0.1.1.md`、维护说明 `docs/maintenance.md` 与各阶段进度文件 `docs/phase5b-progress.md`、`docs/phase5c-progress.md`。
+更完整的功能与限制说明见 `docs/release-notes-0.2.0.md`、维护说明 `docs/maintenance.md` 与各阶段进度文件 `docs/phase5b-progress.md`、`docs/phase5c-progress.md`。
