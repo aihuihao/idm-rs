@@ -20,6 +20,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use idm_core::store::{Store, TaskRecord};
 
@@ -193,6 +194,51 @@ fn host_ping_roundtrip() -> TestResult {
         "ping 应返回 version（crate 版本）"
     );
     child.kill()?;
+    Ok(())
+}
+
+// --- 3b. 半截消息体读取超时 -------------------------------------------------
+
+/// 只写 4 字节长度前缀（声明 100 字节）而不写消息体，host 应在数秒内退出且退出码非 0。
+#[test]
+fn host_times_out_on_partial_frame() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let db = tmp.path().join("nm.db");
+    let mut child = spawn_nmhost_no_lock(&db)?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io_missing("child stdin missing"))?;
+        stdin.write_all(&100u32.to_ne_bytes())?;
+        stdin.flush()?;
+    }
+
+    let began = std::time::Instant::now();
+    let exited = loop {
+        match child.try_wait()? {
+            Some(status) => break Some(status),
+            None if began.elapsed() >= Duration::from_secs(8) => break None,
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let elapsed = began.elapsed();
+    let status = exited.ok_or_else(|| {
+        let _ = child.kill();
+        io_missing(&format!(
+            "host 应在 4-8 秒内因半截消息体退出，但 {elapsed:?} 后仍在运行"
+        ))
+    })?;
+    if elapsed < Duration::from_secs(4) || elapsed > Duration::from_secs(8) {
+        return Err(format!("退出耗时应在 4-8 秒，实际 {elapsed:?}").into());
+    }
+    if status.success() {
+        return Err("半截消息体应以非 0 退出码退出".into());
+    }
+    let log = std::fs::read_to_string(log_path(tmp.path())).unwrap_or_default();
+    if !log.contains("timeout") {
+        return Err(format!("nmhost.log 应含 timeout 记录，实际: {log}").into());
+    }
     Ok(())
 }
 

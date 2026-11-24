@@ -698,7 +698,7 @@ mod dl {
     use idm_core::net::probe::Probe;
     use idm_core::queue::{DownloadQueue, QueueConfig, QueueEvent, QueueMove};
     use idm_core::runner::{Runner, RunnerConfig, RunnerStartError};
-    use idm_core::store::{NewTask, QueuedTask, Store};
+    use idm_core::store::{NewTask, PauseReasonDb, QueuedTask, Store, TaskStateDb};
     use idm_core::task::{
         CancelSignal, ChunkState, DownloadContext, DownloadOptions, DownloadOutcome,
         ProgressSnapshot, download_with_store, resume,
@@ -1538,6 +1538,26 @@ mod dl {
             crate::print_error("cannot create dir", &e);
             return 1;
         }
+        let file_name = match out_name {
+            Some(raw) => {
+                // 只取路径最后一段，再交给 core 做 Windows 合法化。
+                let last = match raw.rfind(['/', '\\']) {
+                    Some(idx) => &raw[idx + 1..],
+                    None => raw.as_str(),
+                };
+                if last.is_empty() {
+                    eprintln!("invalid --out: empty file name");
+                    return 2;
+                }
+                let sanitized = sanitize_windows_filename(last);
+                if sanitized.is_empty() {
+                    eprintln!("invalid --out: empty file name after sanitize");
+                    return 2;
+                }
+                Some(sanitized)
+            }
+            None => None,
+        };
         let id = match store
             .enqueue_task(
                 QueuedTask {
@@ -1546,7 +1566,7 @@ mod dl {
                     strategy: "Auto".to_string(),
                     connections,
                     max_speed,
-                    file_name: None,
+                    file_name,
                 },
                 None,
             )
@@ -1560,7 +1580,6 @@ mod dl {
         };
         let queue_order = store.get_task(id).await.map(|r| r.queue_order).unwrap_or(0);
         println!("ENQUEUED id={id} queue_order={queue_order}");
-        let _ = out_name;
         0
     }
 
@@ -1942,6 +1961,112 @@ mod dl {
         }
     }
 
+    /// 解析 `queue pause/resume <id> [--db PATH]` 的位置参数。
+    fn parse_queue_id_arg(args: &[String], usage: &str) -> std::result::Result<i64, i32> {
+        let mut id: Option<i64> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--db" | "--log-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("missing value for {}", args[i - 1]);
+                        return Err(2);
+                    }
+                }
+                other if id.is_none() && !other.starts_with("--") => match other.parse::<i64>() {
+                    Ok(v) => id = Some(v),
+                    Err(_) => {
+                        eprintln!("invalid task id: {other}");
+                        return Err(2);
+                    }
+                },
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    return Err(2);
+                }
+            }
+            i += 1;
+        }
+        id.ok_or_else(|| {
+            eprintln!("{usage}");
+            2
+        })
+    }
+
+    /// `queue pause <id>`：Queued → Paused(User)；下载中 → 退出码 3；其他 → 退出码 2。
+    pub async fn run_queue_pause(args: &[String], store: Arc<Store>) -> i32 {
+        let id = match parse_queue_id_arg(args, "usage: idm-cli queue pause <id> [--db PATH]") {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let rec = match store.get_task(id).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("task {id} not found: {e}");
+                return 2;
+            }
+        };
+        match rec.state {
+            TaskStateDb::Queued => {
+                match store
+                    .update_state(id, TaskStateDb::Paused, Some(PauseReasonDb::User), None)
+                    .await
+                {
+                    Ok(()) => {
+                        println!("paused {id}");
+                        0
+                    }
+                    Err(e) => {
+                        crate::print_error("pause failed", &e);
+                        1
+                    }
+                }
+            }
+            TaskStateDb::Downloading | TaskStateDb::Finalizing | TaskStateDb::Probing => {
+                eprintln!("任务正在下载，请在桌面程序中暂停，或执行 idm-cli runner stop");
+                3
+            }
+            other => {
+                eprintln!("task {id} cannot be paused in state {}", other.as_str());
+                2
+            }
+        }
+    }
+
+    /// `queue resume <id>`：Paused / Failed → Queued；其他 → 退出码 2。
+    pub async fn run_queue_resume(args: &[String], store: Arc<Store>) -> i32 {
+        let id = match parse_queue_id_arg(args, "usage: idm-cli queue resume <id> [--db PATH]") {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let rec = match store.get_task(id).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("task {id} not found: {e}");
+                return 2;
+            }
+        };
+        match rec.state {
+            TaskStateDb::Paused | TaskStateDb::Failed => {
+                match store.requeue_task(id, false).await {
+                    Ok(()) => {
+                        println!("resumed {id}");
+                        0
+                    }
+                    Err(e) => {
+                        crate::print_error("resume failed", &e);
+                        1
+                    }
+                }
+            }
+            other => {
+                eprintln!("task {id} cannot be resumed in state {}", other.as_str());
+                2
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use idm_core::store::Store;
@@ -2219,6 +2344,8 @@ async fn main() {
                 match sub2 {
                     "run" => dl::run_queue_run(&args[3..], Arc::clone(&store)).await,
                     "move" => dl::run_queue_move(&args[3..], Arc::clone(&store)).await,
+                    "pause" => dl::run_queue_pause(&args[3..], Arc::clone(&store)).await,
+                    "resume" => dl::run_queue_resume(&args[3..], Arc::clone(&store)).await,
                     other => {
                         eprintln!("unknown queue subcommand: {other}");
                         2

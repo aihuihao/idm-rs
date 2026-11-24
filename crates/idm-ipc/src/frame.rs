@@ -48,6 +48,39 @@ where
     }
 }
 
+/// 与 [`read_frame`] 相同，但只对「消息体」读取施加 `body_timeout`；
+/// 等待下一条消息的 4 字节长度前缀阶段不设超时（对端关闭时自然返回 [`ReadFrame::Eof`]）。
+///
+/// 超时返回 [`std::io::ErrorKind::TimedOut`]，调用方据此记录日志并以非 0 退出。
+pub async fn read_frame_body_timeout<R>(
+    reader: &mut R,
+    body_timeout: std::time::Duration,
+) -> std::io::Result<ReadFrame>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut lenbuf = [0u8; 4];
+    match reader.read_exact(&mut lenbuf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(ReadFrame::Eof),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_ne_bytes(lenbuf) as usize;
+    if len > MAX_MESSAGE_LEN {
+        return Ok(ReadFrame::TooLarge);
+    }
+    let mut payload = vec![0u8; len];
+    match tokio::time::timeout(body_timeout, reader.read_exact(&mut payload)).await {
+        Ok(Ok(_)) => Ok(ReadFrame::Message(payload)),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(ReadFrame::Eof),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("message body timeout after {} ms", body_timeout.as_millis()),
+        )),
+    }
+}
+
 /// 向 `writer` 写一帧：`[4 字节本机字节序长度][UTF-8 JSON]`。
 ///
 /// 序列化失败时返回 `Err` 且**不写出任何字节**：绝不发送长度为 0 的空帧。

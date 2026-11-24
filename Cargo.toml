@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/idm-core", "crates/idm-cli", "crates/idm-ipc", "apps/idm-desktop/src-tauri"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99.1"
 publish = false
@@ -34,6 +34,12 @@ dbg_macro = "deny"
 unwrap_used = "warn"
 expect_used = "warn"
 undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"

@@ -8,6 +8,9 @@
 #   (cargo test with an --exact filter that matches nothing still exits 0, so
 #    we must also check that exactly one test ran.)
 # - All items must reach 10/10, otherwise exit 1.
+# - validate_url tests now live in idm-core (net::url_check::url_tests), not the
+#   idm-nmhost binary; host_spawns_runner_once was removed because the host no
+#   longer spawns the runner (Phase 4c+ uses an independent queue run --watch).
 #
 # Usage:
 #   powershell -File scripts/phase4a-acceptance.ps1                 # all sections
@@ -38,14 +41,16 @@ $tests = @(
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_rejects_bad_input' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_rejects_oversized_message' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_url_validation_cases' }
-    [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--bin', 'idm-nmhost'); Name = 'url_tests::validate_url_returns_for_three_inputs' }
-    [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--bin', 'idm-nmhost'); Name = 'url_tests::validate_url_rejects_all_userinfo_forms' }
+    [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-core';  Target = @('--lib');              Name = 'net::url_check::url_tests::validate_url_returns_for_three_inputs' }
+    [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-core';  Target = @('--lib');              Name = 'net::url_check::url_tests::validate_url_rejects_all_userinfo_forms' }
     [pscustomobject]@{ Id = 4;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_enqueue_rejects_url_credentials' }
     [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Feature = 'test-hooks'; Name = 'host_stdout_contains_only_frames' }
     [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Feature = 'test-hooks'; Name = 'host_stdout_single_ping_frame_then_panic' }
     [pscustomobject]@{ Id = 5;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'default_build_ignores_panic_env' }
     [pscustomobject]@{ Id = 6;  Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'filename_is_sanitized' }
-    [pscustomobject]@{ Id = 13; Section = 'ipc';   Pkg = 'idm-ipc';  Target = @('--test', 'nmhost');    Name = 'host_spawns_runner_once' }
+    # Id 13 (host_spawns_runner_once) removed: the host no longer spawns the runner
+    # (Phase 4c+ moved the runner to an independent `idm-cli queue run --watch`
+    # process); the corresponding test no longer exists in the codebase.
 
     [pscustomobject]@{ Id = 7;  Section = 'core';  Pkg = 'idm-core'; Target = @('--test', 'phase4a');   Name = 'headers_reach_server_including_retry' }
     [pscustomobject]@{ Id = 7;  Section = 'core';  Pkg = 'idm-core'; Target = @('--test', 'phase4a');   Name = 'headers_reach_server_on_resume' }

@@ -21,11 +21,15 @@ use idm_core::net::client::validate_extra_headers;
 use idm_core::net::filename::{sanitize_windows_filename, strip_browser_dup_suffix};
 use idm_core::net::validate_url;
 use idm_core::store::{QueuedTask, Store, default_db_path, default_download_dir};
-use idm_ipc::frame::{ReadFrame, read_frame, write_frame};
+use idm_ipc::frame::{ReadFrame, read_frame_body_timeout, write_frame};
 use serde_json::{Value, json};
 
 /// 日志文件容量上限：1 MiB。超过则在打开时覆盖重写。
 const LOG_CAP: u64 = 1_048_576;
+
+/// 消息体读取超时：长度前缀读到之后，负载必须在此时间内读完，否则报错退出。
+/// 等待下一条消息前缀的空闲阶段不设超时。
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 当前使用的数据库文件路径（与 `idm-cli` 解析规则一致：优先 `IDM_RS_DB` 环境变量）。
 fn current_db_path() -> PathBuf {
@@ -130,12 +134,14 @@ async fn run_loop(db: &Store) -> Result<(), Error> {
     let mut stdout = tokio::io::stdout();
     let mut seen = 0usize;
     loop {
-        let payload = match read_frame(&mut stdin).await.map_err(|e| Error::Io {
-            operation: "nmhost read_frame",
-            path: std::path::PathBuf::from("<stdin>"),
-            offset: 0,
-            source: e,
-        })? {
+        let payload = match read_frame_body_timeout(&mut stdin, BODY_READ_TIMEOUT)
+            .await
+            .map_err(|e| Error::Io {
+                operation: "nmhost read_frame",
+                path: std::path::PathBuf::from("<stdin>"),
+                offset: 0,
+                source: e,
+            })? {
             ReadFrame::Message(p) => p,
             ReadFrame::Eof => break, // 标准输入关闭
             ReadFrame::TooLarge => {
