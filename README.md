@@ -21,7 +21,7 @@ idm-rs 是一个本地下载管理器，由桌面程序（Tauri）、命令行�
 ## 首次使用
 
 1. **启用浏览器集成**：打开 idm-rs →「选项」→「浏览器集成」，点击「启用」（或点击界面顶部的提示条「启用」）。这会把 `idm-nmhost.exe` 注册为本机 Native Messaging host，供 Firefox 扩展连接。
-2. **安装 Firefox 扩展**：在 Firefox 中临时载入扩展目录 `extensions/firefox`（开发者工具方式），或安装经 Mozilla 签名后的 `.xpi`。扩展启用后，工具栏图标显示 `ON`。
+2. **安装 Firefox 扩展**：把经 Mozilla 签名后的 `idm-rs-firefox-0.1.0-signed.xpi` 文件直接拖入 Firefox 窗口，按提示完成安装。安装确认窗口中"允许在隐私窗口中运行"建议**不要勾选**——隐私窗口中的下载会被记入 idm-rs 的下载记录，与隐私窗口的预期行为不符。扩展启用后，工具栏图标显示 `ON`。
 
 接管已开启/关闭可通过点击工具栏图标切换；图标上的 `!` 表示最近一次交接失败（见常见问题）。
 
@@ -68,5 +68,7 @@ cargo test --workspace --locked
 pwsh -File scripts/verify-workspace.ps1
 pwsh -File scripts/package-extension.ps1   # 生成 dist/idm-rs-firefox-0.1.0.zip
 ```
+
+**Firefox 扩展调试**：开发者可在 `about:debugging#/runtime/this-firefox` 中点击「临时载入附加组件」，选择 `extensions/firefox/manifest.json` 临时载入扩展进行验证。此方式仅用于开发调试，重启浏览器后即失效；普通用户应按「首次使用」中的说明安装经 Mozilla 签名的 `.xpi`，不要使用临时载入。
 
 更完整的功能与限制说明见 `docs/release-notes-0.1.0.md` 与各阶段进度文件 `docs/phase5b-progress.md`、`docs/phase5c-progress.md`。

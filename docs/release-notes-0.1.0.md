@@ -9,6 +9,16 @@
 - 命令行工具 `idm-cli`：下载、续传、列出、删除、入队、队列运行/移动、配置、runner、nm（install/uninstall/status）等子命令。
 - 安装包：NSIS 当前用户模式安装，`idm-cli.exe` 与 `idm-nmhost.exe` 与桌面程序同目录；卸载时清理程序与注册表，保留数据目录 `%LOCALAPPDATA%\idm-rs`。
 
+## 签名扩展
+
+Firefox 扩展已由 Mozilla 以"自行分发"（unlisted）方式签名：
+
+- 文件名：`idm-rs-firefox-0.1.0-signed.xpi`
+- 大小：10,894 字节
+- SHA256：`D918224C3DF5800289A8311245D555A4328053C2B8AD980CDD229729C60F3227`
+- 签名方式：Mozilla 附加组件开发者中心"自行分发"（unlisted）签名
+- 扩展 ID：`idm-rs@local`；版本：0.1.0
+
 ## 已知限制
 
 - **仅支持 Firefox**：浏览器接管扩展只提供 Firefox 版本（Manifest V2），不支持 Chrome/Edge。
