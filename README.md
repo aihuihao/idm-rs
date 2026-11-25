@@ -72,3 +72,7 @@ pwsh -File scripts/package-extension.ps1   # 生成 dist/idm-rs-firefox-0.1.0.zi
 **Firefox 扩展调试**：开发者可在 `about:debugging#/runtime/this-firefox` 中点击「临时载入附加组件」，选择 `extensions/firefox/manifest.json` 临时载入扩展进行验证。此方式仅用于开发调试，重启浏览器后即失效；普通用户应按「首次使用」中的说明安装经 Mozilla 签名的 `.xpi`，不要使用临时载入。
 
 更完整的功能与限制说明见 `docs/release-notes-0.2.0.md`、维护说明 `docs/maintenance.md` 与各阶段进度文件 `docs/phase5b-progress.md`、`docs/phase5c-progress.md`。
+
+## 许可证
+
+本项目源码可见，采用 **PolyForm Noncommercial 1.0.0** 许可证，允许个人、学习、研究等非商业用途；商业用途需事先取得作者授权。完整条款见仓库根目录的 `LICENSE.md`。第三方组件（如 Tauri NSIS 安装模板）的许可声明见 `THIRD_PARTY_NOTICES.md`。
