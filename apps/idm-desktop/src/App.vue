@@ -18,6 +18,16 @@
       <button class="browser-action" @click="onDismissBrowserBanner">不再提示</button>
     </div>
 
+    <div v-if="updateBannerVisible" class="banner update-banner">
+      <span>发现新版本 {{ updateAvailableVersion }}</span>
+      <button class="browser-action" @click="updateNotesOpen = !updateNotesOpen">查看说明</button>
+      <button class="browser-action" :disabled="readOnly || updateInstalling" @click="confirmUpdate = true">立即更新</button>
+      <button class="browser-action" @click="dismissUpdateBanner">稍后</button>
+      <pre v-if="updateNotesOpen" class="update-notes">{{ updateNotes || '暂无更新说明' }}</pre>
+    </div>
+
+    <div v-if="updateInstalling" class="banner update-banner">正在下载更新 {{ updateProgressText }}</div>
+
     <div class="toolbar">
       <button :disabled="readOnly" @click="openAddDialog">
         <svg class="ico" viewBox="0 0 16 16"><path :d="icons.add" /></svg>添加任务
@@ -301,10 +311,33 @@
             下载完成时通知
           </label>
         </div>
+        <div class="field update-field">
+          <label>更新</label>
+          <span class="hint">当前版本：{{ appVersion }}</span>
+          <label class="checkbox">
+            <input v-model="draftSettings.auto_check_updates" type="checkbox" />
+            自动检查更新（启动 30 秒后及每 24 小时）
+          </label>
+          <button :disabled="updateChecking" @click="onCheckUpdate">检查更新</button>
+          <span v-if="updateCheckResult" class="hint">{{ updateCheckResult }}</span>
+        </div>
         <div v-if="optionsError" class="error-text">{{ optionsError }}</div>
         <div class="dialog-ops">
           <button @click="closeOptions">取消</button>
           <button :disabled="readOnly" @click="onSaveOptions">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 更新确认 -->
+    <div v-if="confirmUpdate" class="overlay" @click.self="confirmUpdate = false">
+      <div class="dialog">
+        <h2>确认更新</h2>
+        <p>更新前会暂停所有正在进行的下载，更新完成后程序会自动重新启动，下载可以继续</p>
+        <div v-if="updateError" class="error-text">{{ updateError }}</div>
+        <div class="dialog-ops">
+          <button @click="confirmUpdate = false">取消</button>
+          <button @click="onInstallUpdate">确定</button>
         </div>
       </div>
     </div>
@@ -339,6 +372,19 @@ interface Settings {
   autostart: boolean;
   notify_on_complete: boolean;
   browser_integration_dismissed: boolean;
+  auto_check_updates: boolean;
+}
+
+interface UpdateCheckView {
+  currentVersion: string;
+  available: boolean;
+  newVersion: string | null;
+  notes: string;
+}
+
+interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
 }
 
 interface ChunkView {
@@ -458,9 +504,29 @@ const draftSettings = ref<Settings>({
   download_dir: '', global_max_speed: 0, max_tasks: 3,
   default_connections: 8, max_connections_per_host: 8, resume_uses_current_connections: true,
   autostart: false, notify_on_complete: true, browser_integration_dismissed: false,
+  auto_check_updates: true,
 });
 const draftSpeedKb = ref(0);
 const optionsError = ref('');
+
+const appVersion = ref('');
+const updateBannerVisible = ref(false);
+const updateAvailableVersion = ref('');
+const updateNotes = ref('');
+const updateNotesOpen = ref(false);
+const updateChecking = ref(false);
+const updateInstalling = ref(false);
+const updateCheckResult = ref('');
+const updateError = ref('');
+const confirmUpdate = ref(false);
+const updateProgress = ref<UpdateProgress | null>(null);
+const updateProgressText = computed(() => {
+  const p = updateProgress.value;
+  if (!p) return '';
+  if (p.total === null || p.total <= 0) return `已下载 ${formatBytes(p.downloaded)}`;
+  const percentValue = Math.min(100, Math.round((p.downloaded / p.total) * 100));
+  return `${percentValue}%（${formatBytes(p.downloaded)} / ${formatBytes(p.total)}）`;
+});
 
 const globalSpeed = ref(0);
 
@@ -479,6 +545,8 @@ const MIN_DETAIL_HEIGHT = 120;
 const HEADER_PLUS_FIVE_ROWS = 6 * 28; // 表头 + 5 行数据，约 168px
 
 let unlisten: (() => void) | null = null;
+let unlistenUpdateAvailable: (() => void) | null = null;
+let unlistenUpdateProgress: (() => void) | null = null;
 let fatalTimer: ReturnType<typeof setTimeout> | null = null;
 let detailTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -499,9 +567,9 @@ const canResumeSelection = computed(
   () => selectedTasks.value.length > 0 && selectedTasks.value.some((t) => t.state === 'Paused' || t.state === 'Failed'),
 );
 const canPauseSelection = computed(
-  () => selectedTasks.value.length > 0 && selectedTasks.value.some((t) => t.state === 'Queued' || t.state === 'Downloading'),
+  () => selectedTasks.value.length > 0 && selectedTasks.value.some((t) => t.state === 'Queued' || t.state === 'Probing' || t.state === 'Downloading'),
 );
-const downloadingCount = computed(() => tasks.value.filter((t) => t.state === 'Downloading').length);
+const downloadingCount = computed(() => tasks.value.filter((t) => t.state === 'Probing' || t.state === 'Downloading').length);
 const totalSpeed = computed(() => tasks.value.reduce((sum, t) => sum + (t.speed_bps || 0), 0));
 const deleteConfirmText = computed(() => {
   const n = selectedIds.value.size;
@@ -509,12 +577,12 @@ const deleteConfirmText = computed(() => {
 });
 const ctxTask = computed(() => tasks.value.find((t) => t.id === contextMenu.value.taskId) ?? null);
 const ctxCanResume = computed(() => ctxTask.value?.state === 'Paused' || ctxTask.value?.state === 'Failed');
-const ctxCanPause = computed(() => ctxTask.value?.state === 'Queued' || ctxTask.value?.state === 'Downloading');
+const ctxCanPause = computed(() => ctxTask.value?.state === 'Queued' || ctxTask.value?.state === 'Probing' || ctxTask.value?.state === 'Downloading');
 
 function statusMatch(t: TaskView): boolean {
   switch (filterStatus.value) {
-    case 'downloading': return t.state === 'Downloading';
-    case 'incomplete': return t.state === 'Queued' || t.state === 'Paused' || t.state === 'Failed';
+    case 'downloading': return t.state === 'Probing' || t.state === 'Downloading';
+    case 'incomplete': return t.state === 'Queued' || t.state === 'Probing' || t.state === 'Paused' || t.state === 'Failed';
     case 'completed': return t.state === 'Completed';
     default: return true;
   }
@@ -524,8 +592,8 @@ function statusCount(key: string): number {
 }
 function statusMatchKey(t: TaskView, key: string): boolean {
   switch (key) {
-    case 'downloading': return t.state === 'Downloading';
-    case 'incomplete': return t.state === 'Queued' || t.state === 'Paused' || t.state === 'Failed';
+    case 'downloading': return t.state === 'Probing' || t.state === 'Downloading';
+    case 'incomplete': return t.state === 'Queued' || t.state === 'Probing' || t.state === 'Paused' || t.state === 'Failed';
     case 'completed': return t.state === 'Completed';
     default: return true;
   }
@@ -591,6 +659,7 @@ function formatEta(task: TaskView): string {
 function stateText(task: TaskView): string {
   switch (task.state) {
     case 'Queued': return '排队中';
+    case 'Probing': return '连接中';
     case 'Downloading': return '下载中';
     case 'Paused': return task.pause_reason === 'Interrupted' ? '已中断' : '已暂停';
     case 'Completed': return '已完成';
@@ -661,7 +730,7 @@ async function runOnIds(ids: number[], action: string): Promise<void> {
 }
 
 async function onPauseSelected(): Promise<void> {
-  const ids = selectedTasks.value.filter((t) => t.state === 'Queued' || t.state === 'Downloading').map((t) => t.id);
+  const ids = selectedTasks.value.filter((t) => t.state === 'Queued' || t.state === 'Probing' || t.state === 'Downloading').map((t) => t.id);
   await runOnIds(ids, 'pause');
 }
 async function onResumeSelected(): Promise<void> {
@@ -829,6 +898,7 @@ async function onSaveOptions(): Promise<void> {
     autostart: draftSettings.value.autostart,
     notify_on_complete: draftSettings.value.notify_on_complete,
     browser_integration_dismissed: draftSettings.value.browser_integration_dismissed,
+    auto_check_updates: draftSettings.value.auto_check_updates,
   };
   try {
     await invoke('set_settings', { settings: payload });
@@ -836,6 +906,47 @@ async function onSaveOptions(): Promise<void> {
     closeOptions();
   } catch (err) {
     optionsError.value = errText(err);
+  }
+}
+
+function showUpdateResult(view: UpdateCheckView): void {
+  if (view.available) {
+    updateCheckResult.value = `发现新版本 ${view.newVersion ?? ''}`;
+    updateAvailableVersion.value = view.newVersion ?? '';
+    updateNotes.value = view.notes || '';
+    updateNotesOpen.value = false;
+    updateBannerVisible.value = true;
+  } else {
+    updateCheckResult.value = '已是最新';
+  }
+}
+
+async function onCheckUpdate(): Promise<void> {
+  updateChecking.value = true;
+  try {
+    showUpdateResult(await invoke<UpdateCheckView>('check_for_update'));
+  } catch (err) {
+    updateCheckResult.value = `检查失败：${errText(err)}`;
+  } finally {
+    updateChecking.value = false;
+  }
+}
+
+function dismissUpdateBanner(): void {
+  updateBannerVisible.value = false;
+}
+
+async function onInstallUpdate(): Promise<void> {
+  updateError.value = '';
+  updateInstalling.value = true;
+  try {
+    await invoke('install_update');
+    confirmUpdate.value = false;
+  } catch (err) {
+    updateError.value = errText(err);
+    updateInstalling.value = false;
+    confirmUpdate.value = false;
+    showFatalError(updateError.value);
   }
 }
 
@@ -1044,6 +1155,7 @@ onMounted(async () => {
     readOnly.value = await invoke<boolean>('is_read_only');
     const saved = await invoke<Settings>('get_settings');
     globalSpeed.value = saved.global_max_speed;
+    appVersion.value = await invoke<string>('app_version');
     await loadBrowserStatus();
     await refreshTasks();
     unlisten = await listen<string>('tasks-updated', (event) => {
@@ -1053,6 +1165,12 @@ onMounted(async () => {
       } catch {
         // 忽略非法载荷
       }
+    });
+    unlistenUpdateAvailable = await listen<UpdateCheckView>('update-available', (event) => {
+      showUpdateResult(event.payload);
+    });
+    unlistenUpdateProgress = await listen<UpdateProgress>('update-progress', (event) => {
+      updateProgress.value = event.payload;
     });
     window.addEventListener('keydown', onKeydown);
     window.addEventListener('resize', onWindowResize);
@@ -1064,6 +1182,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (unlisten) { unlisten(); unlisten = null; }
+  if (unlistenUpdateAvailable) { unlistenUpdateAvailable(); unlistenUpdateAvailable = null; }
+  if (unlistenUpdateProgress) { unlistenUpdateProgress(); unlistenUpdateProgress = null; }
   stopDetailTimer();
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('resize', onWindowResize);
@@ -1138,6 +1258,12 @@ h1 { font-size: 16px; margin: 0; }
 .browser-banner { display: flex; align-items: center; gap: 10px; }
 .browser-banner span { flex: 1; }
 .browser-action { padding: 3px 10px; }
+.update-banner { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.update-banner span { flex: 1; }
+.update-notes {
+  flex-basis: 100%; max-height: 160px; overflow: auto; white-space: pre-wrap;
+  margin: 4px 0 0; padding: 6px; background: var(--panel-bg); border: 1px solid var(--border);
+}
 .browser-status-row { display: flex; align-items: center; gap: 10px; }
 .browser-status-row span { flex: 1; }
 .toolbar { display: flex; gap: 6px; flex-wrap: wrap; }

@@ -1,14 +1,24 @@
-//! Tauri 命令薄包装：只转发到 DesktopService，不含业务逻辑。
+//! Tauri 命令薄包装：只转发到 DesktopService / 更新插件，不含业务逻辑。
 
-use tauri::State;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tauri::{Emitter, State};
+use tauri_plugin_updater::{Update, UpdaterExt};
 
 use idm_desktop::service::{
-    BrowserIntegration, DesktopService, FirefoxExtensionStatus, ServiceError, Settings, TaskDetail,
-    TaskView,
+    BrowserIntegration, DesktopService, FirefoxExtensionStatus, OBSERVER_RUNNER_MESSAGE,
+    ServiceError, Settings, TaskDetail, TaskView,
+};
+use idm_desktop::update::{
+    UpdateCheckView, UpdateProgress, check_error_text, evaluate_update, run_install_flow,
 };
 
+#[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) service: std::sync::Arc<tokio::sync::Mutex<Option<DesktopService>>>,
+    pub(crate) service: Arc<tokio::sync::Mutex<Option<DesktopService>>>,
+    /// 更新安装期间为 true：运行器主动停止信号不应触发应用退出。
+    pub(crate) update_in_progress: Arc<AtomicBool>,
 }
 
 fn closed() -> ServiceError {
@@ -172,4 +182,143 @@ pub(crate) async fn pick_download_dir(app: tauri::AppHandle) -> Result<String, S
         None => String::new(),
     };
     Ok(path)
+}
+
+// --- v0.3.0a：自动更新（插件只在 Rust 端调用） ---------------------------
+
+/// 手动与自动检查共用的入口；结果整理成不依赖 Tauri 的纯数据结构。
+pub(crate) async fn check_for_update_inner(
+    app: &tauri::AppHandle,
+) -> Result<UpdateCheckView, ServiceError> {
+    let current = env!("CARGO_PKG_VERSION");
+    let updater = app
+        .updater()
+        .map_err(|err| ServiceError::Internal(err.to_string()))?;
+    let found = updater
+        .check()
+        .await
+        .map_err(|err| ServiceError::InvalidInput(check_error_text(&err.to_string())))?;
+    Ok(match found {
+        Some(update) => evaluate_update(current, Some((&update.version, update.body.as_deref()))),
+        None => evaluate_update(current, None),
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn check_for_update(
+    app: tauri::AppHandle,
+) -> Result<UpdateCheckView, ServiceError> {
+    check_for_update_inner(&app).await
+}
+
+#[tauri::command]
+pub(crate) fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+async fn download_and_install(app: &tauri::AppHandle, update: &Update) -> Result<(), ServiceError> {
+    let emitter = app.clone();
+    update
+        .download_and_install(
+            move |chunk, total| {
+                let _ = emitter.emit(
+                    "update-progress",
+                    UpdateProgress {
+                        downloaded: chunk,
+                        total,
+                    },
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|err| ServiceError::Internal(err.to_string()))
+}
+
+async fn install_update_inner(
+    app: &tauri::AppHandle,
+    shared: &Arc<tokio::sync::Mutex<Option<DesktopService>>>,
+) -> Result<(), ServiceError> {
+    let updater = app
+        .updater()
+        .map_err(|err| ServiceError::Internal(err.to_string()))?;
+    let update = Arc::new(
+        match updater
+            .check()
+            .await
+            .map_err(|err| ServiceError::InvalidInput(check_error_text(&err.to_string())))?
+        {
+            Some(update) => update,
+            None => return Err(ServiceError::InvalidInput("已是最新版本".to_string())),
+        },
+    );
+
+    let taken = {
+        let mut guard = shared.lock().await;
+        guard.take().ok_or_else(closed)?
+    };
+    let session: Arc<tokio::sync::Mutex<Option<DesktopService>>> =
+        Arc::new(tokio::sync::Mutex::new(Some(taken)));
+
+    let stop_session = Arc::clone(&session);
+    let restore_session = Arc::clone(&session);
+    let download_app = app.clone();
+    let download_update = Arc::clone(&update);
+
+    let result = run_install_flow(
+        move || {
+            let session = Arc::clone(&stop_session);
+            async move {
+                let mut guard = session.lock().await;
+                let service = guard.as_mut().ok_or_else(closed)?;
+                service.prepare_for_update().await
+            }
+        },
+        move || {
+            let app = download_app.clone();
+            let update = Arc::clone(&download_update);
+            async move { download_and_install(&app, &update).await }
+        },
+        move || {
+            let session = Arc::clone(&restore_session);
+            async move {
+                let mut guard = session.lock().await;
+                let service = guard.as_mut().ok_or_else(closed)?;
+                service.restore_after_update().await
+            }
+        },
+    )
+    .await;
+
+    // 无论成功或失败，服务都不能永久留在临时 session 里。
+    let restored = session.lock().await.take();
+    if restored.is_some() {
+        let mut guard = shared.lock().await;
+        *guard = restored;
+    }
+    result
+}
+
+#[tauri::command]
+pub(crate) async fn install_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), ServiceError> {
+    {
+        let guard = state.service.lock().await;
+        let service = guard.as_ref().ok_or_else(closed)?;
+        if !service.can_install_update() {
+            return Err(ServiceError::InvalidInput(
+                OBSERVER_RUNNER_MESSAGE.to_string(),
+            ));
+        }
+    }
+    if state.update_in_progress.swap(true, Ordering::SeqCst) {
+        return Err(ServiceError::InvalidInput(
+            "正在安装更新，请稍候".to_string(),
+        ));
+    }
+    let result = install_update_inner(&app, &state.service).await;
+    state.update_in_progress.store(false, Ordering::SeqCst);
+    result
 }

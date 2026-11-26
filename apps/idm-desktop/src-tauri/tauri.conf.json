@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "idm-rs",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "com.idmrs.desktop",
   "build": {
     "frontendDist": "../dist"
@@ -23,6 +23,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "externalBin": [
       "binaries/idm-cli",
       "binaries/idm-nmhost"
@@ -36,6 +37,17 @@
         "languages": ["SimpChinese", "English"],
         "template": "nsis/installer.nsi",
         "installerHooks": "nsis/hooks.nsh"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU0QjZENEQwM0I0NzRDMTMKUldRVFRFYzcwTlMyVkE5MExBcWdCRlh5eHRjY01tajIwSE81bnVFZXp0M2E4bWVSUkxnRW40dkkK",
+      "endpoints": [
+        "https://github.com/aihuihao/idm-rs/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

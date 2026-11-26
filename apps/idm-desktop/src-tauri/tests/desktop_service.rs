@@ -117,6 +117,7 @@ fn default_settings(download_dir: &Path) -> Settings {
         autostart: false,
         notify_on_complete: true,
         browser_integration_dismissed: false,
+        auto_check_updates: true,
     }
 }
 
@@ -1892,5 +1893,48 @@ async fn install_extension_success_launches_firefox() -> TestResult {
         return Err(format!("启动参数不符: {got:?}").into());
     }
     svc.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_check_updates_setting_roundtrip() -> TestResult {
+    let desktop_name = unique_run_name("idm-auto-desktop");
+    let runner_name = unique_run_name("idm-auto-runner");
+    let tmp = TempDir::new()?;
+    let db = tmp.join("idm.db");
+    let download = tmp.join("downloads");
+    std::fs::create_dir_all(&download)?;
+    seed_settings(&db, &download, None).await?;
+
+    let svc = DesktopService::open_with_autostart_names(
+        db.clone(),
+        desktop_name.clone(),
+        runner_name.clone(),
+    )
+    .await?;
+    assert!(
+        svc.get_settings().await?.auto_check_updates,
+        "auto-check-updates 默认为真"
+    );
+    let mut changed = default_settings(&download);
+    changed.auto_check_updates = false;
+    svc.set_settings(changed).await?;
+    assert!(
+        !svc.get_settings().await?.auto_check_updates,
+        "保存后应为假"
+    );
+    svc.shutdown().await?;
+
+    let reopened = DesktopService::open_with_autostart_names(
+        db,
+        unique_run_name("idm-auto-desktop"),
+        unique_run_name("idm-auto-runner"),
+    )
+    .await?;
+    assert!(
+        !reopened.get_settings().await?.auto_check_updates,
+        "重开数据库后应保持为假"
+    );
+    reopened.shutdown().await?;
     Ok(())
 }

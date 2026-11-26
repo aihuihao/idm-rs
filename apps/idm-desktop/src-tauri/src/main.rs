@@ -5,6 +5,7 @@ mod commands;
 use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tauri::menu::{Menu, MenuItem};
@@ -68,7 +69,9 @@ fn run() -> Result<(), String> {
     let stopped_rx = service.stopped_receiver();
     let state = AppState {
         service: Arc::new(tokio::sync::Mutex::new(Some(service))),
+        update_in_progress: Arc::new(AtomicBool::new(false)),
     };
+    let update_state = state.clone();
 
     let app = tauri::Builder::default()
         // single-instance 必须是第一个注册的插件。
@@ -85,6 +88,7 @@ fn run() -> Result<(), String> {
         }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::is_read_only,
@@ -104,6 +108,9 @@ fn run() -> Result<(), String> {
             commands::disable_browser_integration,
             commands::firefox_extension_status,
             commands::install_firefox_extension,
+            commands::check_for_update,
+            commands::install_update,
+            commands::app_version,
         ])
         .setup(move |app| {
             // --- 托盘：菜单 + 图标 ---
@@ -188,6 +195,42 @@ fn run() -> Result<(), String> {
                 });
             }
 
+            // --- v0.3.0a：30 秒后首次自动检查，之后每 24 小时 ---
+            {
+                let handle = app.handle().clone();
+                let shared = update_state.clone();
+                let log_path = log_db_path.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    loop {
+                        let enabled = {
+                            let guard = shared.service.lock().await;
+                            match guard.as_ref() {
+                                Some(svc) => match svc.get_settings().await {
+                                    Ok(settings) => settings.auto_check_updates,
+                                    Err(_) => false,
+                                },
+                                None => false,
+                            }
+                        };
+                        if enabled {
+                            match commands::check_for_update_inner(&handle).await {
+                                Ok(view) if view.available => {
+                                    let _ = handle.emit("update-available", view);
+                                }
+                                Ok(_) => {}
+                                // 自动检查失败只写日志，不打扰用户。
+                                Err(err) => startup_auto_log(
+                                    &log_path,
+                                    &format!("auto update check failed: {err}"),
+                                ),
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+                    }
+                });
+            }
+
             // --- 后台每 250ms 推送任务列表 ---
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -255,6 +298,15 @@ fn run() -> Result<(), String> {
                         if rx.changed().await.is_err() {
                             break;
                         }
+                    }
+                    // 更新安装会主动停止运行器；此时不能退出，否则下载失败后
+                    // 没有机会恢复运行器。install_update 会负责恢复。
+                    if handle
+                        .state::<AppState>()
+                        .update_in_progress
+                        .load(Ordering::SeqCst)
+                    {
+                        return;
                     }
                     shutdown_and_exit(handle).await;
                 });

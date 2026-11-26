@@ -391,6 +391,11 @@ enum Command {
         last_error: Option<String>,
         reply: Reply<()>,
     },
+    /// 条件启动：仅当 state='Queued' 时改为 Probing；返回是否更新了 1 行。
+    TryStartTask {
+        id: i64,
+        reply: Reply<bool>,
+    },
     SetFinalName {
         id: i64,
         name: String,
@@ -600,6 +605,12 @@ impl Store {
             reply,
         })
         .await
+    }
+
+    /// 条件启动任务：仅当数据库 state='Queued' 时改为 Probing。
+    /// 返回 Ok(true) 表示成功占用；Ok(false) 表示已被暂停/改状态，调用方应放弃启动。
+    pub async fn try_start_task(&self, id: i64) -> Result<bool> {
+        self.call(|reply| Command::TryStartTask { id, reply }).await
     }
 
     pub async fn set_final_name(&self, id: i64, name: &str) -> Result<()> {
@@ -833,6 +844,9 @@ fn handle_command(conn: &mut Connection, cmd: Command, fail: &AtomicBool) {
             reply,
         } => {
             let _ = reply.send(update_state(conn, id, state, pause, last_error));
+        }
+        Command::TryStartTask { id, reply } => {
+            let _ = reply.send(try_start_task(conn, id));
         }
         Command::SetFinalName { id, name, reply } => {
             let _ = reply.send(set_final_name(conn, id, &name));
@@ -1075,6 +1089,19 @@ fn update_state(
         return Err(Error::TaskNotFound { id });
     }
     Ok(())
+}
+
+/// 条件启动：仅从 Queued 改为 Probing；返回是否真正更新了一行。
+/// 若已被 CLI 暂停为 Paused，更新 0 行并返回 Ok(false)，避免随后被下载路径改回 Downloading。
+fn try_start_task(conn: &Connection, id: i64) -> Result<bool> {
+    let n = conn
+        .execute(
+            "UPDATE tasks SET state=?2, pause_reason=NULL, last_error=NULL, updated_at=?3 \
+             WHERE id=?1 AND state='Queued'",
+            params![id, TaskStateDb::Probing.as_str(), now_text()],
+        )
+        .map_err(db_err)?;
+    Ok(n == 1)
 }
 
 fn set_final_name(conn: &Connection, id: i64, name: &str) -> Result<()> {
@@ -1525,6 +1552,9 @@ fn recover(conn: &Connection) -> Result<RecoveryReport> {
 
     // 第四部分 2：Pending / Probing 且停留超过 5 分钟 → Failed 并记录原因。
     // Probe 的总超时只有 60 秒，正在运行的进程不可能在这两个状态停留 5 分钟。
+    // 注意：未超时的 Probing 不能在此改为 Paused——CLI 的每个命令（含 queue pause）
+    // 启动时都会调用 recover，若改动会把运行器正在处理的 Probing 任务误暂停。
+    // 残留 Probing 会在下次启动满 5 分钟后 Failed，再由用户显式恢复。
     struct StaleRow {
         id: i64,
         updated_at: String,

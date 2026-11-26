@@ -3,3 +3,4 @@
 pub mod firefox;
 pub mod service;
 pub mod throttle;
+pub mod update;

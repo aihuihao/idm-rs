@@ -109,6 +109,8 @@ pub struct Settings {
     pub notify_on_complete: bool,
     /// Phase 5c-2：用户是否已关闭「浏览器集成未启用」顶部提示条。
     pub browser_integration_dismissed: bool,
+    /// v0.3.0a：启动 30 秒后及每 24 小时自动检查更新，默认开启。
+    pub auto_check_updates: bool,
 }
 
 /// 浏览器集成状态。
@@ -173,6 +175,7 @@ impl IntegrationConfig {
 
 pub struct DesktopService {
     store: Arc<Store>,
+    db_path: PathBuf,
     runner: Option<Runner>,
     read_only: bool,
     autostart_desktop_name: String,
@@ -184,6 +187,8 @@ pub struct DesktopService {
 
 const DEFAULT_AUTOSTART_DESKTOP_NAME: &str = "idm-rs-desktop";
 const DEFAULT_AUTOSTART_RUNNER_NAME: &str = "idm-rs-runner";
+/// 观察模式（另一个运行器持有锁）下禁止安装更新。
+pub const OBSERVER_RUNNER_MESSAGE: &str = "后台运行器正在运行，请先停止后再更新";
 
 fn internal<E: std::fmt::Display>(err: E) -> ServiceError {
     ServiceError::Internal(err.to_string())
@@ -307,6 +312,15 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
         Some(v) => v.trim() == "true",
         None => false,
     };
+    // v0.3.0a：默认开启；仅显式写入 "false" 时关闭。
+    let auto_check_updates = match store
+        .get_setting("auto-check-updates")
+        .await
+        .map_err(internal)?
+    {
+        Some(v) => v.trim() != "false",
+        None => true,
+    };
     Ok(Settings {
         download_dir: download,
         global_max_speed,
@@ -317,6 +331,7 @@ async fn read_settings(store: &Store, desktop_name: &str) -> Result<Settings, Se
         autostart: autostart::query(desktop_name).is_some(),
         notify_on_complete,
         browser_integration_dismissed,
+        auto_check_updates,
     })
 }
 
@@ -499,7 +514,7 @@ impl DesktopService {
         let store = Store::open(&db_path).map_err(internal)?;
         let settings = read_settings(&store, &autostart_desktop_name).await?;
         let cfg = RunnerConfig {
-            db_path,
+            db_path: db_path.clone(),
             max_tasks: settings.max_tasks.clamp(1, 16),
             // 重启生效：每主机连接上限由独立的 max-connections-per-host 决定，
             // 不再误用「每任务默认连接数」default_connections。
@@ -510,6 +525,7 @@ impl DesktopService {
         match Runner::start(Arc::clone(&store), cfg).await {
             Ok(runner) => Ok(Self {
                 store,
+                db_path,
                 runner: Some(runner),
                 read_only: false,
                 autostart_desktop_name,
@@ -519,6 +535,7 @@ impl DesktopService {
             }),
             Err(RunnerStartError::AlreadyRunning) => Ok(Self {
                 store,
+                db_path,
                 runner: None,
                 read_only: true,
                 autostart_desktop_name,
@@ -532,6 +549,57 @@ impl DesktopService {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    // --- v0.3.0a：更新前的安全停止与失败恢复 -------------------------------
+
+    /// 观察模式（无本进程运行器）下只允许检查，不允许安装。
+    pub fn can_install_update(&self) -> bool {
+        !self.read_only && self.runner.is_some()
+    }
+
+    async fn runner_config(&self) -> Result<RunnerConfig, ServiceError> {
+        let settings = read_settings(&self.store, &self.autostart_desktop_name).await?;
+        Ok(RunnerConfig {
+            db_path: self.db_path.clone(),
+            max_tasks: settings.max_tasks.clamp(1, 16),
+            host_max_connections: settings.max_connections_per_host.clamp(1, 32),
+            proxy: Some(ProxyConfig::Disabled),
+        })
+    }
+
+    /// 安全停止运行器：活动任务变为 Paused(User) 并释放 runner.lock。
+    /// 保留 Store 存活，以便下载失败后调用 restore_after_update 恢复。
+    pub async fn prepare_for_update(&mut self) -> Result<(), ServiceError> {
+        if !self.can_install_update() {
+            return Err(ServiceError::InvalidInput(
+                OBSERVER_RUNNER_MESSAGE.to_string(),
+            ));
+        }
+        let runner = self
+            .runner
+            .take()
+            .ok_or_else(|| ServiceError::InvalidInput(OBSERVER_RUNNER_MESSAGE.to_string()))?;
+        runner.stop().await.map_err(internal)?;
+        Ok(())
+    }
+
+    /// 下载/签名校验失败后重新启动运行器；已是运行状态时幂等返回。
+    pub async fn restore_after_update(&mut self) -> Result<(), ServiceError> {
+        if self.runner.is_some() {
+            return Ok(());
+        }
+        let cfg = self.runner_config().await?;
+        match Runner::start(Arc::clone(&self.store), cfg).await {
+            Ok(runner) => {
+                self.runner = Some(runner);
+                Ok(())
+            }
+            Err(RunnerStartError::AlreadyRunning) => Err(ServiceError::InvalidInput(
+                OBSERVER_RUNNER_MESSAGE.to_string(),
+            )),
+            Err(RunnerStartError::Other(err)) => Err(internal(err)),
+        }
     }
 
     // --- Phase 5c-2：浏览器集成 --------------------------------------------
@@ -1037,6 +1105,11 @@ impl DesktopService {
                 "browser-integration-dismissed",
                 &s.browser_integration_dismissed.to_string(),
             )
+            .await
+            .map_err(internal)?;
+        // v0.3.0a：自动检查更新开关。
+        self.store
+            .set_setting("auto-check-updates", &s.auto_check_updates.to_string())
             .await
             .map_err(internal)?;
 

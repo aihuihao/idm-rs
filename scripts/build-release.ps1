@@ -4,8 +4,20 @@
 # - ASCII-only output/comments for PowerShell 5.1/7.x compatibility.
 # - Any failing step exits non-zero immediately.
 # - Does NOT execute the installer, does NOT touch registry or user data.
+# - v0.3.0a: default build is UNSIGNED (createUpdaterArtifacts overridden to false).
+#   Use -Sign only when the user has supplied the private key path and password.
+
+param(
+    [switch] $Sign
+)
 
 $ErrorActionPreference = 'Stop'
+
+function Clear-SignEnvironment {
+    # Password is only ever held in process environment for the duration of the build.
+    Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+}
 
 function Invoke-Step {
     param(
@@ -24,6 +36,7 @@ function Invoke-Step {
     if ($null -eq $code) { $code = 0 }
     if ($code -ne 0) {
         Write-Output "[FAIL] $Name (exit $code)"
+        Clear-SignEnvironment
         exit $code
     }
     Write-Output "[PASS] $Name"
@@ -84,17 +97,48 @@ Invoke-Step 'verify + stage signed Firefox extension' {
     Write-Output "SHA256: $stagedHash"
 }
 
-# 5) desktop release build + NSIS installer
-Invoke-Step 'tauri build (nsis)' {
-    Push-Location (Join-Path $RepoRoot 'apps\idm-desktop')
-    try { npx tauri build --bundles nsis } finally { Pop-Location }
+# 5) signing setup (signed mode only; my verification builds never use -Sign)
+# https://v2.tauri.app/plugin/updater/#signing-updates :
+# tauri build reads TAURI_SIGNING_PRIVATE_KEY (path or content) and
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD. The user-facing path variable is mapped
+# to the build variable only for this process.
+if ($Sign) {
+    $keyPath = $env:TAURI_SIGNING_PRIVATE_KEY_PATH
+    if ([string]::IsNullOrWhiteSpace($keyPath) -or -not (Test-Path $keyPath)) {
+        Write-Output '[FAIL] TAURI_SIGNING_PRIVATE_KEY_PATH is not set or the file does not exist'
+        Write-Output '  Example: $env:TAURI_SIGNING_PRIVATE_KEY_PATH = "C:\path\to\updater.key"'
+        exit 1
+    }
+    $securePassword = Read-Host -AsSecureString -Prompt 'Updater signing password'
+    $plainPassword = [System.Net.NetworkCredential]::new('', $securePassword).Password
+    $env:TAURI_SIGNING_PRIVATE_KEY = $keyPath
+    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $plainPassword
+    Remove-Variable plainPassword -ErrorAction SilentlyContinue
+    Write-Output 'SIGNING: enabled (password in process environment only)'
+} else {
+    Clear-SignEnvironment
+    Write-Output 'SIGNING: disabled (createUpdaterArtifacts=false override)'
 }
 
-# 5) locate installer and report
+# https://v2.tauri.app/reference/cli/ : --config accepts inline JSON merged
+# over tauri.conf.json, with later values overriding earlier ones.
+$UnsignedConfig = '{\"bundle\":{\"createUpdaterArtifacts\":false}}'
+
+# 6) desktop release build + NSIS installer
+Invoke-Step 'tauri build (nsis)' {
+    Push-Location (Join-Path $RepoRoot 'apps\idm-desktop')
+    try {
+        if ($Sign) { npx tauri build --bundles nsis }
+        else { npx tauri build --bundles nsis --config $UnsignedConfig }
+    } finally { Pop-Location }
+}
+
+# 7) locate installer and report
 $setup = Get-ChildItem -Path $SetupDir -Filter '*-setup.exe' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if ($null -eq $setup) {
     Write-Output '[FAIL] installer not found'
+    Clear-SignEnvironment
     exit 1
 }
 $sizeMiB = [math]::Round($setup.Length / 1MB, 2)
@@ -102,4 +146,13 @@ Write-Output '=============================================='
 Write-Output "INSTALLER: $($setup.FullName)"
 Write-Output "SIZE: $($setup.Length) bytes ($sizeMiB MiB)"
 Write-Output '=============================================='
+
+if ($Sign) {
+    Invoke-Step 'make-latest-json.ps1' {
+        $version = (Get-Content (Join-Path $TauriDir 'tauri.conf.json') -Raw | ConvertFrom-Json).version
+        & (Join-Path $PSScriptRoot 'make-latest-json.ps1') -Version $version
+    }
+}
+
+Clear-SignEnvironment
 exit 0

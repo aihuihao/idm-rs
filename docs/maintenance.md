@@ -47,3 +47,30 @@
 4. **扩展打包与签名**：`package-extension.ps1` 生成 `dist/idm-rs-firefox-<版本>.zip`；经 Mozilla 自行分发（unlisted）签名得到 `.xpi`，记录文件名、大小、SHA256；签名文件不入库（`.gitignore` 忽略 `*.xpi` 与 `/dist/`）。
 5. **版本说明**：新建 `docs/release-notes-<版本>.md`，列本次修复与已知限制，并从旧版本说明中移除已修复项；更新 `README.md` 的下载/安装/版本引用。
 6. **标签**：提交后创建 annotated 标签 `git tag -a v<版本> -m "idm-rs v<版本>"`，用 `git cat-file -p v<版本>` 确认指向发布提交；按约定不 push（除非另有授权）。
+
+## 5. 发布新版本（含自动更新）
+
+自动更新的公钥已写入 `apps/idm-desktop/src-tauri/tauri.conf.json`，端点固定为
+`https://github.com/aihuihao/idm-rs/releases/latest/download/latest.json`。私钥**不入库**，只保存在发布者本机。
+
+1. **准备私钥**：在开始菜单或 PowerShell 中设置当前会话的环境变量（只影响本次会话，不写入任何文件）：
+   ```powershell
+   $env:TAURI_SIGNING_PRIVATE_KEY_PATH = "C:\path\to\updater.key"
+   ```
+   私钥由 Tauri CLI 通过该路径读取；脚本不会把私钥内容写入日志或产物。
+2. **签名构建**：在仓库根目录运行 `powershell -File scripts/build-release.ps1 -Sign`。脚本会：
+   - 检查上述路径存在，否则报错退出；
+   - 用 `Read-Host -AsSecureString` 交互式询问私钥密码，仅映射为本次进程的 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，构建结束（含失败路径）即从进程环境移除；
+   - 以 `createUpdaterArtifacts=true` 构建，生成 `target\release\bundle\nsis\idm-rs_<版本>_x64-setup.exe` 与同名 `.sig`；
+   - 调用 `scripts/make-latest-json.ps1` 生成 `dist/latest.json`（字段格式见 https://v2.tauri.app/plugin/updater/）。
+   - 密码和私钥内容都不会出现在终端回显、日志或 JSON 中。
+3. **验证 latest.json**：本地先确认字段正确：
+   ```powershell
+   Get-Content dist/latest.json -Raw | ConvertFrom-Json | Format-List version,pub_date,notes
+   ```
+   `version` 应为目标版本，`platforms.'windows-x86_64'.signature` 是 `.sig` 文件内容，`url` 指向第 4 步的 Release 下载地址。
+4. **创建 GitHub Release**：在 `https://github.com/aihuihao/idm-rs/releases` 新建标签为 `v<版本>` 的 Release，上传两个文件：
+   - `idm-rs_<版本>_x64-setup.exe`
+   - `latest.json`
+5. **验证公开可访问**：浏览器打开 `https://github.com/aihuihao/idm-rs/releases/latest/download/latest.json`，应返回上述 JSON；再确认其中 `url` 拼出的安装包下载地址可下载（返回 200）。客户端启动 30 秒后会自动检查，或在「选项 → 更新 → 检查更新」手动检查。
+6. **不打标签的约定**：源码提交按任务要求不创建标签；正式 `v<版本>` 标签由完成签名构建的发布者在 GitHub Release 时创建。

@@ -14,7 +14,7 @@ idm-rs 是一个本地下载管理器，由桌面程序（Tauri）、命令行�
 
 ## 安装
 
-1. 运行安装包 `idm-rs_0.2.0_x64-setup.exe`。安装采用"当前用户"模式，默认安装到 `%LOCALAPPDATA%\Programs\idm-rs`，不需要管理员权限。
+1. 运行安装包 `idm-rs_0.3.0_x64-setup.exe`。安装采用"当前用户"模式，默认安装到 `%LOCALAPPDATA%\Programs\idm-rs`，不需要管理员权限。
 2. Windows 可能弹出"未知发布者"（Windows 已保护你的电脑）提示：这是因为程序尚未做代码签名。确认发布者来源为你自己构建/信任的副本后，点击"更多信息"→"仍要运行"继续安装。
 3. 安装完成后，开始菜单出现 `idm-rs` 快捷方式；安装目录含 `idm-desktop.exe`、`idm-cli.exe`、`idm-nmhost.exe` 三个程序，以及随包分发的签名扩展 `idm-rs-firefox.xpi`。
 
@@ -71,7 +71,7 @@ pwsh -File scripts/package-extension.ps1   # 生成 dist/idm-rs-firefox-0.1.0.zi
 
 **Firefox 扩展调试**：开发者可在 `about:debugging#/runtime/this-firefox` 中点击「临时载入附加组件」，选择 `extensions/firefox/manifest.json` 临时载入扩展进行验证。此方式仅用于开发调试，重启浏览器后即失效；普通用户应按「首次使用」中的说明安装经 Mozilla 签名的 `.xpi`，不要使用临时载入。
 
-更完整的功能与限制说明见 `docs/release-notes-0.2.0.md`、维护说明 `docs/maintenance.md` 与各阶段进度文件 `docs/phase5b-progress.md`、`docs/phase5c-progress.md`。
+更完整的功能与限制说明见 `docs/release-notes-0.3.0.md`、维护说明 `docs/maintenance.md` 与各阶段进度文件 `docs/phase5b-progress.md`、`docs/phase5c-progress.md`。
 
 ## 许可证
 

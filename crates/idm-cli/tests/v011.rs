@@ -483,3 +483,55 @@ async fn pause_queued_while_runner_running() -> TestResult {
     srv.shutdown();
     Ok(())
 }
+
+// --- v0.3.0a 步骤0：任务已 spawn 但 probe 未完成时暂停 -----------------------
+
+/// 竞态：运行器已 spawn 任务、但服务器 probe 延迟中（DB 仍 Queued）时用 CLI 暂停。
+/// 期望：CLI 视任务为"正在下载"（退出码 3），或任务最终持久保持 Paused 且不下载。
+#[tokio::test]
+async fn pause_spawned_before_probe() -> TestResult {
+    let size = 1024u64;
+    let srv = start(ServerConfig {
+        size,
+        probe_delay: Some(Duration::from_secs(3)),
+        ..ServerConfig::default()
+    })
+    .await?;
+    let tmp = tempfile::tempdir()?;
+    let dir = tmp.path().join("out");
+    std::fs::create_dir_all(&dir)?;
+    let db = tmp.path().join("idm.db");
+    let db_s = db.to_string_lossy().into_owned();
+    let id = enqueue_named(&srv.url("/slow.bin"), "slow.bin", &db, &dir)?;
+    let _runner = spawn_runner_max(&db_s, 1)?;
+
+    // 等 600ms：runner 已 spawn 任务且卡在 probe 延迟中。
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let (early_state, _) = task_state_pause(&db, id)?;
+    if early_state != "Queued" && early_state != "Probing" {
+        return Err(format!("早期状态应为 Queued 或 Probing, got {early_state}").into());
+    }
+
+    let out = run_cli(&["queue", "pause", &id.to_string(), "--db", &db_s])?;
+    let code = out.status.code();
+    let accepted_busy = code == Some(3);
+    let (paused_now, _) = task_state_pause(&db, id)?;
+
+    // 等 probe 延迟窗口过去（3s）+ 余量，让"错误改回 Downloading"有机会发生。
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let (final_state, _) = task_state_pause(&db, id)?;
+    let part = dir.join("slow.bin.idm-part");
+    let stable_paused = final_state == "Paused" && !part.exists();
+
+    if !accepted_busy && !(paused_now == "Paused" && stable_paused) {
+        return Err(format!(
+            "竞态发生：pause 返回 code={code:?}（应 3），暂停后状态={paused_now}，4 秒后状态={final_state}，idm-part={}",
+            part.exists()
+        )
+        .into());
+    }
+
+    drop(_runner);
+    srv.shutdown();
+    Ok(())
+}

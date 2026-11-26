@@ -13,8 +13,10 @@
 //!   （`outstanding` = 仍在队列或活动中的任务），随即自动唤醒调度器拉起下一个。
 //! - 同一队列内的所有任务共用同一个 [`DiskWriterPool`](crate::disk::DiskWriterPool)、全局 [`RateLimiter`](crate::net::ratelimit::RateLimiter) 与按服务器
 //!   的 [`HostConnectionLimiter`](crate::net::host_limit::HostConnectionLimiter)，因此全局限速与每主机连接上限对队列内所有任务同时生效。
-//! - 下载期间数据库 `state` 仍为 `Queued`（终态由 `finalize_download` 写入），所以调度器
-//!   以内存中的 `active` 映射判断并发，而不是数据库状态。
+//! - v0.3.0a 起，调度器在启动任务前用条件更新把数据库 `state` 从 `Queued` 改为
+//!   `Probing`（仅当仍为 Queued 时才成功，避免与 CLI 暂停竞态）；随后下载期间为
+//!   `Probing`/`Downloading`，终态由 `finalize_download` 写入。调度器以内存 `active`
+//!   映射判断并发，而不是数据库状态。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -402,6 +404,20 @@ async fn try_schedule(inner: &Arc<Inner>) {
 /// 登记活动任务并启动其下载 future（detached）。
 async fn spawn_task(inner: &Arc<Inner>, rec: TaskRecord) {
     let id = rec.id;
+    // v0.3.0a：在占用内存槽位之前，先用条件更新把 DB 从 Queued 标记为 Probing。
+    // 若已被 CLI pause 为 Paused，更新 0 行，放弃启动并回退 outstanding 计数。
+    match inner.store.try_start_task(id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            bump_outstanding(inner, -1);
+            return;
+        }
+        Err(e) => {
+            let _ = e;
+            bump_outstanding(inner, -1);
+            return;
+        }
+    }
     let cancel = Arc::new(CancelSignal::new());
     let done = Arc::new(Notify::new());
     let finished = Arc::new(AtomicBool::new(false));
@@ -453,14 +469,14 @@ async fn on_finished(
     finished: Arc<AtomicBool>,
     done: Arc<Notify>,
 ) {
-    // 1. 错误路径：若数据库里该任务仍是 `Queued`，说明下载在写入任何状态之前
-    //    就失败了。必须立刻落终态，否则 `list_queued_tasks` 始终能查到它，
-    //    调度器会把同一个任务反复拉起。
+    // 1. 错误路径：若数据库里该任务仍是 `Queued` 或 v0.3.0a 新引入的 `Probing`，
+    //    说明下载在写入任何下载状态之前就失败了。必须立刻落终态，否则任务会永久
+    //    停留在 Probing（或 Queued 被反复拉起）。
     //    该写入必须早于「移除活动项」和「唤醒调度器」：期间 `active` 仍持有这个
     //    id，`try_schedule` 会把它排除，杜绝并发重复拉起。
     if let Err(e) = &result
         && let Ok(rec) = inner.store.get_task(id).await
-        && rec.state == TaskStateDb::Queued
+        && matches!(rec.state, TaskStateDb::Queued | TaskStateDb::Probing)
     {
         let (state, pause, last_error) = if matches!(e, Error::TaskInUse { .. }) {
             // 9.5：另一个进程正占用该任务，放回暂停状态等待后续恢复，不改失败态。
@@ -568,6 +584,10 @@ mod tests {
     use crate::store::Store;
     use tempfile::tempdir;
 
+    #[path = "../../../tests/support/mod.rs"]
+    mod support;
+    use support::{ServerConfig, start};
+
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
     /// 构造一个带独立 SQLite 库的测试队列。
@@ -595,37 +615,208 @@ mod tests {
         (done, finished)
     }
 
+    /// v0.3.0a：失败兜底必须覆盖 Probing——任务在 spawn 前已被条件更新为 Probing，
+    /// 若 resume 在写入任何下载状态前就失败，DB 会停在 Probing，必须落终态。
     #[tokio::test]
-    async fn enqueue_preserves_order_and_state() {
-        let dir = tempdir().unwrap();
+    async fn probing_task_on_finished_error_becomes_failed() -> TestResult {
+        let dir = tempdir()?;
         let db = dir.path().join("q.db");
-        let store = Store::open(&db).unwrap();
-        let pool = Arc::new(DiskWriterPool::new(2, 16).unwrap());
-        let q = DownloadQueue::new(store.clone(), pool, QueueConfig::default());
+        let store = Arc::new(Store::open(&db)?);
+        let pool = Arc::new(DiskWriterPool::new(2, 16)?);
+        let q = DownloadQueue::new(Arc::clone(&store), pool, QueueConfig::default());
+        // 先关掉后台调度器，避免它抢先占用/结束任务；on_finished 在停机态仍可调用。
+        q.shutdown().await?;
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let id = store
+            .enqueue_task(
+                QueuedTask {
+                    url: "http://127.0.0.1:9/x.bin".to_string(),
+                    dir: out.to_string_lossy().into_owned(),
+                    strategy: "Auto".to_string(),
+                    connections: 1,
+                    max_speed: None,
+                    file_name: None,
+                },
+                None,
+            )
+            .await?;
+        // 模拟调度器已占用任务。
+        if !store.try_start_task(id).await? {
+            return Err("try_start_task 应成功".into());
+        }
+        let (state, _) = task_state_of(&store, id).await?;
+        if state != TaskStateDb::Probing {
+            return Err(format!("前置状态应为 Probing, got {state:?}").into());
+        }
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(Notify::new());
+        on_finished(
+            &q.inner,
+            id,
+            Err(Error::InvalidArgument {
+                message: "probe failed before any state write".to_string(),
+            }),
+            finished,
+            done,
+        )
+        .await;
+        let (after, _) = task_state_of(&store, id).await?;
+        if after != TaskStateDb::Failed {
+            return Err(format!("Probing 任务失败后应为 Failed, got {after:?}").into());
+        }
+        q.shutdown().await?;
+        Ok(())
+    }
+
+    /// 读取任务状态与暂停原因（仅测试使用）。
+    async fn task_state_of(
+        store: &Store,
+        id: i64,
+    ) -> TestResult<(TaskStateDb, Option<PauseReasonDb>)> {
+        let rec = store.get_task(id).await?;
+        Ok((rec.state, rec.pause_reason))
+    }
+
+    /// try_start_task 必须只从 Queued 改：已被 CLI 暂停为 Paused 时返回 false 且状态不变。
+    #[tokio::test]
+    async fn try_start_task_refuses_paused_task() -> TestResult {
+        let dir = tempdir()?;
+        let store = Store::open(dir.path().join("q.db"))?;
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let id = store
+            .enqueue_task(
+                QueuedTask {
+                    url: "http://127.0.0.1:9/x.bin".to_string(),
+                    dir: out.to_string_lossy().into_owned(),
+                    strategy: "Auto".to_string(),
+                    connections: 1,
+                    max_speed: None,
+                    file_name: None,
+                },
+                None,
+            )
+            .await?;
+        store
+            .update_state(id, TaskStateDb::Paused, Some(PauseReasonDb::User), None)
+            .await?;
+        let started = store.try_start_task(id).await?;
+        if started {
+            return Err("try_start_task 不应占用已暂停任务".into());
+        }
+        let (state, pause) = task_state_of(&store, id).await?;
+        if state != TaskStateDb::Paused || pause != Some(PauseReasonDb::User) {
+            return Err(format!("状态应保持 Paused(User), got {state:?}/{pause:?}").into());
+        }
+        Ok(())
+    }
+
+    /// recover 不得干扰运行器正在处理的 Probing 任务：CLI 每个命令启动时都会调
+    /// recover，若把未超时的 Probing 改为 Paused，会误暂停正在下载的任务（破坏
+    /// v0.3.0a 的暂停竞态修复）。残留 Probing 仍按原逻辑在超 5 分钟后 Failed。
+    #[tokio::test]
+    async fn recover_does_not_touch_recent_probing() -> TestResult {
+        let dir = tempdir()?;
+        let store = Store::open(dir.path().join("q.db"))?;
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let id = store
+            .enqueue_task(
+                QueuedTask {
+                    url: "http://127.0.0.1:9/x.bin".to_string(),
+                    dir: out.to_string_lossy().into_owned(),
+                    strategy: "Auto".to_string(),
+                    connections: 1,
+                    max_speed: None,
+                    file_name: None,
+                },
+                None,
+            )
+            .await?;
+        if !store.try_start_task(id).await? {
+            return Err("try_start_task 应成功".into());
+        }
+        store.recover().await?;
+        let (state, pause) = task_state_of(&store, id).await?;
+        if state != TaskStateDb::Probing || pause.is_some() {
+            return Err(
+                format!("recover 不应干扰运行中的 Probing, got {state:?}/{pause:?}").into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// v0.3.0a 起，调度器启动任务前会把状态改为 `Probing`，用于消除 CLI 暂停的竞态：
+    /// 只有仍在 `Queued` 的任务才会被条件更新占用；已被暂停的任务不会被拉起。
+    /// 本测试保留其原意（入队顺序 + 入队后状态），但构造上让并发上限为 1 且首个任务
+    /// 卡在 probe 阶段，从而精确断言"1 个 Probing + 3 个仍 Queued 且顺序正确"。
+    #[tokio::test]
+    async fn enqueue_preserves_order_and_state() -> TestResult {
+        let srv = start(ServerConfig {
+            size: 1024,
+            probe_delay: Some(std::time::Duration::from_secs(60)),
+            ..ServerConfig::default()
+        })
+        .await?;
+        let dir = tempdir()?;
+        let db = dir.path().join("q.db");
+        let store = Store::open(&db)?;
+        let pool = Arc::new(DiskWriterPool::new(2, 16)?);
+        let q = DownloadQueue::new(
+            store.clone(),
+            pool,
+            QueueConfig {
+                max_concurrent_tasks: 1,
+                ..QueueConfig::default()
+            },
+        );
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir)?;
         let mut ids = Vec::new();
         for i in 0..4 {
             let id = q
                 .enqueue(EnqueueRequest {
-                    url: format!("http://h/file{i}.bin"),
-                    dir: dir.path().to_path_buf(),
+                    url: srv.url(&format!("/file{i}.bin")),
+                    dir: out_dir.clone(),
                     connections: 4,
                     out_name: None,
                     max_speed: None,
                     strategy: AllocationStrategy::Auto,
                 })
-                .await
-                .unwrap();
+                .await?;
             ids.push(id);
         }
-        let queued = store.list_queued_tasks().await.unwrap();
-        assert_eq!(queued.len(), 4);
-        // 严格按入队顺序（queue_order 递增、id 递增）。
+
+        // 等调度器把第 1 个任务改成 Probing（probe 延迟 60s，期间不会往下走）。
+        let began = std::time::Instant::now();
+        let mut first_probing = false;
+        while began.elapsed() < std::time::Duration::from_secs(10) {
+            let first = store.get_task(ids[0]).await?;
+            if first.state == TaskStateDb::Probing {
+                first_probing = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if !first_probing {
+            return Err("首个任务未进入 Probing".into());
+        }
+
+        let first = store.get_task(ids[0]).await?;
+        assert_eq!(first.state, TaskStateDb::Probing);
+        assert_eq!(first.queue_order, 1);
+
+        let queued = store.list_queued_tasks().await?;
+        assert_eq!(queued.len(), 3, "并发上限 1 时只应有 3 个仍为 Queued");
         for (i, r) in queued.iter().enumerate() {
-            assert_eq!(r.id, ids[i]);
-            assert_eq!(r.queue_order, (i + 1) as i64);
+            assert_eq!(r.id, ids[i + 1]);
+            assert_eq!(r.queue_order, (i + 2) as i64);
             assert_eq!(r.state, TaskStateDb::Queued);
         }
-        q.shutdown().await.unwrap();
+        q.shutdown().await?;
+        srv.shutdown();
+        Ok(())
     }
 
     /// 任务在 `pause()` 调用的同一时刻自然结束：重复 200 次，每次 `pause`

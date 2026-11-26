@@ -385,7 +385,7 @@ $dups = Invoke-Step -Name "cargo tree -d" -ScriptBlock { cargo tree --workspace 
 Write-Host $dups.Output.Trim()
 
 # ---------------------------------------------------------------------------
-# STEP 15: 文档注释 / 链接检查（rustdoc -D warnings）
+# STEP 15: rustdoc comment/link check (-D warnings)
 # ---------------------------------------------------------------------------
 $stepNumber++
 Write-Host "[STEP $stepNumber] cargo doc --workspace --no-deps --locked (RUSTDOCFLAGS=-D warnings)"
@@ -429,6 +429,55 @@ Step-Check -Name "static: frontend has no dangerous patterns" -ScriptBlock {
                 return $false
             }
         }
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+# STEP 18b (v0.3.0a): frontend must surface the `Probing` task state.
+#   The scheduler now writes Probing before probe; the UI must show a Chinese
+#   label and include it in pause/downloading/incomplete filters and counts.
+# ---------------------------------------------------------------------------
+Step-Check -Name "static: frontend handles Probing state" -ScriptBlock {
+    $app = Join-Path (Get-Location) 'apps/idm-desktop/src/App.vue'
+    # App.vue is UTF-8 without BOM; PS 5.1 Get-Content -Raw would decode it as ANSI
+    # and mangle Chinese labels, so read it explicitly as UTF-8.
+    $text = Get-Content $app -Encoding UTF8 -Raw
+    $checks = @(
+        'function stateText(task: TaskView)',
+        '{{ stateText(task) }}',
+        'function statusMatchKey(t: TaskView, key: string)',
+        "t.state === 'Probing' || t.state === 'Downloading'"
+    )
+    foreach ($c in $checks) {
+        if ($text.IndexOf($c) -lt 0) {
+            Write-Host "  missing Probing handling: $c"
+            return $false
+        }
+    }
+    # Check the real behavior: stateText maps Probing to the exact Chinese label
+    # "连接中" (code points 8FDE 63A5 4E2D), and that function feeds the table cell.
+    $expectedLabel = -join @([char]0x8FDE, [char]0x63A5, [char]0x4E2D)
+    $mapping = [regex]::Match($text, "case 'Probing':\s*return '([^']*)'")
+    if (-not $mapping.Success) {
+        Write-Host '  missing Chinese label for Probing'
+        return $false
+    }
+    if ($mapping.Groups[1].Value -ne $expectedLabel) {
+        $codes = ($mapping.Groups[1].Value.ToCharArray() | ForEach-Object { ([int]$_).ToString('X4') }) -join ' '
+        Write-Host "  Probing label mismatch (code points: $codes)"
+        return $false
+    }
+    $probingMentions = ([regex]::Matches($text, "t\.state === 'Probing'")).Count
+    if ($probingMentions -lt 4) {
+        Write-Host "  expected at least 4 Probing state checks in App.vue, got $probingMentions"
+        return $false
+    }
+    # The pause button must actually act on Probing tasks, not only be enabled.
+    $pauseFilters = ([regex]::Matches($text, [regex]::Escape("t.state === 'Queued' || t.state === 'Probing' || t.state === 'Downloading'"))).Count
+    if ($pauseFilters -lt 2) {
+        Write-Host "  expected Probing in both canPauseSelection and onPauseSelected, got $pauseFilters"
+        return $false
     }
     return $true
 }
@@ -499,6 +548,78 @@ Step-Check -Name "static: invoke args use camelCase (no snake_case keys)" -Scrip
     if ($bad.Count -gt 0) {
         $bad | ForEach-Object { Write-Host "  snake_case invoke arg $_" }
         return $false
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+# STEP 21b (v0.3.0a): the updater plugin must be called from Rust only, and
+#   the config/settings/UI pieces required by the auto-update flow must exist.
+# ---------------------------------------------------------------------------
+Step-Check -Name "static: updater plugin only in Rust" -ScriptBlock {
+    $root = Join-Path (Get-Location) 'apps/idm-desktop/src'
+    $files = @(Get-ChildItem -Path $root -Recurse -File | Where-Object { $_.Extension -in '.vue', '.ts' })
+    foreach ($file in $files) {
+        $text = Get-Content $file.FullName -Raw
+        if ($text -match '@tauri-apps/plugin-updater|plugin-updater|updaterBuilder') {
+            Write-Host "  frontend must not call the updater plugin: $($file.Name)"
+            return $false
+        }
+    }
+    $commands = Get-Content (Join-Path (Get-Location) 'apps/idm-desktop/src-tauri/src/commands.rs') -Raw
+    if ($commands -notmatch 'tauri_plugin_updater') {
+        Write-Host '  Rust commands do not use tauri_plugin_updater'
+        return $false
+    }
+    return $true
+}
+
+Step-Check -Name "static: auto-update config, settings and UI" -ScriptBlock {
+    $confPath = Join-Path (Get-Location) 'apps/idm-desktop/src-tauri/tauri.conf.json'
+    $conf = Get-Content $confPath -Raw | ConvertFrom-Json
+    if (-not $conf.bundle.createUpdaterArtifacts) {
+        Write-Host '  bundle.createUpdaterArtifacts must be true'
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($conf.plugins.updater.pubkey)) {
+        Write-Host '  plugins.updater.pubkey is missing'
+        return $false
+    }
+    if ($conf.plugins.updater.endpoints[0] -ne 'https://github.com/aihuihao/idm-rs/releases/latest/download/latest.json') {
+        Write-Host '  updater endpoint mismatch'
+        return $false
+    }
+    if ($conf.plugins.updater.windows.installMode -ne 'passive') {
+        Write-Host '  updater installMode must be passive'
+        return $false
+    }
+    $service = Get-Content (Join-Path (Get-Location) 'apps/idm-desktop/src-tauri/src/service.rs') -Raw
+    $commands = Get-Content (Join-Path (Get-Location) 'apps/idm-desktop/src-tauri/src/commands.rs') -Raw
+    $app = Get-Content (Join-Path (Get-Location) 'apps/idm-desktop/src/App.vue') -Encoding UTF8 -Raw
+    $checks = @(
+        @($service, '"auto-check-updates"', 'Rust settings key'),
+        @($commands, 'run_install_flow', 'install orchestration'),
+        @($app, 'auto_check_updates', 'settings checkbox'),
+        @($app, "invoke<UpdateCheckView>('check_for_update')", 'manual check command'),
+        @($app, "invoke('install_update')", 'install command'),
+        @($app, "'update-progress'", 'progress event listener')
+    )
+    foreach ($c in $checks) {
+        if ($c[0].IndexOf($c[1]) -lt 0) {
+            Write-Host "  missing auto-update piece: $($c[2])"
+            return $false
+        }
+    }
+    # Chinese UI text via Unicode regex so this script stays ASCII-only.
+    $regexChecks = @(
+        @($app, '\u53d1\u73b0\u65b0\u7248\u672c', 'update banner'),
+        @($app, '\u66f4\u65b0\u524d\u4f1a\u6682\u505c\u6240\u6709\u6b63\u5728\u8fdb\u884c\u7684\u4e0b\u8f7d', 'install confirmation text')
+    )
+    foreach ($c in $regexChecks) {
+        if ($c[0] -notmatch $c[1]) {
+            Write-Host "  missing auto-update piece: $($c[2])"
+            return $false
+        }
     }
     return $true
 }
